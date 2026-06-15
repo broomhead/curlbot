@@ -11,20 +11,83 @@ domain and club name are not hardcoded.
 ## What it shows
 
 `/sheets [upcoming]` lists practice-ice opportunities in time order, each as
-**time · type · sheets free · date**. Practice ice comes from four source types:
+**time · type · sheets free · date**. The reply is **private** (ephemeral — only
+you see it), so checking it doesn't post in the channel. Practice ice comes from
+four source types:
 
 - **Practice blocks** — designated open-ice sessions on the calendar.
 - **Learn-to-Curls** — sheet usage from registration headcount (`ceil(people / 8)`).
 - **Private events** — sheet usage derived from the booking fee.
 - **Leagues** — team count and draw schedule parsed from the public league pages.
 
-Free sheets during any session = 4 − sheets used by every overlapping session,
-so concurrent bookings stack correctly. Sessions with no available data are
-flagged rather than guessed.
+Free sheets during any session = `NUM_SHEETS` − sheets used by every overlapping
+session, so concurrent bookings stack correctly. Sessions with no available data
+are flagged rather than guessed. `NUM_SHEETS` (default 4) is configurable since
+facilities differ.
 
 `upcoming` (1–5, default 1) is how many designated practice blocks to look
 ahead; that span defines the window in which LTCs, private events, and league
 draws are also surfaced.
+
+**Practice sign-up pool.** Each opportunity has a sign-up button. Tap it to say
+"I want to practice this slot"; tap again to drop off. There's no cap — it's an
+open pool, so the report just shows free sheets and how many people have signed
+up, and members sort out sheets themselves. Sign-ups are shared (everyone sees
+the counts) even though each `/sheets` view is private; they age out a few hours
+after the slot's start time.
+
+Because people often show up when someone else is going, a shared **practice
+board** is kept current in the channel: it's posted/pinned the first time someone
+signs up (in whatever channel they used `/sheets`) and edited silently on every
+join or leave. When someone *newly joins* a slot, the bot also posts a short
+ping so others get notified and can join in.
+
+## Subs board
+
+The subs board coordinates "I need a sub" / "I can sub" through buttons. Two
+commands:
+
+- **`/subs`** opens your **private** copy of the board (ephemeral — only you see
+  it, nothing is posted to the channel). Use it to check what's open and act.
+- **`/subsboard`** posts the **shared** board to the channel and pins it
+  (restricted to members who can manage messages). Run it once per channel.
+
+Both show the same board; every action (taking a spot, posting a request,
+inviting a sub) updates the shared pinned board, and acting from your private
+board refreshes it in place. The buttons:
+
+- **➕ Need a sub** walks you through league → your team → which game → how many
+  spots. Leagues, teams, and games are pulled live from the club's league pages
+  (the same source as `/sheets`), so you pick from real data instead of typing
+  it. (No game listed? Pick *Enter date manually*.) After posting you can invite
+  an available sub right away.
+- A numbered **Sub for …** button appears per open request. Click to take an
+  open spot, click again to drop it. The requester is notified of every change.
+- **🙋 I can sub** lets you pick a league and the upcoming games you can cover
+  (or none, for "any game"), listing you on the board's available-subs section.
+- **🛠 Manage** (requester only) lets you add/remove a member directly, **invite
+  an available sub** (they get a DM to confirm), or close a request early.
+
+When inviting an available sub, they receive a DM with **Confirm / Can't**
+buttons; the spot is held as **pending** (shown on the board) until they accept,
+then it flips to filled. Either way the requester is notified.
+
+Game pickers show **all upcoming games** for the chosen league. Requests carry
+the game's date/time and **auto-expire** a few hours after it starts
+(`SUBS_GRACE_HOURS`, default 3); availability tied to specific games expires once
+those games pass — checked every 15 minutes and on startup.
+
+Notifications try a DM first and fall back to an @-mention in the board channel
+if the member has DMs closed.
+
+State is kept in a small JSON file (`SUBS_STORE_PATH`, default `subs_store.json`)
+and the buttons survive bot restarts. The board is generic by design (each
+request has a `kind` field), so the same machinery can later back pickup games,
+team-building, etc.
+
+> Requires `discord.py >= 2.4` (persistent per-request buttons). For pinning,
+> invite the bot with the **Manage Messages** permission; without it the board
+> still works, just unpinned.
 
 ## Setup
 
@@ -58,14 +121,20 @@ All configuration is via environment variables (see `.env.example`):
 | Variable | Purpose |
 |---|---|
 | `DISCORD_TOKEN` | Discord bot token |
+| `DEV_GUILD_ID` | Optional. Server ID for instant slash-command sync (dev). Unset = global sync (~1h). |
 | `SITE_BASE_URL` | Target WordPress site, no trailing slash |
 | `CLUB_NAME` | Name shown in the Discord embed |
+| `NUM_SHEETS` | Number of sheets at the facility (default 4) |
+| `PRACTICE_STORE_PATH` | Practice sign-up pool state file (default `practice_signups.json`) |
 | `GF_CONSUMER_KEY` / `GF_CONSUMER_SECRET` | Gravity Forms REST API v2 credentials |
 | `LEAGUE_CACHE_TTL` | League-page cache lifetime in seconds (default 21600 = 6h) |
+| `TIMEZONE_OFFSET` | Club UTC offset for subs date/time parsing (default -5) |
+| `SUBS_STORE_PATH` | Subs board state file (default `subs_store.json`) |
+| `SUBS_GRACE_HOURS` | Hours after game start before a request expires (default 3) |
 
-A few site-specific constants live at the top of `bot.py` — `TOTAL_SHEETS`,
-`PEOPLE_PER_SHEET`, `PRICE_PER_PERSON`, `TIMEZONE_OFFSET`, the form IDs, and the
-practice category slug. Adjust to match your site.
+Sheet count is set via `NUM_SHEETS`. A few other site-specific constants live at
+the top of `bot.py` — `PEOPLE_PER_SHEET`, `PRICE_PER_PERSON`, `TIMEZONE_OFFSET`,
+the form IDs, and the practice category slug. Adjust to match your site.
 
 ## How data is sourced
 

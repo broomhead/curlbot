@@ -55,7 +55,11 @@ class GFClient:
         ) as resp:
             if resp.status == 401:
                 raise RuntimeError("GF auth failed — check GF_CONSUMER_KEY / GF_CONSUMER_SECRET")
-            resp.raise_for_status()
+            if resp.status >= 400:
+                # NB: credentials ride in the query string, so the default
+                # ClientResponseError (which embeds the full URL) would leak the
+                # consumer key/secret. Raise a sanitized error with only path+status.
+                raise RuntimeError(f"GF request failed ({resp.status}) for {path}") from None
             return await resp.json()
 
     async def forms(self) -> list[dict]:

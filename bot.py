@@ -31,17 +31,29 @@ from discord.ext import commands
 from gf_client import GFClient
 from league_client import get_cached_leagues, draw_to_datetime
 import practice_ice as pi
+import practice_store as ps
+import subs
 
 log = logging.getLogger(__name__)
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
+# Dev mode: set DEV_GUILD_ID to your server's ID to sync slash commands to that
+# one guild — they appear instantly, instead of the ~1h global propagation.
+# Leave unset in production for a normal global sync.
+DEV_GUILD_ID  = int(os.environ["DEV_GUILD_ID"]) if os.environ.get("DEV_GUILD_ID") else None
 SITE_BASE_URL = os.environ.get("SITE_BASE_URL", "https://example.com")
 CLUB_NAME     = os.environ.get("CLUB_NAME", "Curling Club")
 WP_API        = f"{SITE_BASE_URL}/wp-json/tribe/events/v1"
-TOTAL_SHEETS  = 4
+# Sheet count varies by facility — configure via NUM_SHEETS (default 4).
+TOTAL_SHEETS  = int(os.environ.get("NUM_SHEETS", "4"))
 TIMEZONE_OFFSET = -5  # America/Chicago (CST = UTC-5, CDT = UTC-6)
+
+# Practice sign-up pool (shared across members; interactions stay private).
+PRACTICE_STORE_PATH = os.environ.get("PRACTICE_STORE_PATH", "practice_signups.json")
+_practice_state = ps.load(PRACTICE_STORE_PATH)
+_practice_lock = asyncio.Lock()
 
 PRACTICE_SLUG = "practice"
 
@@ -291,49 +303,243 @@ intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
+async def setup_hook():
+    # Register persistent per-request buttons so they keep working across
+    # restarts, then load the subs cog (adds the /subs command + board logic).
+    bot.add_dynamic_items(
+        subs.NewRequestButton,
+        subs.AvailableButton,
+        subs.ManageButton,
+        subs.TakeSpotButton,
+        subs.ConfirmButton,
+        subs.DeclineButton,
+        JoinPracticeButton,
+    )
+    await bot.add_cog(subs.Subs(bot))
+
+    # Sync slash commands once, here (on_ready can fire repeatedly on reconnect).
+    if DEV_GUILD_ID:
+        guild = discord.Object(id=DEV_GUILD_ID)
+        bot.tree.copy_global_to(guild=guild)        # stage every command onto the dev guild
+        synced = await bot.tree.sync(guild=guild)   # replaces the guild's set — instant
+        # Flush the GLOBAL set so commands don't also show as a second (global)
+        # copy in the dev guild. copy_global_to already captured them above.
+        bot.tree.clear_commands(guild=None)
+        await bot.tree.sync()
+        print(f"🔧  Dev mode: synced {len(synced)} command(s) to guild {DEV_GUILD_ID} "
+              f"(instant) and cleared global commands.")
+    else:
+        synced = await bot.tree.sync()              # global — up to ~1h to appear
+        print(f"🌐  Synced {len(synced)} command(s) globally (allow up to ~1h to appear).")
+
+bot.setup_hook = setup_hook
+
+
 @bot.event
 async def on_ready():
-    await bot.tree.sync()
-    print(f"✅  Logged in as {bot.user} — slash commands synced.")
+    cog = bot.get_cog("Subs")
+    if cog is not None:
+        await cog.startup()  # prune expired requests and refresh the pinned board
+    print(f"✅  Logged in as {bot.user}.")
 
 
-@bot.tree.command(name="sheets", description="Check free sheets during upcoming practice ice")
-@app_commands.describe(upcoming="How many upcoming practices to show (1–5, default 1)")
-async def sheets_cmd(interaction: discord.Interaction, upcoming: int = 1):
-    upcoming = max(1, min(upcoming, 5))
-    await interaction.response.defer()
+# ── Practice ice: live report + open sign-up pool ───────────────────────────
 
+MAX_SIGNUP_BUTTONS = 20  # leave headroom under Discord's 25-component cap
+
+def session_key(opp: dict) -> str:
+    """Stable per-slot key from the session start minute (e.g. '20260616T1945')."""
+    return opp["start"].strftime("%Y%m%dT%H%M")
+
+
+class SheetsError(Exception):
+    """Carries a user-facing message for a failed /sheets fetch."""
+
+
+async def fetch_opps(upcoming: int) -> list[dict]:
+    """Fetch the practice-ice opportunities (raises SheetsError with a message)."""
     try:
         practices = await fetch_upcoming_practices(upcoming)
-    except Exception as e:
-        await interaction.followup.send(f"❌  Could not reach the event calendar: `{e}`")
-        return
-
+    except Exception:  # noqa: BLE001 — log detail server-side, show a safe message
+        log.exception("Calendar fetch failed")
+        raise SheetsError("❌  Could not reach the event calendar right now — please try again shortly.")
     if not practices:
-        await interaction.followup.send("⚠️  No upcoming practice events found on the calendar.")
-        return
-
-    # The N practice blocks define the lookahead window; LTCs and league draws
-    # between now and the last block surface as additional practice ice.
+        return []
     window_start = now_club()
     window_end   = max(datetime.fromisoformat(p["end_date"]) for p in practices)
-
     try:
         async with GFClient() as gf:
             sessions = await collect_sessions(practices, window_start, window_end, gf)
-    except Exception as ex:
-        await interaction.followup.send(f"❌  Registration data error: `{ex}`")
-        return
+    except Exception:  # noqa: BLE001 — never surface raw errors (they can carry the GF URL+creds)
+        log.exception("Registration data fetch failed")
+        raise SheetsError("❌  Couldn't load registration data right now — please try again shortly.")
+    return pi.practice_opportunities(sessions, TOTAL_SHEETS)
 
-    opps = pi.practice_opportunities(sessions, TOTAL_SHEETS)
+
+async def build_sheets_payload(upcoming: int, user) -> tuple[discord.Embed, discord.ui.View | None]:
+    """Build the (ephemeral) practice-ice embed + sign-up view for a member."""
+    opps = await fetch_opps(upcoming)
+
+    # Register each session and snapshot sign-up counts under the lock.
+    async with _practice_lock:
+        ps.expire(_practice_state, now_club())
+        keyed = []
+        for o in opps[:MAX_SIGNUP_BUTTONS]:
+            key = session_key(o)
+            label = f"{o['start'].strftime('%a %b %-d')} · {o['start'].strftime('%-I:%M %p')}"
+            ps.register_session(_practice_state, key, when_ts=o["start"].isoformat(),
+                                label=label, sheets=o.get("free"))
+            keyed.append((o, key, ps.count(_practice_state, key),
+                          ps.is_signed_up(_practice_state, key, user.id)))
+        ps.save(PRACTICE_STORE_PATH, _practice_state)
 
     embed = discord.Embed(title=f"🥌  Practice Ice — {CLUB_NAME}", color=0x1a6bb5)
     if not opps:
         embed.description = "🔴  No sheets free during the upcoming practice window."
+        embed.set_footer(text="Only you can see this · source: calendar + Gravity Forms + leagues")
+        return embed, None
+
+    lines, view = [], discord.ui.View(timeout=None)
+    for o, key, n, mine in keyed:
+        line = pi.format_opportunity(o, TOTAL_SHEETS)[1]
+        line += f"\n    🧹 **{n}** signed up to practice" + (" · you're in" if mine else "")
+        lines.append(line)
+        view.add_item(JoinPracticeButton(key, upcoming, o["start"], n, mine))
+    embed.description = "\n\n".join(lines)
+    embed.set_footer(text="Tap a slot to sign up · only you can see this report")
+    return embed, view
+
+
+def build_practice_board_embed() -> discord.Embed:
+    """Public, always-current practice sign-up board (built from the store only)."""
+    e = discord.Embed(title=f"🧹  Practice Sign-ups — {CLUB_NAME}", color=0x1a6bb5)
+    sessions = [s for s in ps.active_sessions(_practice_state) if s.get("users")]
+    if not sessions:
+        e.description = "No one's signed up to practice yet.\n\nRun **/sheets** to see open ice and join a slot."
     else:
-        embed.description = "\n\n".join(pi.format_opportunity(o, TOTAL_SHEETS)[1] for o in opps)
-    embed.set_footer(text="Source: event calendar + Gravity Forms + league pages")
-    await interaction.followup.send(embed=embed)
+        lines = []
+        for s in sessions:
+            sheets = s.get("sheets")
+            free = f"{sheets} sheet{'s' if sheets != 1 else ''} free · " if sheets is not None else ""
+            names = ", ".join(u["name"] for u in s["users"])
+            lines.append(f"🧹  **{s.get('label', s['key'])}** · {free}{len(s['users'])} in\n    {names}")
+        e.description = "\n\n".join(lines)
+    e.set_footer(text="Use /sheets to join · updates as people sign up")
+    return e
+
+
+async def render_practice_board(target_channel=None):
+    """Edit the pinned practice board (creating/moving it to `target_channel` when
+    given). Safe to call with no target — it just refreshes an existing board."""
+    async with _practice_lock:
+        ps.expire(_practice_state, now_club())
+        embed = build_practice_board_embed()
+        board = _practice_state.get("board")
+        ps.save(PRACTICE_STORE_PATH, _practice_state)
+
+    # If the board exists in a different channel than where the action happened,
+    # move it (people want it where they're using the bot).
+    if board and target_channel is not None and board.get("channel_id") != target_channel.id:
+        try:
+            ch = bot.get_channel(board["channel_id"]) or await bot.fetch_channel(board["channel_id"])
+            old = await ch.fetch_message(board["message_id"])
+            await old.delete()
+        except discord.HTTPException:
+            pass
+        board = None
+
+    if board:
+        try:
+            ch = bot.get_channel(board["channel_id"]) or await bot.fetch_channel(board["channel_id"])
+            msg = await ch.fetch_message(board["message_id"])
+            await msg.edit(embed=embed)
+            return
+        except discord.NotFound:
+            board = None
+        except discord.HTTPException:
+            return
+
+    if target_channel is not None:
+        try:
+            msg = await target_channel.send(embed=embed)
+            try:
+                await msg.pin()
+            except discord.HTTPException:
+                pass  # no Manage Messages — board still works unpinned
+        except discord.HTTPException:
+            return
+        async with _practice_lock:
+            _practice_state["board"] = {"channel_id": target_channel.id, "message_id": msg.id}
+            ps.save(PRACTICE_STORE_PATH, _practice_state)
+
+
+class JoinPracticeButton(discord.ui.DynamicItem[discord.ui.Button],
+                         template=r"sheet:join:(?P<key>\d{8}T\d{4}):(?P<up>\d+)"):
+    def __init__(self, key: str, upcoming: int, start: datetime | None = None,
+                 count: int = 0, mine: bool = False):
+        self.key = key
+        self.upcoming = int(upcoming)
+        when = start.strftime('%a %-I:%M%p').lower() if start else key
+        label = f"{'Leave' if mine else 'Practice'} {when} ({count})"
+        super().__init__(discord.ui.Button(
+            label=label[:80],
+            style=discord.ButtonStyle.secondary if mine else discord.ButtonStyle.success,
+            custom_id=f"sheet:join:{key}:{upcoming}",
+        ))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match["key"], int(match["up"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        when_ts = ""
+        try:
+            when_ts = datetime.strptime(self.key, "%Y%m%dT%H%M").isoformat()
+        except ValueError:
+            pass
+        async with _practice_lock:
+            result = ps.toggle(_practice_state, self.key, interaction.user.id,
+                               interaction.user.display_name, when_ts=when_ts, now=now_club())
+            label = _practice_state["sessions"].get(self.key, {}).get("label", self.key)
+            n = ps.count(_practice_state, self.key)
+            ps.save(PRACTICE_STORE_PATH, _practice_state)
+
+        # Refresh the (private) report in place so counts stay current.
+        try:
+            embed, view = await build_sheets_payload(self.upcoming, interaction.user)
+            await interaction.edit_original_response(embed=embed, view=view)
+        except SheetsError:
+            pass  # keep the existing message if the refresh fetch hiccups
+
+        # Update the shared, pinned practice board in this channel…
+        await render_practice_board(interaction.channel)
+        # …and ping the channel when someone newly joins, so others can join in.
+        if result == "joined" and interaction.channel is not None:
+            try:
+                await interaction.channel.send(
+                    f"🧹  **{interaction.user.display_name}** is in for **{label}** "
+                    f"— {n} signed up to practice. Come throw some rocks!")
+            except discord.HTTPException:
+                pass
+
+        await interaction.followup.send(
+            (f"🧹  You're signed up for **{label}** — the channel board's updated." if result == "joined"
+             else f"👍  Removed you from practice on **{label}**."),
+            ephemeral=True)
+
+
+@bot.tree.command(name="sheets", description="Check free sheets and sign up to practice (only you see it)")
+@app_commands.describe(upcoming="How many upcoming practices to show (1–5, default 1)")
+async def sheets_cmd(interaction: discord.Interaction, upcoming: int = 1):
+    upcoming = max(1, min(upcoming, 5))
+    await interaction.response.defer(ephemeral=True)
+    try:
+        embed, view = await build_sheets_payload(upcoming, interaction.user)
+    except SheetsError as e:
+        await interaction.followup.send(str(e), ephemeral=True)
+        return
+    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
 bot.run(DISCORD_TOKEN)
