@@ -1,14 +1,22 @@
-# Curling Club Practice-Ice Bot
+# Curling Club Discord Bot
 
-A Discord bot that reports how many of a curling club's 4 sheets are free during
-upcoming practice ice. It reads a WordPress site's public event calendar (The
-Events Calendar), Gravity Forms registrations, and the league pages, then lists
-every upcoming session that leaves a sheet open.
+A Discord bot that helps a curling club coordinate ice time. It has three
+features:
 
-It is configured for a single site via environment variables — the target
-domain and club name are not hardcoded.
+- **Practice ice (`/sheets`)** — reports how many sheets are free during upcoming
+  practice ice, read live from the club's WordPress site (The Events Calendar,
+  Gravity Forms registrations, and the public league pages).
+- **Practice sign-ups** — an open pool to say "I want to practice this slot," with
+  a shared, auto-updating board so members can rally when someone's going.
+- **Subs board (`/subs`)** — "I need a sub" / "I can sub" coordination tied to real
+  league teams and game dates, with spot-filling, DM confirmations, and
+  notifications.
 
-## What it shows
+Everything is configured for a single site via environment variables — the
+target domain, club name, and sheet count are not hardcoded. The number of sheets
+is set with `NUM_SHEETS` (default 4), since facilities differ.
+
+## Practice ice — what it shows
 
 `/sheets [upcoming]` lists practice-ice opportunities in time order, each as
 **time · type · sheets free · date**. The reply is **private** (ephemeral — only
@@ -93,10 +101,14 @@ team-building, etc.
 
 1. Create a Discord application and bot (Developer Portal → New Application →
    Bot → copy the token). Under OAuth2 → URL Generator, select `bot` +
-   `applications.commands` and the `Send Messages` permission, then invite it.
+   `applications.commands` and the `Send Messages`, `Embed Links`, and
+   `Manage Messages` permissions (the last is needed to pin the boards), then
+   invite it.
 2. Copy `.env.example` to `.env` and fill in the values (Discord token, site
-   URL, club name, Gravity Forms REST key/secret).
-3. Run it.
+   URL, club name, sheet count, Gravity Forms REST key/secret).
+3. Run it. The bot syncs slash commands on startup (`/sheets`, `/subs`,
+   `/subsboard`); set `DEV_GUILD_ID` to your server for instant command updates
+   while testing (otherwise a global sync can take up to ~1h to appear).
 
 ### Docker (recommended)
 
@@ -110,9 +122,6 @@ docker compose up --build -d
 pip install -r requirements.txt
 python bot.py
 ```
-
-The bot syncs slash commands on startup; allow up to a minute for `/sheets` to
-appear in Discord.
 
 ## Configuration
 
@@ -151,6 +160,25 @@ the form IDs, and the practice category slug. Adjust to match your site.
 League data is cached locally with a TTL (default 6h); calendar and Gravity
 Forms data are fetched live per command via a single ranged request with
 concurrent lookups.
+
+## Security & privacy
+
+- **Secrets live only in `.env`** (the Discord token and Gravity Forms key/secret),
+  which is gitignored. Nothing sensitive is committed; `.env.example` holds only
+  placeholders. No club identity is baked into source — everything is env-driven.
+- **Runtime data stays local and out of git:** `subs_store.json`,
+  `practice_signups.json`, and `league_cache.json` (plus their `.tmp` siblings)
+  are gitignored. These hold Discord display names and numeric IDs only.
+- **Errors are never echoed raw to Discord.** Gravity Forms credentials ride in
+  the request query string (to survive proxies that strip auth headers), so a
+  failed request's default error would embed the URL — and the credentials.
+  `gf_client` raises a sanitized error (status + path only) and commands log full
+  detail server-side while showing a generic message. When adding new code, never
+  interpolate a raw exception or request URL into a user-facing message.
+- **Member-facing commands are private:** `/sheets` and `/subs` reply ephemerally.
+  The shared practice board and the subs board intentionally show display names so
+  members can coordinate. DM confirm/decline actions are validated against the
+  invited user's ID, so only the invitee can respond.
 
 ## Developer scripts
 
