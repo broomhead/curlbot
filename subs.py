@@ -27,6 +27,7 @@ from __future__ import annotations
 import os
 import re
 import html
+import time
 import logging
 from datetime import datetime, date, timedelta, timezone
 
@@ -44,6 +45,11 @@ CLUB_NAME       = os.environ.get("CLUB_NAME", "Curling Club")
 TIMEZONE_OFFSET = int(os.environ.get("TIMEZONE_OFFSET", "-5"))  # America/Chicago default
 GRACE_HOURS     = int(os.environ.get("SUBS_GRACE_HOURS", str(store.DEFAULT_GRACE_HOURS)))
 MAX_BUTTON_REQUESTS = 20  # Discord caps a message at 25 components; reserve a row for controls.
+# Several buttons act on shared state and can be impatiently double-tapped before
+# the first click visibly resolves. We ignore a repeat click (same user, same
+# target) within this window so a double-tap is idempotent: a "Take a spot" toggle
+# can't take-then-drop, and a Confirm/Decline can't clobber its own result.
+CLICK_DEBOUNCE_SECONDS = 3.0
 
 CID_NEW    = "sub:new"
 CID_AVAIL  = "sub:avail"
@@ -125,11 +131,35 @@ def first_name(name: str) -> str:
 
 # ── League / game helpers ───────────────────────────────────────────────────
 
+# Admins embed scheduling noise in league titles (e.g. "– Summer 2026 League 2 –
+# Begins July 5"). We strip the date/time-ish tokens so the name doesn't echo the
+# game date/time we already display. Best-effort across formats — weekday names
+# (Sunday/Tuesday/…) are deliberately NOT stripped since they're part of the name.
+_MONTHS = (r"(?:January|February|March|April|May|June|July|August|September|October|"
+           r"November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)")
+_TITLE_NOISE = [
+    re.compile(r"\bBegins\b.*$", re.I),                                    # "Begins July 5" tail
+    re.compile(r"\b\d{1,2}:\d{2}\s*(?:[ap]\.?m\.?)?", re.I),               # 9:00 AM, 19:30
+    re.compile(r"\b\d{1,2}\s*[ap]\.?m\.?\b", re.I),                        # 9am, 7 pm
+    re.compile(r"\b\d{4}-\d{2}-\d{2}\b"),                                  # 2026-07-05
+    re.compile(r"\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b"),                       # 7/5, 07/05/26
+    re.compile(rf"\b{_MONTHS}\b\.?\s*\d{{0,2}}(?:st|nd|rd|th)?", re.I),    # July 5, Jul
+    re.compile(r"\b(?:Spring|Summer|Fall|Autumn|Winter)\b", re.I),        # season
+    re.compile(r"\b(?:19|20)\d{2}\b"),                                    # 2026
+]
+
+
 def clean_title(title: str) -> str:
-    """Decode HTML entities and trim the verbose '– Begins <date>' tail."""
+    """Decode HTML entities and strip admin-embedded date/time noise (seasons,
+    years, month-dates, clock times, "Begins …" tails) plus orphaned punctuation,
+    so the league name doesn't repeat the game date/time we already show."""
     t = html.unescape(title or "")
-    t = re.split(r"\s[–—-]\s*Begins\b", t)[0]
-    return t.strip()
+    for pat in _TITLE_NOISE:
+        t = pat.sub(" ", t)
+    t = re.sub(r"[(\[]\s*[)\]]", " ", t)               # drop emptied ()/[] pairs
+    t = re.sub(r"\s+", " ", t)                          # collapse whitespace
+    t = re.sub(r"(?:\s*[–—\-·,]\s*){2,}", " – ", t)    # collapse separator runs
+    return t.strip(" –—-·,")
 
 
 def _truncate(s: str, n: int) -> str:
@@ -166,9 +196,25 @@ def league_games(league: dict, now: datetime) -> list[dict]:
 
 # ── Board rendering ─────────────────────────────────────────────────────────
 
+BOARD_TITLE = f"🥌  Subs Board — {CLUB_NAME}"
+
+
+def _looks_like_board(msg) -> bool:
+    """True if a message is one of our pinned subs boards (by embed title)."""
+    return any("Subs Board" in (e.title or "") for e in msg.embeds)
+
+
+def _game_key(iso: str) -> str:
+    """Game timestamp normalized to the minute, for matching availability to requests."""
+    try:
+        return datetime.fromisoformat(iso).replace(second=0, microsecond=0).isoformat()
+    except (ValueError, TypeError):
+        return iso or ""
+
+
 def build_embed(state: dict) -> discord.Embed:
     reqs = store.requests_sorted(state)
-    e = discord.Embed(title=f"🥌  Subs Board — {CLUB_NAME}", color=0x1a6bb5)
+    e = discord.Embed(title=BOARD_TITLE, color=0x1a6bb5)
 
     if not reqs:
         e.description = "No open sub requests right now.\n\nPress **➕ Need a sub** to post one."
@@ -177,52 +223,80 @@ def build_embed(state: dict) -> discord.Embed:
         for i, r in enumerate(reqs[:MAX_BUTTON_REQUESTS], start=1):
             opn = store.open_spots(r)
             icon = "🟢" if opn > 0 else "✅"
-            head = f"{icon}  **{fmt_when(r['game_ts'])}**"
+            # League name is intentionally omitted — it's redundant with the
+            # date/time (and the league title itself embeds the season/date).
             bits = []
-            if r.get("league"):
-                bits.append(_truncate(r["league"], 40))
             if r.get("team"):
                 bits.append(f"Team {r['team']}")
-            bits.append(f"needs {r['spots_needed']}")
-            head += " · " + " · ".join(bits)
+            status = f"{len(r.get('filled', []))}/{r['spots_needed']} filled"
+            # Name the subs so you can see who you're playing with (pending = invited
+            # but not yet confirmed).
             names = [f["name"] for f in r.get("filled", [])]
             names += [f"{p['name']} (pending)" for p in r.get("pending", [])]
-            filled = ", ".join(names) or "nobody yet"
-            sub = f"    by {r['requester_name']} · filled: {filled}"
-            sub += f" · {opn} open" if opn > 0 else " · full"
-            lines.append(f"`{i}.` {head}\n{sub}")
+            if names:
+                status += " — " + ", ".join(names)
+            bits.append(status)
+            lines.append(f"`{i}.` {icon}  **{fmt_when(r['game_ts'])}** · " + " · ".join(bits))
         e.description = "\n\n".join(lines)
         if len(reqs) > MAX_BUTTON_REQUESTS:
             e.description += f"\n\n…and {len(reqs) - MAX_BUTTON_REQUESTS} more (older ones fill first)."
 
     avail = state.get("availability", [])
     if avail:
-        rows = []
+        # Anyone already filled/pending on a request is no longer "available" for that
+        # game — hide them from the list (keyed by user + league + game-minute). When a
+        # requester later removes them they're un-committed again and reappear here;
+        # only a self-drop deletes their availability outright.
+        committed = set()
+        for r in state.get("requests", []):
+            lid_r = str(r.get("league_id") or "")
+            gk = _game_key(r.get("game_ts", ""))
+            for m in r.get("filled", []) + r.get("pending", []):
+                committed.add((m["user_id"], lid_r, gk))
+        # Grouped by league → game so the board answers "who can sub THIS game?" at a
+        # glance, instead of a per-person list you have to scan for dates. Subs who
+        # listed no specific games are shown on an "any game" line for that league.
+        groups: dict[str, dict] = {}
+        order: list[str] = []
         for a in avail:
-            line = "• " + a["name"]
-            if a.get("league"):
-                line += f" — {_truncate(a['league'], 40)}"
+            lkey = str(a.get("league_id") or "")
+            if lkey not in groups:
+                groups[lkey] = {"title": clean_title(a.get("league", "")) or "Other league",
+                                "games": {}, "any": []}
+                order.append(lkey)
+            g = groups[lkey]
             games = a.get("games") or []
             if games:
-                line += " · " + ", ".join(fmt_when(g) for g in games)
+                for iso in games:
+                    if (a["user_id"], lkey, _game_key(iso)) in committed:
+                        continue  # already subbing this game — not available for it
+                    g["games"].setdefault(iso, []).append(a["name"])
             else:
-                line += " · any game"
-            if a.get("note"):
-                line += f" ({a['note']})"
-            rows.append(line)
-        e.add_field(name="🙋  Available to sub", value="\n".join(rows)[:1024], inline=False)
+                g["any"].append(a["name"])
+        rows = []
+        for lkey in order:
+            g = groups[lkey]
+            if not g["games"] and not g["any"]:
+                continue  # everyone offered here is already committed — nothing to show
+            rows.append(f"**{_truncate(g['title'], 40)}**")
+            for iso in sorted(g["games"]):
+                rows.append(f"{fmt_when(iso)} — {', '.join(sorted(g['games'][iso]))}")
+            if g["any"]:
+                rows.append(f"any game — {', '.join(sorted(g['any']))}")
+        if rows:
+            e.add_field(name="🙋  Available to sub", value="\n".join(rows)[:1024], inline=False)
 
-    e.set_footer(text="Tap a number to take a spot · ➕ post a request · 🙋 offer to sub")
+    e.set_footer(text="➕ post a request · 🙋 offer to sub")
     return e
 
 
 def build_view(state: dict) -> discord.ui.View:
+    # Just the three control buttons. Claiming an open spot is done from the
+    # "I can sub" flow (multi-select of open requests), not per-request buttons.
     view = discord.ui.View(timeout=None)
     view.add_item(NewRequestButton())
     view.add_item(AvailableButton())
     view.add_item(ManageButton())
-    for i, r in enumerate(store.requests_sorted(state)[:MAX_BUTTON_REQUESTS], start=1):
-        view.add_item(TakeSpotButton(r["id"], index=i, req=r))
     return view
 
 
@@ -241,14 +315,16 @@ class NewRequestButton(discord.ui.DynamicItem[discord.ui.Button], template=r"sub
 
     async def callback(self, interaction: discord.Interaction):
         cog: "Subs" = interaction.client.get_cog("Subs")
-        await interaction.response.defer(ephemeral=True)
+        # thinking=True shows an ephemeral "curlbot is thinking…" right away while we
+        # load leagues, then we edit that placeholder into the flow.
+        await interaction.response.defer(thinking=True, ephemeral=True)
         leagues = await cog.get_leagues()
         if not leagues:
-            await interaction.followup.send(
-                "Couldn't load the league list just now — try again in a moment.", ephemeral=True)
+            await interaction.edit_original_response(
+                content="Couldn't load the league list just now — try again in a moment.")
             return
         view = NeedSubFlowView(leagues)
-        view.message = await interaction.followup.send(content=view.prompt(), view=view, ephemeral=True)
+        view.message = await interaction.edit_original_response(content=view.prompt(), view=view)
 
 
 class AvailableButton(discord.ui.DynamicItem[discord.ui.Button], template=r"sub:avail"):
@@ -264,14 +340,16 @@ class AvailableButton(discord.ui.DynamicItem[discord.ui.Button], template=r"sub:
 
     async def callback(self, interaction: discord.Interaction):
         cog: "Subs" = interaction.client.get_cog("Subs")
-        await interaction.response.defer(ephemeral=True)
+        # thinking=True shows an ephemeral "curlbot is thinking…" right away while we
+        # load leagues, then we edit that placeholder into the flow.
+        await interaction.response.defer(thinking=True, ephemeral=True)
         leagues = await cog.get_leagues()
         if not leagues:
-            await interaction.followup.send(
-                "Couldn't load the league list just now — try again in a moment.", ephemeral=True)
+            await interaction.edit_original_response(
+                content="Couldn't load the league list just now — try again in a moment.")
             return
-        view = AvailFlowView(leagues, interaction.user.id)
-        view.message = await interaction.followup.send(content=view.prompt(), view=view, ephemeral=True)
+        view = AvailFlowView(leagues, interaction.user.id, cog.state)
+        view.message = await interaction.edit_original_response(content=view.prompt(), view=view)
 
 
 class ManageButton(discord.ui.DynamicItem[discord.ui.Button], template=r"sub:manage"):
@@ -287,36 +365,32 @@ class ManageButton(discord.ui.DynamicItem[discord.ui.Button], template=r"sub:man
 
     async def callback(self, interaction: discord.Interaction):
         cog: "Subs" = interaction.client.get_cog("Subs")
-        mine = [r for r in store.requests_sorted(cog.state) if r["requester_id"] == interaction.user.id]
-        if not mine:
+        uid = interaction.user.id
+        has_avail = any(a.get("user_id") == uid for a in cog.state.get("availability", []))
+        if not (_my_requests(cog.state, uid) or _my_spots(cog.state, uid) or has_avail):
             await interaction.response.send_message(
-                "You have no open sub requests to manage.", ephemeral=True)
+                "Nothing to manage yet — you have no open requests, sub spots, or availability listed.",
+                ephemeral=True)
             return
         await interaction.response.send_message(
-            "Pick a request to manage:", view=ManagePickView(mine), ephemeral=True)
-
-
-class TakeSpotButton(discord.ui.DynamicItem[discord.ui.Button], template=r"sub:take:(?P<rid>[0-9a-f]+)"):
-    def __init__(self, rid: str, index: int | None = None, req: dict | None = None):
-        self.rid = rid
-        if req is not None:
-            opn = store.open_spots(req)
-            label = f"{index}. {first_name(req['requester_name'])} · {fmt_when_short(req['game_ts'])} ({len(req['filled'])}/{req['spots_needed']})"
-            style = discord.ButtonStyle.success if opn > 0 else discord.ButtonStyle.secondary
-        else:
-            label, style = "Take a spot", discord.ButtonStyle.secondary
-        super().__init__(discord.ui.Button(label=label[:80], style=style, custom_id=f"sub:take:{rid}"))
-
-    @classmethod
-    async def from_custom_id(cls, interaction, item, match):
-        return cls(match["rid"])
-
-    async def callback(self, interaction: discord.Interaction):
-        cog: "Subs" = interaction.client.get_cog("Subs")
-        await cog.handle_take(interaction, self.rid)
+            "**Manage** — your requests, the spots you're subbing, and your availability:",
+            view=ManageHomeView(cog.state, uid), ephemeral=True)
 
 
 # ── Shared selects for the league/game flows ────────────────────────────────
+
+def _unique_options(opts: list[discord.SelectOption]) -> list[discord.SelectOption]:
+    """Drop options whose value repeats, keeping the first. Discord rejects a
+    Select whose options share a value (error 50035: "option value is already
+    used"), which would otherwise fail the whole message render."""
+    seen, out = set(), []
+    for o in opts:
+        if o.value in seen:
+            continue
+        seen.add(o.value)
+        out.append(o)
+    return out
+
 
 class LeagueSelect(discord.ui.Select):
     def __init__(self, leagues: list[dict], selected, row: int = 0):
@@ -329,7 +403,8 @@ class LeagueSelect(discord.ui.Select):
             )
             for l in leagues[:25]
         ] or [discord.SelectOption(label="No active leagues", value="__none__")]
-        super().__init__(placeholder="Choose a league…", min_values=1, max_values=1, options=opts, row=row)
+        super().__init__(placeholder="Choose a league…", min_values=1, max_values=1,
+                         options=_unique_options(opts), row=row)
 
     async def callback(self, interaction: discord.Interaction):
         if self.values[0] == "__none__":
@@ -342,24 +417,48 @@ class LeagueSelect(discord.ui.Select):
 
 class TeamSelect(discord.ui.Select):
     def __init__(self, names: list[str], selected, row: int = 1):
-        opts = [
+        opts = _unique_options([
             discord.SelectOption(label=_truncate(n, 100), value=_truncate(n, 100), default=(n == selected))
-            for n in names[:25]
-        ]
-        super().__init__(placeholder="Your team…", min_values=1, max_values=1, options=opts, row=row)
+            for n in names[:24]
+        ])
+        # Always allow a typed team — some leagues expose no team list, and the
+        # requester may want a name that isn't in it.
+        opts.append(discord.SelectOption(label="⌨️ Enter team manually…", value="__manual__"))
+        placeholder = "Your team…" if names else "Enter your team…"
+        super().__init__(placeholder=placeholder, min_values=1, max_values=1, options=opts, row=row)
 
     async def callback(self, interaction: discord.Interaction):
+        if self.values[0] == "__manual__":
+            await interaction.response.send_modal(TeamModal(self.view))
+            return
         self.view.team = self.values[0]
         await self.view.refresh(interaction)
+
+
+class TeamModal(discord.ui.Modal, title="Enter your team"):
+    team_in = discord.ui.TextInput(label="Team name", placeholder="e.g. Simpson", required=True, max_length=60)
+
+    def __init__(self, flow):
+        super().__init__()
+        self.flow = flow
+
+    async def on_submit(self, interaction: discord.Interaction):
+        self.flow.team = str(self.team_in).strip()
+        await interaction.response.defer()
+        try:
+            await self.flow.message.edit(content=self.flow.prompt(), view=self.flow.build())
+        except discord.HTTPException:
+            pass
 
 
 class GameSelect(discord.ui.Select):
     def __init__(self, games: list[dict], selected_isos, *, multi: bool, allow_manual: bool, row: int = 2):
         self.multi = multi
-        opts = [
+        # Two draws can share a start time; dedupe so the iso values stay unique.
+        opts = _unique_options([
             discord.SelectOption(label=_truncate(g["label"], 100), value=g["iso"], default=(g["iso"] in (selected_isos or [])))
             for g in games[:23]
-        ]
+        ])
         if allow_manual:
             opts.append(discord.SelectOption(label="⌨️ Enter date manually…", value="__manual__"))
         if not opts:
@@ -430,6 +529,7 @@ class NeedSubFlowView(discord.ui.View):
         self.game_iso = None
         self.spots = 1
         self.message = None
+        self.posted = False  # one-shot guard: a posted flow can't post again
         self.build()
 
     def league(self) -> dict | None:
@@ -445,8 +545,9 @@ class NeedSubFlowView(discord.ui.View):
         lg = self.league()
         if lg:
             names = lg.get("team_names") or []
-            if names:
-                self.add_item(TeamSelect(names, self.team, row=1))
+            # Always offer the team step (dropdown when the league lists teams, plus
+            # a manual-entry option) — team is required info for a sub request.
+            self.add_item(TeamSelect(names, self.team, row=1))
             self.add_item(GameSelect(
                 league_games(lg, club_now()),
                 [self.game_iso] if self.game_iso else [],
@@ -460,9 +561,7 @@ class NeedSubFlowView(discord.ui.View):
         lg = self.league()
         if not lg:
             return False
-        if (lg.get("team_names")) and not self.team:
-            return False
-        return bool(self.game_iso)
+        return bool(self.team) and bool(self.game_iso)
 
     def prompt(self) -> str:
         lg = self.league()
@@ -487,10 +586,28 @@ class PostNeedButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
         f: NeedSubFlowView = self.view
+        # One-shot guard: posting isn't idempotent (each call appends a new
+        # request), so an impatient double-tap would post twice. Set the flag
+        # synchronously — before any await — so a second callback (which can only
+        # run once this one yields) sees it and bails. Belt-and-braces with the
+        # button being removed from the view on success below.
+        if f.posted:
+            try:
+                await interaction.response.defer()
+            except discord.HTTPException:
+                pass
+            return
+        f.posted = True
+
+        try:
+            await interaction.response.defer()
+        except discord.HTTPException:
+            pass
+
         lg = f.league()
         title = clean_title(lg.get("title", "")) if lg else ""
         cog: "Subs" = interaction.client.get_cog("Subs")
-        req = await cog.add_request(
+        status, req = await cog.add_request(
             requester=interaction.user,
             league_id=f.league_id or "",
             league=title,
@@ -498,9 +615,20 @@ class PostNeedButton(discord.ui.Button):
             game_ts=f.game_iso,
             spots=f.spots,
         )
+        if status == "duplicate":
+            # Don't stack an identical request on the board. Keep the flow open so
+            # they can tweak the team/game and re-post if it really is different.
+            f.posted = False
+            await interaction.edit_original_response(
+                content=(f"⚠️  There's already an open request for **{f.team}** · "
+                         f"{fmt_when(f.game_iso)}. Claim or **Manage** that one instead — "
+                         "or change the team/game below and re-post.\n\n" + f.prompt()),
+                view=f.build(),
+            )
+            return
         # Offer to invite an available sub straight away (optional).
         view = InviteView(req["id"], cog.state)
-        await interaction.response.edit_message(
+        await interaction.edit_original_response(
             content=(f"✅  Posted: **{title}** · {f.team or '—'} · {fmt_when(f.game_iso)} · needs {f.spots}.\n"
                      "Invite an available sub now (optional), or just leave it on the board:"),
             view=view,
@@ -510,10 +638,11 @@ class PostNeedButton(discord.ui.Button):
 # ── Available-to-sub flow (ephemeral, league → games) ───────────────────────
 
 class AvailFlowView(discord.ui.View):
-    def __init__(self, leagues: list[dict], user_id: int):
+    def __init__(self, leagues: list[dict], user_id: int, state: dict | None = None):
         super().__init__(timeout=300)
         self.leagues = leagues
         self.user_id = user_id
+        self.state = state or {}
         self.league_id = None
         self.game_isos: list[str] = []
         self.message = None
@@ -525,27 +654,46 @@ class AvailFlowView(discord.ui.View):
     def on_league_change(self):
         self.game_isos = []
 
+    def open_requests(self) -> list[dict]:
+        """All open requests (any league) the user could claim — shown first so they
+        can grab a spot without first having to pick a league."""
+        return _open_requests_for_fill(self.state, None, [], self.user_id)
+
     def build(self) -> "AvailFlowView":
         self.clear_items()
-        self.add_item(LeagueSelect(self.leagues, self.league_id, row=0))
+        row = 0
+        # Claim open spots FIRST — always shown (a disabled placeholder when nothing
+        # is open), any league, no league pick needed.
+        self.add_item(FillOpenRequestSelect(self.open_requests(), row=row))
+        row += 1
+        # Then the optional general-availability path: pick a league → games → post.
+        self.add_item(LeagueSelect(self.leagues, self.league_id, row=row))
+        row += 1
         lg = self.league()
         if lg:
             games = league_games(lg, club_now())
             if games:
-                self.add_item(GameSelect(games, self.game_isos, multi=True, allow_manual=False, row=1))
-            self.add_item(PostAvailButton(row=2))
-            self.add_item(RemoveAvailButton(row=2))
+                self.add_item(GameSelect(games, self.game_isos, multi=True, allow_manual=False, row=row))
+                row += 1
+            self.add_item(PostAvailButton(row=row))
         return self
 
     def prompt(self) -> str:
+        lines = ["**I can sub**"]
+        has_open = bool(self.open_requests())
+        if has_open:
+            lines.append("🔔  **Claim open spots** — pick any games that need a sub (any league) "
+                         "from the top menu.")
+        prefix = "Or list " if has_open else "List "
         lg = self.league()
-        if not lg:
-            return "**I can sub** — pick the league you can sub in:"
-        s = f"League: **{clean_title(lg.get('title', ''))}**"
-        if self.game_isos:
-            s += " · games: " + ", ".join(fmt_when(g) for g in self.game_isos)
-        return ("**I can sub** — " + s +
-                "\nPick the games you can cover (or none for any), then **Post availability**.")
+        if lg:
+            s = f"**general availability** · {clean_title(lg.get('title', ''))}"
+            if self.game_isos:
+                s += " · " + ", ".join(fmt_when(g) for g in self.game_isos)
+            lines.append(f"{prefix}{s} — choose games (or none for any), then **Post availability**.")
+        else:
+            lines.append(f"{prefix}**general availability** for other times — pick a league below.")
+        return "\n".join(lines)
 
     async def refresh(self, interaction: discord.Interaction):
         await interaction.response.edit_message(content=self.prompt(), view=self.build())
@@ -556,45 +704,139 @@ class PostAvailButton(discord.ui.Button):
         super().__init__(label="Post availability", emoji="🙋", style=discord.ButtonStyle.success, row=row)
 
     async def callback(self, interaction: discord.Interaction):
+        # Ack immediately (feedback + dodge the 3s deadline before the board sync).
+        await interaction.response.defer()
         view: AvailFlowView = self.view
         lg = view.league()
         if not lg:
-            await interaction.response.defer()
-            return
+            return  # leave the flow open so they can pick a league
         title = clean_title(lg.get("title", ""))
         cog: "Subs" = interaction.client.get_cog("Subs")
         await cog.add_availability(user=interaction.user, league_id=view.league_id, league=title, games=view.game_isos)
         gtxt = ", ".join(fmt_when(g) for g in view.game_isos) if view.game_isos else "any game"
-        await interaction.response.edit_message(
+        await interaction.edit_original_response(
             content=f"✅  Listed you as available for **{title}** · {gtxt}.", view=None)
 
 
-class RemoveAvailButton(discord.ui.Button):
-    def __init__(self, row: int = 2):
-        super().__init__(label="Remove my availability", emoji="🗑️", style=discord.ButtonStyle.secondary, row=row)
+def _open_requests_for_fill(state: dict, league_id, game_isos, user_id: int) -> list[dict]:
+    """Open requests the user could fill from the 'I can sub' flow: in the chosen
+    league, matching the chosen game(s) (or any game in the league if none chosen),
+    with an open spot, excluding the user's own requests and ones they're already in."""
+    lid = str(league_id or "")
+    out = []
+    for r in store.requests_sorted(state):
+        if lid and str(r.get("league_id") or "") != lid:
+            continue
+        if store.open_spots(r) <= 0:
+            continue
+        if r.get("requester_id") == user_id or store.is_involved(r, user_id):
+            continue
+        if game_isos and not any(_same_game(r.get("game_ts", ""), g) for g in game_isos):
+            continue
+        out.append(r)
+    return out
+
+
+class FillOpenRequestSelect(discord.ui.Select):
+    """Surfaced in the 'I can sub' flow: pick one or more open requests (any league)
+    to claim their spots directly (each requester is notified). Renders as a disabled
+    placeholder when nothing is open, so the option stays visible instead of vanishing."""
+    def __init__(self, reqs: list[dict], row: int = 1):
+        opts = _unique_options([
+            discord.SelectOption(
+                label=_truncate(f"{fmt_when_short(r['game_ts'])}"
+                                + (f" · Team {r['team']}" if r.get("team") else ""), 100),
+                value=r["id"],
+                description=_truncate(f"{store.open_spots(r)} of {r['spots_needed']} spots open", 100),
+            )
+            for r in reqs[:25]
+        ])
+        disabled = not opts
+        if disabled:
+            opts = [discord.SelectOption(label="No open requests to claim right now", value="__none__")]
+        super().__init__(
+            placeholder=("No open requests right now" if disabled else "Claim open spot(s) that need a sub…"),
+            min_values=1, max_values=(1 if disabled else max(1, len(opts))),
+            options=opts, disabled=disabled, row=row)
 
     async def callback(self, interaction: discord.Interaction):
-        view: AvailFlowView = self.view
-        if not view.league_id:
-            await interaction.response.defer()
-            return
+        await interaction.response.defer()
+        if self.values and self.values[0] == "__none__":
+            return  # disabled placeholder — nothing to claim
         cog: "Subs" = interaction.client.get_cog("Subs")
-        removed = await cog.remove_availability(interaction.user.id, view.league_id)
-        msg = ("Removed your availability for this league." if removed
-               else "You had no availability listed for this league.")
-        await interaction.response.edit_message(content=msg, view=None)
+        filled, already, unavailable = [], [], []
+        for rid in self.values:
+            result, req = await cog.fill_request_spot(interaction.user, rid)
+            when = fmt_when(req["game_ts"]) if req else "that game"
+            if result == "added":
+                filled.append(when)
+            elif result == "already":
+                already.append(when)
+            else:  # full / closed
+                unavailable.append(when)
+        parts = []
+        if filled:
+            parts.append("✅  You're in for: " + ", ".join(filled) + " — requester(s) notified.")
+        if already:
+            parts.append("Already in for: " + ", ".join(already) + ".")
+        if unavailable:
+            parts.append("Couldn't claim (filled up or closed): " + ", ".join(unavailable) + ".")
+        await interaction.edit_original_response(content="\n".join(parts) or "Nothing to claim.", view=None)
 
 
 # ── Invite an available sub (requester picks → DM confirmation) ─────────────
 
+def _same_game(a_iso: str, b_iso: str) -> bool:
+    """True if two game timestamps refer to the same draw, compared to the minute
+    and tolerant of minor ISO formatting differences."""
+    if a_iso == b_iso:
+        return True
+    try:
+        return (datetime.fromisoformat(a_iso).replace(second=0, microsecond=0)
+                == datetime.fromisoformat(b_iso).replace(second=0, microsecond=0))
+    except (ValueError, TypeError):
+        return False
+
+
+def _find_open_duplicate(state: dict, league_id, game_ts: str, team: str) -> dict | None:
+    """An existing open request for the same league + game + team (case/space
+    tolerant), or None. All requests on the board are open, so a match is a dup."""
+    lid = str(league_id or "")
+    team_norm = (team or "").strip().casefold()
+    for r in state.get("requests", []):
+        if str(r.get("league_id") or "") != lid:
+            continue
+        if (r.get("team") or "").strip().casefold() != team_norm:
+            continue
+        if _same_game(r.get("game_ts", ""), game_ts or ""):
+            return r
+    return None
+
+
 def _availability_for_request(state: dict, req: dict | None) -> list[dict]:
-    """Availability entries relevant to a request: same league first, else all."""
+    """Subs who can cover THIS request: available in its league AND for its game
+    time. An availability with no specific games listed covers any game in that
+    league. Deduped by user; the requester-side filtering (anyone already filled or
+    pending) is applied so they don't show up as invitable."""
     if not req:
         return []
     lid = str(req.get("league_id") or "")
-    same = [a for a in state.get("availability", []) if a.get("league_id", "") == lid]
-    pool = same if same else state.get("availability", [])
-    return [a for a in pool if not store.is_involved(req, a["user_id"])]
+    game = req.get("game_ts") or ""
+    out, seen = [], set()
+    for a in state.get("availability", []):
+        uid = a["user_id"]
+        # Skip the requester themselves (you can't sub your own request) and anyone
+        # already filled/pending on it.
+        if uid in seen or uid == req.get("requester_id") or store.is_involved(req, uid):
+            continue
+        if lid and str(a.get("league_id") or "") != lid:
+            continue  # different league
+        games = a.get("games") or []
+        if games and game and not any(_same_game(game, g) for g in games):
+            continue  # available in this league, but not for this game time
+        seen.add(uid)
+        out.append(a)
+    return out
 
 
 class InviteView(discord.ui.View):
@@ -613,10 +855,9 @@ class InviteSelect(discord.ui.Select):
         for a in entries[:25]:
             games = a.get("games") or []
             desc = ", ".join(fmt_when_short(g) for g in games) if games else "any game"
-            if a.get("league"):
-                desc = f"{a['league']} · {desc}"
             opts.append(discord.SelectOption(
                 label=_truncate(a["name"], 100), value=str(a["user_id"]), description=_truncate(desc, 100)))
+        opts = _unique_options(opts)  # belt-and-braces: never emit a duplicate user value
         disabled = not opts
         if not opts:
             opts = [discord.SelectOption(label="No available subs to invite", value="__none__")]
@@ -624,12 +865,15 @@ class InviteSelect(discord.ui.Select):
                          options=opts, disabled=disabled, row=row)
 
     async def callback(self, interaction: discord.Interaction):
+        # Ack immediately (the invite does a DM + board sync that can be slow).
+        await interaction.response.defer()
         if self.values[0] == "__none__":
-            await interaction.response.defer()
             return
         uid = int(self.values[0])
         name = self.names.get(uid, "a sub")
         cog: "Subs" = interaction.client.get_cog("Subs")
+        # invite_sub is idempotent (returns "already" if they're already pending/
+        # filled), so a repeated pick can't double-book or double-DM.
         result = await cog.invite(self.rid, uid, name, inviter=interaction.user)
         msgs = {
             "invited": f"📨  Invited **{name}** — they'll get a DM to confirm. Pending until they accept.",
@@ -638,7 +882,7 @@ class InviteSelect(discord.ui.Select):
             "closed": "That request is no longer available.",
         }
         view = InviteView(self.rid, cog.state) if result in ("invited", "already") else None
-        await interaction.response.edit_message(content=msgs.get(result, "Done."), view=view)
+        await interaction.edit_original_response(content=msgs.get(result, "Done."), view=view)
 
 
 def confirm_view(rid: str, uid) -> discord.ui.View:
@@ -684,16 +928,41 @@ class DeclineButton(discord.ui.DynamicItem[discord.ui.Button],
         await cog.handle_invite_response(interaction, self.rid, int(self.uid), confirm=False)
 
 
-# ── Manage flow (ephemeral, requester-only) ─────────────────────────────────
+# ── Manage flow (ephemeral) ─────────────────────────────────────────────────
+# Manages both sides of the board for the caller: requests they opened, the spots
+# they're subbing (drop), and the availability they've listed (remove).
 
-class ManagePickView(discord.ui.View):
-    def __init__(self, requests: list[dict]):
+def _my_requests(state: dict, uid: int) -> list[dict]:
+    return [r for r in store.requests_sorted(state) if r.get("requester_id") == uid]
+
+
+def _my_spots(state: dict, uid: int) -> list[dict]:
+    """Requests where the caller is a sub (filled or pending)."""
+    return [r for r in store.requests_sorted(state)
+            if store.is_filled_by(r, uid) or store.is_pending_by(r, uid)]
+
+
+class ManageHomeView(discord.ui.View):
+    """One ephemeral panel with a select per category the caller has anything in."""
+    def __init__(self, state: dict, uid: int):
         super().__init__(timeout=180)
-        self.add_item(ManagePickSelect(requests))
+        row = 0
+        my_requests = _my_requests(state, uid)
+        if my_requests:
+            self.add_item(ManagePickSelect(my_requests, row=row))
+            row += 1
+        my_spots = _my_spots(state, uid)
+        if my_spots:
+            self.add_item(DropSpotSelect(my_spots, uid, row=row))
+            row += 1
+        my_avail = [a for a in state.get("availability", []) if a.get("user_id") == uid]
+        if my_avail:
+            self.add_item(RemoveAvailSelect(my_avail, row=row))
+            row += 1
 
 
 class ManagePickSelect(discord.ui.Select):
-    def __init__(self, requests: list[dict]):
+    def __init__(self, requests: list[dict], row: int | None = None):
         options = [
             discord.SelectOption(
                 label=fmt_when(r["game_ts"])[:100],
@@ -703,7 +972,8 @@ class ManagePickSelect(discord.ui.Select):
             )
             for r in requests[:25]
         ]
-        super().__init__(placeholder="Choose a request…", options=options, min_values=1, max_values=1)
+        super().__init__(placeholder="Manage a request you opened…",
+                         options=options, min_values=1, max_values=1, row=row)
 
     async def callback(self, interaction: discord.Interaction):
         cog: "Subs" = interaction.client.get_cog("Subs")
@@ -717,6 +987,63 @@ class ManagePickSelect(discord.ui.Select):
         )
 
 
+class DropSpotSelect(discord.ui.Select):
+    """Drop a spot the caller is subbing (filled or pending). Requester is notified."""
+    def __init__(self, spots: list[dict], uid: int, row: int | None = None):
+        opts = _unique_options([
+            discord.SelectOption(
+                label=_truncate(f"{fmt_when_short(r['game_ts'])}"
+                                + (f" · Team {r['team']}" if r.get("team") else ""), 100),
+                value=r["id"],
+                description=_truncate(
+                    "awaiting your confirmation" if store.is_pending_by(r, uid) else "you're in", 100),
+            )
+            for r in spots[:25]
+        ])
+        super().__init__(placeholder="Drop a spot you're subbing…",
+                         options=opts, min_values=1, max_values=1, row=row)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        cog: "Subs" = interaction.client.get_cog("Subs")
+        rid = self.values[0]
+        if cog._is_repeat_click(cog._click_cooldown, ("drop", interaction.user.id, rid)):
+            return
+        result, req = await cog.drop_sub_spot(interaction.user, rid)
+        if result == "removed":
+            msg = (f"➖  Dropped your spot for **{fmt_when(req['game_ts'])}** — "
+                   "the requester's been notified.")
+        elif result == "absent":
+            msg = "You weren't in that spot."
+        else:  # closed
+            msg = "That request is no longer on the board."
+        await interaction.edit_original_response(content=msg, view=None)
+
+
+class RemoveAvailSelect(discord.ui.Select):
+    """Remove one of the caller's availability listings (keyed by league)."""
+    def __init__(self, entries: list[dict], row: int | None = None):
+        opts = _unique_options([
+            discord.SelectOption(
+                label=_truncate(clean_title(a.get("league", "")) or "League", 100),
+                value=(str(a.get("league_id")) if a.get("league_id") else "__nolg__"),
+                description=_truncate(
+                    ", ".join(fmt_when_short(g) for g in (a.get("games") or [])) or "any game", 100),
+            )
+            for a in entries[:25]
+        ])
+        super().__init__(placeholder="Remove an availability listing…",
+                         options=opts, min_values=1, max_values=1, row=row)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        cog: "Subs" = interaction.client.get_cog("Subs")
+        league_id = "" if self.values[0] == "__nolg__" else self.values[0]
+        removed = await cog.remove_availability(interaction.user.id, league_id)
+        msg = "🗑️  Removed that availability listing." if removed else "That listing was already gone."
+        await interaction.edit_original_response(content=msg, view=None)
+
+
 class ManageActionView(discord.ui.View):
     def __init__(self, rid: str, state: dict):
         super().__init__(timeout=180)
@@ -728,13 +1055,18 @@ class ManageActionView(discord.ui.View):
 
     @discord.ui.button(label="Close request", emoji="✖️", style=discord.ButtonStyle.danger, row=2)
     async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
         cog: "Subs" = interaction.client.get_cog("Subs")
         req = store.find_request(cog.state, self.rid)
         if not req or req["requester_id"] != interaction.user.id:
-            await interaction.response.edit_message(content="That request is no longer available.", view=None)
+            await interaction.edit_original_response(content="That request is no longer available.", view=None)
+            return
+        # close_request is idempotent, but debounce so a double-tap doesn't clobber
+        # the "closed" message with "no longer available".
+        if cog._is_repeat_click(cog._click_cooldown, ("close", interaction.user.id, self.rid)):
             return
         await cog.close_request(self.rid)
-        await interaction.response.edit_message(content="✅  Request closed and removed from the board.", view=None)
+        await interaction.edit_original_response(content="✅  Request closed and removed from the board.", view=None)
 
 
 class AddSubSelect(discord.ui.UserSelect):
@@ -743,12 +1075,27 @@ class AddSubSelect(discord.ui.UserSelect):
         super().__init__(placeholder="Add or remove someone as a sub…", min_values=1, max_values=1, row=0)
 
     async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
         cog: "Subs" = interaction.client.get_cog("Subs")
         req = store.find_request(cog.state, self.rid)
         if not req or req["requester_id"] != interaction.user.id:
-            await interaction.response.edit_message(content="That request is no longer available.", view=None)
+            await interaction.edit_original_response(content="That request is no longer available.", view=None)
             return
         member = self.values[0]
+        if member.id == req["requester_id"]:
+            await interaction.edit_original_response(
+                content=("You can't add yourself as a sub to your own request.\n"
+                         f"Managing **{fmt_when(req['game_ts'])}** ({store.open_spots(req)} open):"),
+                view=ManageActionView(self.rid, cog.state))
+            return
+        # requester_toggle_sub is a toggle (add ↔ remove); debounce a rapid repeat
+        # of the same member so a double-pick can't add-then-remove them.
+        if cog._is_repeat_click(cog._click_cooldown, ("manage_add", interaction.user.id, self.rid, member.id)):
+            await interaction.edit_original_response(
+                content=f"Managing **{fmt_when(req['game_ts'])}** ({store.open_spots(req)} open):",
+                view=ManageActionView(self.rid, cog.state),
+            )
+            return
         result = await cog.requester_toggle_sub(req, member)
         if result == "added":
             note = f"✅  Added {member.display_name} as a sub."
@@ -756,7 +1103,7 @@ class AddSubSelect(discord.ui.UserSelect):
             note = f"➖  Removed {member.display_name} from the spots."
         else:  # full
             note = f"⚠️  No open spots — {member.display_name} not added."
-        await interaction.response.edit_message(
+        await interaction.edit_original_response(
             content=f"{note}\nManaging **{fmt_when(req['game_ts'])}** ({store.open_spots(req)} open):",
             view=ManageActionView(self.rid, cog.state),
         )
@@ -769,6 +1116,10 @@ class Subs(commands.Cog):
         self.bot = bot
         self.state = store.load(STORE_PATH)
         self._lock = __import__("asyncio").Lock()
+        # namespaced-key -> monotonic time of last click, for debouncing impatient
+        # double-taps across all buttons. Keys are tagged tuples, e.g.
+        # ("take", user_id, rid) or ("manage_add", user_id, rid, member_id).
+        self._click_cooldown: dict[tuple, float] = {}
 
     # -- lifecycle ----------------------------------------------------------
     async def cog_load(self):
@@ -778,35 +1129,114 @@ class Subs(commands.Cog):
         self.expiry_loop.cancel()
 
     async def startup(self):
-        """Prune and re-render the board after a (re)connect."""
+        """Prune and re-render the board after a (re)connect, and clean up any stray
+        duplicate board pins left by a previous run/deploy."""
         async with self._lock:
             store.expire(self.state, club_now(), GRACE_HOURS)
             store.save(STORE_PATH, self.state)
         await self.render_board()
+        board = self.state.get("board")
+        if board:
+            ch = await self._resolve_channel(board["channel_id"])
+            if ch is not None:
+                await self._sweep_board_pins(ch, keep_id=board["message_id"])
 
     # -- persistence + board refresh ----------------------------------------
     def _save(self):
         store.save(STORE_PATH, self.state)
 
+    async def _resolve_channel(self, channel_id: int):
+        ch = self.bot.get_channel(channel_id)
+        if ch is None:
+            try:
+                ch = await self.bot.fetch_channel(channel_id)
+            except discord.HTTPException:
+                return None
+        return ch
+
+    async def _sweep_board_pins(self, channel, keep_id: int):
+        """Unpin & delete any of OUR older board messages still pinned in `channel`
+        (leftovers from a past deploy, reset, or a stale pointer), keeping only
+        keep_id. Only touches board-looking messages this bot authored, so it can't
+        clobber unrelated pins or another bot's board."""
+        me = self.bot.user
+        if me is None:
+            return
+        try:
+            pins = await channel.pins()
+        except discord.HTTPException:
+            return
+        for m in pins:
+            if m.id != keep_id and m.author.id == me.id and _looks_like_board(m):
+                try:
+                    await m.delete()  # delete also unpins
+                except discord.HTTPException:
+                    pass
+
+    async def _post_board(self, channel):
+        """Post a fresh board in `channel`, pin it, repoint state at it, then remove
+        any older board (tracked elsewhere or stray pins). Returns (pinned, pin_err)."""
+        old = self.state.get("board")
+        msg = await channel.send(embed=build_embed(self.state), view=build_view(self.state))
+        pinned, pin_err = True, None
+        try:
+            await msg.pin()
+        except discord.Forbidden:
+            pinned, pin_err = False, "I need the **Manage Messages** permission to pin."
+        except discord.HTTPException as ex:
+            pinned, pin_err = False, f"pinning failed (`{ex}`)."
+        async with self._lock:
+            self.state["board"] = {"channel_id": channel.id, "message_id": msg.id}
+            self._save()
+        # One board only: drop stray pins here, and a prior board in another channel.
+        await self._sweep_board_pins(channel, keep_id=msg.id)
+        if old and old.get("channel_id") != channel.id:
+            prev_ch = await self._resolve_channel(old["channel_id"])
+            if prev_ch is not None:
+                try:
+                    await (await prev_ch.fetch_message(old["message_id"])).delete()
+                except discord.HTTPException:
+                    pass
+        return pinned, pin_err
+
     async def render_board(self):
         board = self.state.get("board")
         if not board:
             return
-        channel = self.bot.get_channel(board["channel_id"])
+        channel = await self._resolve_channel(board["channel_id"])
         if channel is None:
-            try:
-                channel = await self.bot.fetch_channel(board["channel_id"])
-            except discord.HTTPException:
-                return
+            return
         try:
             msg = await channel.fetch_message(board["message_id"])
         except discord.NotFound:
-            self.state["board"] = None
-            self._save()
+            await self._post_board(channel)  # board was deleted — repost so it stays live
             return
         except discord.HTTPException:
             return
-        await msg.edit(embed=build_embed(self.state), view=build_view(self.state))
+        try:
+            await msg.edit(embed=build_embed(self.state), view=build_view(self.state))
+        except discord.Forbidden as e:
+            # 50005 = "cannot edit a message authored by another user": the stored
+            # board belongs to a different bot identity. Repost one we own (and sweep
+            # our own strays) rather than leaving a board that never updates.
+            if e.code == 50005:
+                log.warning("Subs board %s authored by another bot — reposting our own.",
+                            board["message_id"])
+                await self._post_board(channel)
+            else:
+                log.warning("Forbidden editing subs board: %s", e)
+            return
+        except discord.HTTPException as e:
+            log.warning("Could not edit subs board: %s", e)
+            return
+        # The board we just updated must be the one that's actually pinned — otherwise
+        # people keep watching a stale, unpinned copy. Re-pin it and clear strays if so.
+        if not msg.pinned:
+            try:
+                await msg.pin()
+                await self._sweep_board_pins(channel, keep_id=msg.id)
+            except discord.HTTPException as e:
+                log.warning("Could not pin the live subs board: %s", e)
 
     def board_channel(self):
         board = self.state.get("board")
@@ -839,7 +1269,13 @@ class Subs(commands.Cog):
 
     # -- mutations (called from button/modal callbacks) ---------------------
     async def add_request(self, *, requester, game_ts, spots, league_id="", league="", team=""):
+        """Create a request, unless an open one already exists for the same league +
+        game + team. Returns (status, req): ("duplicate", existing) or ("created", new).
+        The dup check + create happen under one lock so two posts can't both slip in."""
         async with self._lock:
+            dup = _find_open_duplicate(self.state, league_id, game_ts, team)
+            if dup is not None:
+                return ("duplicate", dup)
             req = store.new_request(
                 self.state,
                 requester_id=requester.id,
@@ -853,7 +1289,7 @@ class Subs(commands.Cog):
             )
             self._save()
         await self.render_board()
-        return req
+        return ("created", req)
 
     async def invite(self, rid: str, uid: int, name: str, *, inviter) -> str:
         """Requester invites an available sub: reserve a pending spot and DM them."""
@@ -893,13 +1329,25 @@ class Subs(commands.Cog):
                 log.warning("Could not send sub confirmation to %s", uid)
 
     async def handle_invite_response(self, interaction: discord.Interaction, rid: str, uid: int, *, confirm: bool):
+        # Ack immediately: confirm/decline does board + DM work that can exceed the
+        # 3s response deadline, and the instant feedback stops impatient re-clicks.
+        try:
+            await interaction.response.defer()
+        except discord.HTTPException:
+            pass  # already acked (e.g. a duplicate dispatch) — fall through
+
         if interaction.user.id != uid:
-            await interaction.response.send_message("This confirmation isn't for you.", ephemeral=True)
+            await interaction.followup.send("This confirmation isn't for you.", ephemeral=True)
             return
+
         async with self._lock:
             req = store.find_request(self.state, rid)
             if req is None:
-                await interaction.response.edit_message(content="This request is no longer open.", view=None)
+                await interaction.edit_original_response(content="This request is no longer open.", view=None)
+                return
+            # Debounce a rapid double-tap so the duplicate can't clobber the result
+            # message (e.g. overwrite "You're in!" with "no longer valid").
+            if self._is_repeat_click(self._click_cooldown, ("invite_resp", uid, rid)):
                 return
             if confirm:
                 result = store.confirm_sub(req, uid, interaction.user.display_name, now=club_now())
@@ -911,62 +1359,32 @@ class Subs(commands.Cog):
             self._save()
 
         if result == "absent":
-            await interaction.response.edit_message(content="This invite is no longer valid.", view=None)
+            await interaction.edit_original_response(content="This invite is no longer valid.", view=None)
             return
         await self.render_board()
         if result == "confirmed":
-            await interaction.response.edit_message(content=f"✅  You're in for **{when}** — thanks for subbing!", view=None)
+            await interaction.edit_original_response(content=f"✅  You're in for **{when}** — thanks for subbing!", view=None)
             await self.notify(requester_id,
                               f"🥌 {interaction.user.display_name} confirmed as a sub for your **{when}** game "
                               f"({opn} still open).")
         else:  # declined
-            await interaction.response.edit_message(content=f"👍  Thanks for letting us know — declined **{when}**.", view=None)
+            await interaction.edit_original_response(content=f"👍  Thanks for letting us know — declined **{when}**.", view=None)
             await self.notify(requester_id,
                               f"🥌 {interaction.user.display_name} can't sub for your **{when}** game "
                               f"({opn} open again).")
 
-    async def _refresh_clicked(self, interaction: discord.Interaction, note: str | None = None):
-        """Refresh the board the click came from (pinned or a personal /subs copy)
-        in place. `note` is sent as a quiet ephemeral nudge."""
-        try:
-            await interaction.response.edit_message(embed=build_embed(self.state), view=build_view(self.state))
-            if note:
-                await interaction.followup.send(note, ephemeral=True)
-        except discord.HTTPException:
-            if note:
-                try:
-                    await interaction.response.send_message(note, ephemeral=True)
-                except discord.HTTPException:
-                    pass
-
-    async def handle_take(self, interaction: discord.Interaction, rid: str):
-        async with self._lock:
-            req = store.find_request(self.state, rid)
-            if req is None:
-                await self._refresh_clicked(interaction, note="That request just closed.")
-                return
-            result = store.toggle_spot(req, interaction.user.id, interaction.user.display_name, now=club_now())
-            requester_id = req["requester_id"]
-            when = fmt_when(req["game_ts"])
-            opn = store.open_spots(req)
-            self._save()
-
-        if result == "full":
-            await self._refresh_clicked(interaction, note="All spots are filled for that game.")
-            await self.render_board()
-            return
-
-        # Update the board they clicked (their private copy or the pinned one)…
-        await self._refresh_clicked(interaction)
-        # …and keep the shared pinned board in sync.
-        await self.render_board()
-
-        if requester_id != interaction.user.id:
-            verb = "took" if result == "added" else "dropped"
-            await self.notify(
-                requester_id,
-                f"🥌 {interaction.user.display_name} {verb} a sub spot for your **{when}** game "
-                f"({opn} still open).")
+    @staticmethod
+    def _is_repeat_click(cooldown: dict, key) -> bool:
+        """Record this click and report whether it's a repeat of `key` within the
+        debounce window. Caller should treat a repeat as a no-op. Call under the
+        lock so two near-simultaneous clicks can't both pass."""
+        now_m = time.monotonic()
+        last = cooldown.get(key)
+        cooldown[key] = now_m
+        if len(cooldown) > 256:  # opportunistic prune of stale entries
+            for k in [k for k, t in cooldown.items() if now_m - t >= CLICK_DEBOUNCE_SECONDS]:
+                del cooldown[k]
+        return last is not None and now_m - last < CLICK_DEBOUNCE_SECONDS
 
     async def add_availability(self, *, user, league_id, league, games) -> str:
         async with self._lock:
@@ -1002,11 +1420,72 @@ class Subs(commands.Cog):
             await self.notify(member.id, f"🥌 You've been removed as a sub for the **{when}** game.")
         return result
 
-    async def close_request(self, rid: str):
+    async def fill_request_spot(self, user, rid: str) -> tuple[str, dict | None]:
+        """A sub self-fills an open request (e.g. from the 'I can sub' flow). Adds
+        them to the spot and notifies the requester. Returns (result, req) where
+        result is "added" | "already" | "full" | "closed"."""
         async with self._lock:
+            req = store.find_request(self.state, rid)
+            if req is None:
+                return ("closed", None)
+            result = store.add_sub(req, user.id, user.display_name, now=club_now())
+            when = fmt_when(req["game_ts"])
+            requester_id = req["requester_id"]
+            opn = store.open_spots(req)
+            self._save()
+        await self.render_board()
+        if result == "added" and requester_id != user.id:
+            await self.notify(
+                requester_id,
+                f"🥌 {user.display_name} filled a sub spot for your **{when}** game "
+                f"({opn} still open).")
+        return (result, req)
+
+    async def drop_sub_spot(self, user, rid: str) -> tuple[str, dict | None]:
+        """A sub drops a spot they were filling/pending (from Manage). Notifies the
+        requester they lost a sub. Returns (result, req) where result is
+        "removed" | "absent" | "closed"."""
+        async with self._lock:
+            req = store.find_request(self.state, rid)
+            if req is None:
+                return ("closed", None)
+            result = store.remove_sub(req, user.id)  # "removed" | "absent"
+            when = fmt_when(req["game_ts"])
+            requester_id = req["requester_id"]
+            opn = store.open_spots(req)
+            if result == "removed":
+                # They opted out — also drop that game from their availability so the
+                # board doesn't re-offer them for it. (A requester-side removal leaves
+                # availability intact, so they reappear as available.)
+                store.remove_availability_game(self.state, user.id, req.get("league_id"), req.get("game_ts"))
+            self._save()
+        await self.render_board()
+        if result == "removed" and requester_id != user.id:
+            await self.notify(
+                requester_id,
+                f"🥌 {user.display_name} dropped their sub spot for your **{when}** game "
+                f"({opn} now open).")
+        return (result, req)
+
+    async def close_request(self, rid: str):
+        # Capture the subs (filled + pending) before closing so we can tell them the
+        # request they were on is gone — they were removed by someone else (the
+        # requester), so they get a heads-up. The requester themselves is skipped.
+        async with self._lock:
+            req = store.find_request(self.state, rid)
+            when, requester_id, subs = "", None, []
+            if req is not None:
+                when = fmt_when(req["game_ts"])
+                requester_id = req["requester_id"]
+                subs = [m["user_id"] for m in (req.get("filled", []) + req.get("pending", []))]
             store.close_request(self.state, rid)
             self._save()
         await self.render_board()
+        for uid in subs:
+            if uid != requester_id:
+                await self.notify(
+                    uid, f"🥌 The **{when}** game you were subbing was closed by the requester — "
+                         "you're no longer needed. Thanks!")
 
     # -- background expiry --------------------------------------------------
     @tasks.loop(minutes=15)
@@ -1037,34 +1516,15 @@ class Subs(commands.Cog):
     @app_commands.command(name="subsboard", description="Post & pin the shared subs board in this channel (organizers).")
     @app_commands.default_permissions(manage_messages=True)
     async def subsboard_cmd(self, interaction: discord.Interaction):
-        async with self._lock:
-            old = self.state.get("board")
-            msg = await interaction.channel.send(embed=build_embed(self.state), view=build_view(self.state))
-            pinned, pin_err = True, None
-            try:
-                await msg.pin()
-            except discord.Forbidden:
-                pinned = False
-                pin_err = "I need the **Manage Messages** permission in this channel to pin."
-            except discord.HTTPException as ex:
-                pinned = False
-                pin_err = f"pinning failed (`{ex}`)."
-            self.state["board"] = {"channel_id": interaction.channel_id, "message_id": msg.id}
-            self._save()
-
-        # Remove the previous board message (if any) so there's only ever one.
-        if old and old.get("message_id") != msg.id:
-            try:
-                ch = self.bot.get_channel(old["channel_id"]) or await self.bot.fetch_channel(old["channel_id"])
-                prev = await ch.fetch_message(old["message_id"])
-                await prev.delete()  # also unpins it
-            except discord.HTTPException:
-                pass
-
+        # _post_board posts + pins + repoints state, then sweeps any older/stray board
+        # pins (this channel) and a prior board in another channel — so there's only
+        # ever one pinned board.
+        await interaction.response.defer(ephemeral=True)
+        pinned, pin_err = await self._post_board(interaction.channel)
         if pinned:
-            await interaction.response.send_message("📌  Shared subs board posted and pinned here.", ephemeral=True)
+            await interaction.followup.send("📌  Shared subs board posted and pinned here.", ephemeral=True)
         else:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"✅  Shared subs board posted — but I couldn't pin it: {pin_err}\n"
                 "Grant the permission, then run `/subsboard` again to pin.",
                 ephemeral=True)

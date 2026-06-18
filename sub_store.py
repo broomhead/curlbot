@@ -287,6 +287,35 @@ def remove_availability(state: dict, user_id: int, league_id) -> bool:
     return len(state["availability"]) < before
 
 
+def _norm_min(iso: str) -> str:
+    """ISO timestamp normalized to the minute (for game equality), or the raw value."""
+    try:
+        return datetime.fromisoformat(iso).replace(second=0, microsecond=0).isoformat()
+    except (ValueError, TypeError):
+        return iso or ""
+
+
+def remove_availability_game(state: dict, user_id: int, league_id, game_ts: str) -> bool:
+    """Remove a single game from a user's availability for a league (e.g. they dropped
+    a spot they'd offered). Deletes the whole entry if no specific games remain. No-op
+    for "any game" entries (empty games list). Returns True if something changed."""
+    a = find_availability(state, user_id, league_id)
+    if not a:
+        return False
+    games = a.get("games") or []
+    if not games:
+        return False  # "any game" — nothing game-specific to drop
+    target = _norm_min(game_ts)
+    kept = [g for g in games if _norm_min(g) != target]
+    if len(kept) == len(games):
+        return False
+    if kept:
+        a["games"] = kept
+    else:
+        state["availability"] = [x for x in state["availability"] if x is not a]
+    return True
+
+
 def availability_for_user(state: dict, user_id: int) -> list[dict]:
     return [a for a in state["availability"] if a["user_id"] == user_id]
 

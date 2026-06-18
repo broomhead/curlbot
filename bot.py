@@ -17,6 +17,7 @@ import json
 import math
 import os
 import re
+import time
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -54,6 +55,24 @@ TIMEZONE_OFFSET = -5  # America/Chicago (CST = UTC-5, CDT = UTC-6)
 PRACTICE_STORE_PATH = os.environ.get("PRACTICE_STORE_PATH", "practice_signups.json")
 _practice_state = ps.load(PRACTICE_STORE_PATH)
 _practice_lock = asyncio.Lock()
+
+# Debounce impatient double-taps of a practice signup button. ps.toggle is a
+# join↔leave toggle, so without this a quick double-click would join then
+# instantly leave. (user_id, session_key) -> monotonic time of last click.
+CLICK_DEBOUNCE_SECONDS = 3.0
+_practice_cooldown: dict[tuple[int, str], float] = {}
+
+
+def _is_repeat_click(cooldown: dict, key) -> bool:
+    """Record this click and report whether it repeats `key` within the debounce
+    window; callers treat a repeat as a no-op. Call under _practice_lock."""
+    now_m = time.monotonic()
+    last = cooldown.get(key)
+    cooldown[key] = now_m
+    if len(cooldown) > 256:  # opportunistic prune of stale entries
+        for k in [k for k, t in cooldown.items() if now_m - t >= CLICK_DEBOUNCE_SECONDS]:
+            del cooldown[k]
+    return last is not None and now_m - last < CLICK_DEBOUNCE_SECONDS
 
 PRACTICE_SLUG = "practice"
 
@@ -310,7 +329,6 @@ async def setup_hook():
         subs.NewRequestButton,
         subs.AvailableButton,
         subs.ManageButton,
-        subs.TakeSpotButton,
         subs.ConfirmButton,
         subs.DeclineButton,
         JoinPracticeButton,
@@ -456,6 +474,19 @@ async def render_practice_board(target_channel=None):
             return
         except discord.NotFound:
             board = None
+        except discord.Forbidden as e:
+            # 50005 = board authored by another bot identity (e.g. a dev bot reusing
+            # the prod data dir). Drop the stale pointer and fall through to repost
+            # one we own (when called with a target channel).
+            if e.code == 50005:
+                log.warning("Practice board %s authored by another bot — clearing stale pointer.",
+                            board["message_id"])
+                async with _practice_lock:
+                    _practice_state["board"] = None
+                    ps.save(PRACTICE_STORE_PATH, _practice_state)
+                board = None
+            else:
+                return
         except discord.HTTPException:
             return
 
@@ -499,11 +530,16 @@ class JoinPracticeButton(discord.ui.DynamicItem[discord.ui.Button],
         except ValueError:
             pass
         async with _practice_lock:
-            result = ps.toggle(_practice_state, self.key, interaction.user.id,
-                               interaction.user.display_name, when_ts=when_ts, now=now_club())
-            label = _practice_state["sessions"].get(self.key, {}).get("label", self.key)
-            n = ps.count(_practice_state, self.key)
-            ps.save(PRACTICE_STORE_PATH, _practice_state)
+            # Debounce a rapid re-click of the same session: skip the toggle so an
+            # impatient double-tap can't join-then-leave. Checked under the lock so
+            # two near-simultaneous clicks can't both pass.
+            repeat = _is_repeat_click(_practice_cooldown, (interaction.user.id, self.key))
+            if not repeat:
+                result = ps.toggle(_practice_state, self.key, interaction.user.id,
+                                   interaction.user.display_name, when_ts=when_ts, now=now_club())
+                label = _practice_state["sessions"].get(self.key, {}).get("label", self.key)
+                n = ps.count(_practice_state, self.key)
+                ps.save(PRACTICE_STORE_PATH, _practice_state)
 
         # Refresh the (private) report in place so counts stay current.
         try:
@@ -511,6 +547,9 @@ class JoinPracticeButton(discord.ui.DynamicItem[discord.ui.Button],
             await interaction.edit_original_response(embed=embed, view=view)
         except SheetsError:
             pass  # keep the existing message if the refresh fetch hiccups
+
+        if repeat:
+            return  # nothing changed — don't re-ping the channel or re-notify
 
         # Update the shared, pinned practice board in this channel…
         await render_practice_board(interaction.channel)
