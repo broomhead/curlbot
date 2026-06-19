@@ -18,20 +18,8 @@ venv/
 # Docker
 *.log
 
-# League cache (regenerated at runtime)
-league_cache.json
-league_cache.json.tmp
-
 # Local dev state dir (mounted into the container at /data; never commit)
 /data/
-
-# Subs board state (runtime; recreated on first /subs)
-subs_store.json
-subs_store.json.tmp
-
-# Practice sign-up pool (runtime)
-practice_signups.json
-practice_signups.json.tmp
 
 # macOS
 .DS_Store

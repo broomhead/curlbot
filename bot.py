@@ -51,6 +51,10 @@ CLUB_NAME     = os.environ.get("CLUB_NAME", "Curling Club")
 WP_API        = f"{SITE_BASE_URL}/wp-json/tribe/events/v1"
 # Sheet count varies by facility — configure via NUM_SHEETS (default 4).
 TOTAL_SHEETS  = int(os.environ.get("NUM_SHEETS", "4"))
+# How long a session keeps showing in /sheets after it ends, so latecomers still
+# see a just-finished slot. Past this grace it drops off (set 0 for a hard cutoff
+# at end time). Applies to every source (practice/LTC/league/reserved ice).
+SHEETS_GRACE_HOURS = float(os.environ.get("SHEETS_GRACE_HOURS", "1"))
 TIMEZONE_OFFSET = -5  # America/Chicago (CST = UTC-5, CDT = UTC-6)
 
 # Facility-reserved curling ice (the rink's own public Google calendar). The
@@ -271,11 +275,17 @@ async def collect_sessions(practices, window_start, window_end, gf) -> list[dict
     """
     sessions: list[dict] = []
 
-    # 1. Designated practice blocks — occupy no sheets themselves.
+    # 1. Designated practice blocks — occupy no sheets themselves. Skip any that
+    #    already ended or start past the window: the calendar API's start_date filter
+    #    is day-granular, so it can hand back a block from earlier today/yesterday.
     for p in practices:
+        es = datetime.fromisoformat(p["start_date"])
+        ee = datetime.fromisoformat(p["end_date"])
+        if ee <= window_start or es >= window_end:
+            continue
         sessions.append({
-            "start": datetime.fromisoformat(p["start_date"]),
-            "end":   datetime.fromisoformat(p["end_date"]),
+            "start": es,
+            "end":   ee,
             "type":  "Practice",
             "title": p["title"],
             "sheets_used": 0,
@@ -356,7 +366,11 @@ async def collect_sessions(practices, window_start, window_end, gf) -> list[dict
 # ── Discord bot ────────────────────────────────────────────────────────────────
 
 intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents)
+# Slash-command + button bot only — no text-prefix commands, so we don't need the
+# privileged Message Content intent. Using when_mentioned (rather than a literal
+# "!" prefix) tells discord.py that, which silences the "message content intent is
+# missing" warning without enabling a privileged intent we'd never use.
+bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents)
 
 
 async def setup_hook():
@@ -395,6 +409,7 @@ async def on_ready():
     cog = bot.get_cog("Subs")
     if cog is not None:
         await cog.startup()  # prune expired requests and refresh the pinned board
+    await restore_practice_board()  # re-render + re-pin the practice board after a (re)boot
     print(f"✅  Logged in as {bot.user}.")
 
 
@@ -420,8 +435,13 @@ async def fetch_opps(weeks: int) -> list[dict]:
         raise SheetsError("❌  Could not reach the event calendar right now — please try again shortly.")
     if not practices:
         return []
-    window_start = now_club()
-    window_end   = window_start + timedelta(weeks=weeks)
+    # Drop the "already over" floor back by a grace period so a session that just
+    # ended still shows briefly (latecomers can see/join it) — but yesterday's is
+    # long gone. The floor gates every source; the window still extends `weeks`
+    # ahead of *now*.
+    now = now_club()
+    window_start = now - timedelta(hours=SHEETS_GRACE_HOURS)
+    window_end   = now + timedelta(weeks=weeks)
     try:
         async with GFClient() as gf:
             sessions = await collect_sessions(practices, window_start, window_end, gf)
@@ -524,6 +544,7 @@ async def render_practice_board(target_channel=None):
                         ps.save(PRACTICE_STORE_PATH, _practice_state)
                 except discord.HTTPException as e:
                     log.warning("Couldn't pin practice board %s: %s", board["message_id"], e)
+                    await _warn_pin_permission(ch)
             return
         except discord.NotFound:
             board = None  # board was deleted — fall through and repost it
@@ -559,6 +580,49 @@ async def render_practice_board(target_channel=None):
             _practice_state["board"] = {"channel_id": target_channel.id,
                                         "message_id": msg.id, "pinned": pinned_ok}
             ps.save(PRACTICE_STORE_PATH, _practice_state)
+        if not pinned_ok:
+            await _warn_pin_permission(target_channel)
+
+
+async def _warn_pin_permission(channel):
+    """Post a one-time, in-channel note when we can't pin the practice board, so an
+    admin can fix the channel permission without anyone reading the logs. Guarded by
+    a `pin_warned` flag on the board state so it never spams (one message per board
+    until it pins or is recreated)."""
+    board = _practice_state.get("board")
+    if board is None or board.get("pin_warned"):
+        return
+    try:
+        await channel.send(
+            "📌  Heads up: I couldn't **pin** the practice sign-up board, so it won't stay at "
+            "the top of this channel. I need the **Manage Messages** permission here — an admin "
+            "can allow it for my role in this channel's permission settings, and I'll pin it "
+            "automatically from then on. (The board still works unpinned in the meantime.)")
+    except discord.HTTPException:
+        return  # can't even post — nothing more to do
+    async with _practice_lock:
+        if _practice_state.get("board"):
+            _practice_state["board"]["pin_warned"] = True
+            ps.save(PRACTICE_STORE_PATH, _practice_state)
+
+
+async def restore_practice_board():
+    """On (re)boot, re-establish the practice board from its stored pointer: refresh
+    its contents and re-pin it, reposting it in the same channel if the message was
+    deleted while we were down. No-op if no board has been created yet (it'll be
+    created on the first /sheets sign-up). Mirrors the subs cog's startup()."""
+    board = _practice_state.get("board")
+    if not board:
+        return
+    try:
+        ch = bot.get_channel(board["channel_id"]) or await bot.fetch_channel(board["channel_id"])
+    except discord.HTTPException as e:
+        log.warning("Couldn't resolve practice board channel on boot: %s", e)
+        return
+    if ch is not None:
+        # Passing the stored channel means render reposts there if the message is
+        # gone, rather than silently giving up (it has no target otherwise).
+        await render_practice_board(ch)
 
 
 class JoinPracticeButton(discord.ui.DynamicItem[discord.ui.Button],

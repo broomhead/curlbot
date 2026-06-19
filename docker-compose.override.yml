@@ -1,11 +1,9 @@
 services:
   curlbot:
-    # Local dev: live-mount the code for fast reloads, and keep runtime state in a
-    # gitignored ./data dir (mirrors prod's /data layout) so it never lands in the
-    # repo root or gets committed.
     environment:
-      - SUBS_STORE_PATH=/data/subs_store.json
+      - LEAGUE_CACHE_PATH=/data/league_cache.json
       - PRACTICE_STORE_PATH=/data/practice_signups.json
+      - SUBS_STORE_PATH=/data/subs_store.json
     volumes:
       - .:/app
       - ./data:/data
