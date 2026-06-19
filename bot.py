@@ -1,6 +1,6 @@
 """
 Curling Club Practice-Ice Bot
-Slash command: /sheets [upcoming]
+Slash command: /sheets [weeks]
 
 Reports practice ice from three sources, in time order: designated practice
 blocks, Learn-to-Curls that don't fill the ice, and league draws that don't
@@ -120,15 +120,22 @@ async def fetch_events_in_range(start: datetime, end: datetime) -> list[dict]:
     return out
 
 
-async def fetch_upcoming_practices(count: int) -> list[dict]:
+async def fetch_practices_within(weeks: int) -> list[dict]:
+    """Practice blocks starting within the next `weeks` weeks (the /sheets window)."""
     now = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=TIMEZONE_OFFSET)
+    window_end = now + timedelta(weeks=weeks)
     async with aiohttp.ClientSession() as s:
         async with s.get(f"{WP_API}/events", params={
             "categories": PRACTICE_SLUG,
             "start_date": now.strftime("%Y-%m-%d %H:%M:%S"),
-            "per_page": count, "status": "publish",
+            "end_date": window_end.strftime("%Y-%m-%d %H:%M:%S"),
+            "per_page": 100, "status": "publish",
         }) as r:
-            return (await r.json()).get("events", [])
+            events = (await r.json()).get("events", [])
+    # Defensive: keep only blocks that actually start inside the window, in case the
+    # calendar API is lenient about end_date.
+    return [e for e in events
+            if e.get("start_date") and datetime.fromisoformat(e["start_date"]) < window_end]
 
 
 # ── Sheet lookup via Gravity Forms ─────────────────────────────────────────────
@@ -374,17 +381,17 @@ class SheetsError(Exception):
     """Carries a user-facing message for a failed /sheets fetch."""
 
 
-async def fetch_opps(upcoming: int) -> list[dict]:
+async def fetch_opps(weeks: int) -> list[dict]:
     """Fetch the practice-ice opportunities (raises SheetsError with a message)."""
     try:
-        practices = await fetch_upcoming_practices(upcoming)
+        practices = await fetch_practices_within(weeks)
     except Exception:  # noqa: BLE001 — log detail server-side, show a safe message
         log.exception("Calendar fetch failed")
         raise SheetsError("❌  Could not reach the event calendar right now — please try again shortly.")
     if not practices:
         return []
     window_start = now_club()
-    window_end   = max(datetime.fromisoformat(p["end_date"]) for p in practices)
+    window_end   = window_start + timedelta(weeks=weeks)
     try:
         async with GFClient() as gf:
             sessions = await collect_sessions(practices, window_start, window_end, gf)
@@ -394,9 +401,9 @@ async def fetch_opps(upcoming: int) -> list[dict]:
     return pi.practice_opportunities(sessions, TOTAL_SHEETS)
 
 
-async def build_sheets_payload(upcoming: int, user) -> tuple[discord.Embed, discord.ui.View | None]:
+async def build_sheets_payload(weeks: int, user) -> tuple[discord.Embed, discord.ui.View | None]:
     """Build the (ephemeral) practice-ice embed + sign-up view for a member."""
-    opps = await fetch_opps(upcoming)
+    opps = await fetch_opps(weeks)
 
     # Register each session and snapshot sign-up counts under the lock.
     async with _practice_lock:
@@ -422,7 +429,7 @@ async def build_sheets_payload(upcoming: int, user) -> tuple[discord.Embed, disc
         line = pi.format_opportunity(o, TOTAL_SHEETS)[1]
         line += f"\n    🧹 **{n}** signed up to practice" + (" · you're in" if mine else "")
         lines.append(line)
-        view.add_item(JoinPracticeButton(key, upcoming, o["start"], n, mine))
+        view.add_item(JoinPracticeButton(key, weeks, o["start"], n, mine))
     embed.description = "\n\n".join(lines)
     embed.set_footer(text="Tap a slot to sign up · only you can see this report")
     return embed, view
@@ -525,22 +532,30 @@ async def render_practice_board(target_channel=None):
 
 
 class JoinPracticeButton(discord.ui.DynamicItem[discord.ui.Button],
-                         template=r"sheet:join:(?P<key>\d{8}T\d{4}):(?P<up>\d+)"):
-    def __init__(self, key: str, upcoming: int, start: datetime | None = None,
+                         template=r"sheet:join:(?P<key>\d{8}T\d{4}):(?P<weeks>\d+)"):
+    def __init__(self, key: str, weeks: int, start: datetime | None = None,
                  count: int = 0, mine: bool = False):
         self.key = key
-        self.upcoming = int(upcoming)
-        when = start.strftime('%a %-I:%M%p').lower() if start else key
+        self.weeks = int(weeks)
+        # Date + time on the label, e.g. "Practice 6/18 7:45PM (1)". Fall back to
+        # parsing the key when reconstructed from a custom_id (start isn't encoded).
+        when_dt = start
+        if when_dt is None:
+            try:
+                when_dt = datetime.strptime(key, "%Y%m%dT%H%M")
+            except ValueError:
+                when_dt = None
+        when = when_dt.strftime('%-m/%-d %-I:%M%p') if when_dt else key
         label = f"{'Leave' if mine else 'Practice'} {when} ({count})"
         super().__init__(discord.ui.Button(
             label=label[:80],
             style=discord.ButtonStyle.secondary if mine else discord.ButtonStyle.success,
-            custom_id=f"sheet:join:{key}:{upcoming}",
+            custom_id=f"sheet:join:{key}:{weeks}",
         ))
 
     @classmethod
     async def from_custom_id(cls, interaction, item, match):
-        return cls(match["key"], int(match["up"]))
+        return cls(match["key"], int(match["weeks"]))
 
     async def callback(self, interaction: discord.Interaction):
         # Instant "busy" feedback: grey out the report's buttons the moment they tap,
@@ -578,7 +593,7 @@ class JoinPracticeButton(discord.ui.DynamicItem[discord.ui.Button],
         # hiccup here (fetch error, or the interaction message being gone) block the
         # shared-board update below — the board is what everyone else is watching.
         try:
-            embed, view = await build_sheets_payload(self.upcoming, interaction.user)
+            embed, view = await build_sheets_payload(self.weeks, interaction.user)
             await interaction.edit_original_response(embed=embed, view=view)
         except (SheetsError, discord.HTTPException):
             log.warning("Couldn't refresh the private /sheets report after a toggle.")
@@ -604,12 +619,12 @@ class JoinPracticeButton(discord.ui.DynamicItem[discord.ui.Button],
 
 
 @bot.tree.command(name="sheets", description="Check free sheets and sign up to practice (only you see it)")
-@app_commands.describe(upcoming="How many upcoming practices to show (1–5, default 1)")
-async def sheets_cmd(interaction: discord.Interaction, upcoming: int = 1):
-    upcoming = max(1, min(upcoming, 5))
+@app_commands.describe(weeks="How many weeks ahead to show (1–4, default 1)")
+async def sheets_cmd(interaction: discord.Interaction, weeks: int = 1):
+    weeks = max(1, min(weeks, 4))
     await interaction.response.defer(ephemeral=True)
     try:
-        embed, view = await build_sheets_payload(upcoming, interaction.user)
+        embed, view = await build_sheets_payload(weeks, interaction.user)
     except SheetsError as e:
         await interaction.followup.send(str(e), ephemeral=True)
         return
