@@ -614,6 +614,7 @@ class PostNeedButton(discord.ui.Button):
             team=f.team or "",
             game_ts=f.game_iso,
             spots=f.spots,
+            channel=interaction.channel,
         )
         if status == "duplicate":
             # Don't stack an identical request on the board. Keep the flow open so
@@ -1186,7 +1187,7 @@ class Subs(commands.Cog):
         except discord.HTTPException as ex:
             pinned, pin_err = False, f"pinning failed (`{ex}`)."
         async with self._lock:
-            self.state["board"] = {"channel_id": channel.id, "message_id": msg.id}
+            self.state["board"] = {"channel_id": channel.id, "message_id": msg.id, "pinned": pinned}
             self._save()
         # One board only: drop stray pins here, and a prior board in another channel.
         await self._sweep_board_pins(channel, keep_id=msg.id)
@@ -1194,27 +1195,47 @@ class Subs(commands.Cog):
             prev_ch = await self._resolve_channel(old["channel_id"])
             if prev_ch is not None:
                 try:
-                    await (await prev_ch.fetch_message(old["message_id"])).delete()
+                    await prev_ch.get_partial_message(old["message_id"]).delete()
                 except discord.HTTPException:
                     pass
         return pinned, pin_err
 
-    async def render_board(self):
+    async def render_board(self, fallback_channel=None):
         board = self.state.get("board")
         if not board:
+            # No shared board yet. If an action just happened in a channel, lazily
+            # create + pin one there — the same way the practice board appears on the
+            # first /sheets sign-up, instead of waiting for someone to run /subsboard.
+            if fallback_channel is not None:
+                await self._post_board(fallback_channel)
             return
         channel = await self._resolve_channel(board["channel_id"])
         if channel is None:
             return
         try:
-            msg = await channel.fetch_message(board["message_id"])
+            # Edit by ID through a partial message rather than fetch_message()+edit.
+            # fetch_message() needs the Read Message History permission and silently
+            # 403s without it — which is what left the board frozen after every action.
+            # get_partial_message() makes no API call and editing our own message
+            # doesn't need history; NotFound is raised only if it was deleted.
+            partial = channel.get_partial_message(board["message_id"])
+            await partial.edit(
+                embed=build_embed(self.state), view=build_view(self.state))
+            # Self-heal pinning: a board created while we lacked Manage Messages has a
+            # silently-failed pin and "pinned" stays falsy. Retry once now (no fetch),
+            # remember success, and sweep strays — so we don't re-pin on every edit.
+            if not board.get("pinned"):
+                try:
+                    await partial.pin()
+                    async with self._lock:
+                        if self.state.get("board"):
+                            self.state["board"]["pinned"] = True
+                        self._save()
+                    await self._sweep_board_pins(channel, keep_id=board["message_id"])
+                except discord.HTTPException as e:
+                    log.warning("Could not pin the live subs board: %s", e)
         except discord.NotFound:
             await self._post_board(channel)  # board was deleted — repost so it stays live
-            return
-        except discord.HTTPException:
-            return
-        try:
-            await msg.edit(embed=build_embed(self.state), view=build_view(self.state))
         except discord.Forbidden as e:
             # 50005 = "cannot edit a message authored by another user": the stored
             # board belongs to a different bot identity. Repost one we own (and sweep
@@ -1225,18 +1246,8 @@ class Subs(commands.Cog):
                 await self._post_board(channel)
             else:
                 log.warning("Forbidden editing subs board: %s", e)
-            return
         except discord.HTTPException as e:
             log.warning("Could not edit subs board: %s", e)
-            return
-        # The board we just updated must be the one that's actually pinned — otherwise
-        # people keep watching a stale, unpinned copy. Re-pin it and clear strays if so.
-        if not msg.pinned:
-            try:
-                await msg.pin()
-                await self._sweep_board_pins(channel, keep_id=msg.id)
-            except discord.HTTPException as e:
-                log.warning("Could not pin the live subs board: %s", e)
 
     def board_channel(self):
         board = self.state.get("board")
@@ -1268,7 +1279,7 @@ class Subs(commands.Cog):
         return [lg for lg in leagues if not lg.get("ended")]
 
     # -- mutations (called from button/modal callbacks) ---------------------
-    async def add_request(self, *, requester, game_ts, spots, league_id="", league="", team=""):
+    async def add_request(self, *, requester, game_ts, spots, league_id="", league="", team="", channel=None):
         """Create a request, unless an open one already exists for the same league +
         game + team. Returns (status, req): ("duplicate", existing) or ("created", new).
         The dup check + create happen under one lock so two posts can't both slip in."""
@@ -1288,7 +1299,9 @@ class Subs(commands.Cog):
                 now=club_now(),
             )
             self._save()
-        await self.render_board()
+        # Pass the channel so the shared board is created+pinned here if it doesn't
+        # exist yet (first request behaves like the first /sheets sign-up).
+        await self.render_board(fallback_channel=channel)
         return ("created", req)
 
     async def invite(self, rid: str, uid: int, name: str, *, inviter) -> str:

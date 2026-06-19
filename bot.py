@@ -460,8 +460,7 @@ async def render_practice_board(target_channel=None):
     if board and target_channel is not None and board.get("channel_id") != target_channel.id:
         try:
             ch = bot.get_channel(board["channel_id"]) or await bot.fetch_channel(board["channel_id"])
-            old = await ch.fetch_message(board["message_id"])
-            await old.delete()
+            await ch.get_partial_message(board["message_id"]).delete()
         except discord.HTTPException:
             pass
         board = None
@@ -469,11 +468,28 @@ async def render_practice_board(target_channel=None):
     if board:
         try:
             ch = bot.get_channel(board["channel_id"]) or await bot.fetch_channel(board["channel_id"])
-            msg = await ch.fetch_message(board["message_id"])
-            await msg.edit(embed=embed)
+            # Edit by ID through a partial message rather than fetch_message()+edit.
+            # fetch_message() needs the Read Message History permission and silently
+            # 403s without it — which is what left the board frozen after a sign-up or
+            # cancel. get_partial_message() makes no API call and editing our own
+            # message doesn't need history; NotFound is raised only if it was deleted.
+            partial = ch.get_partial_message(board["message_id"])
+            await partial.edit(embed=embed)
+            # Self-heal pinning: if the board was created while we lacked Manage
+            # Messages, its pin silently failed and "pinned" stays falsy. Retry once
+            # now (no fetch) and remember success so we don't re-pin on every edit.
+            if not board.get("pinned"):
+                try:
+                    await partial.pin()
+                    async with _practice_lock:
+                        if _practice_state.get("board"):
+                            _practice_state["board"]["pinned"] = True
+                        ps.save(PRACTICE_STORE_PATH, _practice_state)
+                except discord.HTTPException as e:
+                    log.warning("Couldn't pin practice board %s: %s", board["message_id"], e)
             return
         except discord.NotFound:
-            board = None
+            board = None  # board was deleted — fall through and repost it
         except discord.Forbidden as e:
             # 50005 = board authored by another bot identity (e.g. a dev bot reusing
             # the prod data dir). Drop the stale pointer and fall through to repost
@@ -486,21 +502,25 @@ async def render_practice_board(target_channel=None):
                     ps.save(PRACTICE_STORE_PATH, _practice_state)
                 board = None
             else:
+                log.warning("Couldn't edit practice board %s: %s", board["message_id"], e)
                 return
-        except discord.HTTPException:
+        except discord.HTTPException as e:
+            log.warning("Couldn't edit practice board %s: %s", board["message_id"], e)
             return
 
     if target_channel is not None:
         try:
             msg = await target_channel.send(embed=embed)
+            pinned_ok = True
             try:
                 await msg.pin()
             except discord.HTTPException:
-                pass  # no Manage Messages — board still works unpinned
+                pinned_ok = False  # no Manage Messages — board still works unpinned
         except discord.HTTPException:
             return
         async with _practice_lock:
-            _practice_state["board"] = {"channel_id": target_channel.id, "message_id": msg.id}
+            _practice_state["board"] = {"channel_id": target_channel.id,
+                                        "message_id": msg.id, "pinned": pinned_ok}
             ps.save(PRACTICE_STORE_PATH, _practice_state)
 
 
@@ -523,7 +543,20 @@ class JoinPracticeButton(discord.ui.DynamicItem[discord.ui.Button],
         return cls(match["key"], int(match["up"]))
 
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer()
+        # Instant "busy" feedback: grey out the report's buttons the moment they tap,
+        # so the click visibly registers and an impatient double-tap can't slip a
+        # second toggle in before we re-render. Live buttons return with the refresh
+        # below. (The time-based debounce stays on as a backstop.)
+        try:
+            busy = discord.ui.View.from_message(interaction.message)
+            for child in busy.children:
+                child.disabled = True
+            await interaction.response.edit_message(view=busy)
+        except (discord.HTTPException, AttributeError):
+            try:
+                await interaction.response.defer()  # fall back to a plain ack
+            except discord.HTTPException:
+                pass
         when_ts = ""
         try:
             when_ts = datetime.strptime(self.key, "%Y%m%dT%H%M").isoformat()
@@ -541,12 +574,14 @@ class JoinPracticeButton(discord.ui.DynamicItem[discord.ui.Button],
                 n = ps.count(_practice_state, self.key)
                 ps.save(PRACTICE_STORE_PATH, _practice_state)
 
-        # Refresh the (private) report in place so counts stay current.
+        # Refresh the (private) report in place so counts stay current. Don't let a
+        # hiccup here (fetch error, or the interaction message being gone) block the
+        # shared-board update below — the board is what everyone else is watching.
         try:
             embed, view = await build_sheets_payload(self.upcoming, interaction.user)
             await interaction.edit_original_response(embed=embed, view=view)
-        except SheetsError:
-            pass  # keep the existing message if the refresh fetch hiccups
+        except (SheetsError, discord.HTTPException):
+            log.warning("Couldn't refresh the private /sheets report after a toggle.")
 
         if repeat:
             return  # nothing changed — don't re-ping the channel or re-notify
