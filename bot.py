@@ -2,11 +2,12 @@
 Curling Club Practice-Ice Bot
 Slash command: /sheets [weeks]
 
-Reports practice ice from three sources, in time order: designated practice
-blocks, Learn-to-Curls that don't fill the ice, and league draws that don't
-fill the ice. Sheet counts come from Gravity Forms (LTC/private events) and the
-public league pages (leagues, via league_client). No estimates — unconfirmed
-sessions are flagged as such.
+Reports practice ice from four sources, in time order: designated practice
+blocks, Learn-to-Curls that don't fill the ice, league draws that don't fill the
+ice, and facility-reserved curling ice the club hasn't booked over yet (the
+rink's public iCal feed, via pond_ice). Sheet counts come from Gravity Forms
+(LTC/private events) and the public league pages (leagues, via league_client).
+No estimates — unconfirmed sessions are flagged as such.
 
 Configure the target site and club name via environment variables
 (SITE_BASE_URL, CLUB_NAME) — see .env.example.
@@ -33,6 +34,7 @@ from gf_client import GFClient
 from league_client import get_cached_leagues, draw_to_datetime
 import practice_ice as pi
 import practice_store as ps
+import pond_ice
 import subs
 
 log = logging.getLogger(__name__)
@@ -50,6 +52,15 @@ WP_API        = f"{SITE_BASE_URL}/wp-json/tribe/events/v1"
 # Sheet count varies by facility — configure via NUM_SHEETS (default 4).
 TOTAL_SHEETS  = int(os.environ.get("NUM_SHEETS", "4"))
 TIMEZONE_OFFSET = -5  # America/Chicago (CST = UTC-5, CDT = UTC-6)
+
+# Facility-reserved curling ice (the rink's own public Google calendar). The
+# club can use these blocks but they're not on the club calendar until something
+# is booked, so we surface any that nothing club-side overlaps as open practice
+# ice. POND_ICS_URLS = comma-separated public iCal URLs (kept in .env, never in
+# the repo); POND_MATCH = title keyword that marks a curling block.
+POND_ICS_URLS = [u.strip() for u in os.environ.get("POND_ICS_URLS", "").split(",") if u.strip()]
+POND_MATCH    = os.environ.get("POND_MATCH", "curl")
+POND_CACHE_TTL = int(os.environ.get("POND_CACHE_TTL", "21600"))  # 6h
 
 # Practice sign-up pool (shared across members; interactions stay private).
 PRACTICE_STORE_PATH = os.environ.get("PRACTICE_STORE_PATH", "practice_signups.json")
@@ -320,6 +331,25 @@ async def collect_sessions(practices, window_start, window_end, gf) -> list[dict
                 "sheets_used": d.get("sheets_used"),
             })
 
+    # 4. Facility-reserved curling ice (the rink's public calendar). Surface a
+    #    block only when nothing the club already has booked overlaps it — an
+    #    overlap means that ice is already represented by another row above.
+    if POND_ICS_URLS:
+        club_sessions = list(sessions)  # snapshot before adding reserved blocks
+        try:
+            reserved = await pond_ice.fetch_reserved_curling(
+                POND_ICS_URLS, window_start, window_end, POND_CACHE_TTL, POND_MATCH)
+        except Exception as ex:  # noqa: BLE001 — a feed hiccup must not break /sheets
+            log.warning("Reserved-ice fetch failed: %s", ex)
+            reserved = []
+        for rv in reserved:
+            if any(pi.overlaps(rv["start"], rv["end"], s["start"], s["end"]) for s in club_sessions):
+                continue
+            sessions.append({
+                "start": rv["start"], "end": rv["end"],
+                "type": "Reserved Ice", "title": "", "sheets_used": 0,
+            })
+
     return sessions
 
 
@@ -537,8 +567,12 @@ class JoinPracticeButton(discord.ui.DynamicItem[discord.ui.Button],
                  count: int = 0, mine: bool = False):
         self.key = key
         self.weeks = int(weeks)
-        # Date + time on the label, e.g. "Practice 6/18 7:45PM (1)". Fall back to
-        # parsing the key when reconstructed from a custom_id (start isn't encoded).
+        # No type prefix: the report line directly above each button already names
+        # the slot type and free sheets, and the button colour signals state. So the
+        # button just shows the time (+ current sign-up count), e.g. "6/20 1:30PM (0)".
+        # "Leave" stays on the joined state since that affordance isn't obvious from
+        # colour alone. Fall back to parsing the key when reconstructed from a
+        # custom_id (start isn't encoded; the live label is re-rendered on build).
         when_dt = start
         if when_dt is None:
             try:
@@ -546,7 +580,7 @@ class JoinPracticeButton(discord.ui.DynamicItem[discord.ui.Button],
             except ValueError:
                 when_dt = None
         when = when_dt.strftime('%-m/%-d %-I:%M%p') if when_dt else key
-        label = f"{'Leave' if mine else 'Practice'} {when} ({count})"
+        label = f"Leave {when} ({count})" if mine else f"{when} ({count})"
         super().__init__(discord.ui.Button(
             label=label[:80],
             style=discord.ButtonStyle.secondary if mine else discord.ButtonStyle.success,

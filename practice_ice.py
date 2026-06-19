@@ -13,7 +13,7 @@ practice opportunity when at least one sheet is free.
 A "session" is a plain dict:
   {
     "start": datetime, "end": datetime,
-    "type": "Practice" | "LTC" | "Private" | "League",
+    "type": "Practice" | "LTC" | "Private" | "League" | "Reserved Ice",
     "title": str,
     "sheets_used": int | None,   # None = unknown (no registration data yet)
   }
@@ -35,7 +35,7 @@ TOTAL_SHEETS = 4
 # Free sheets during any session = total minus the sheets used by EVERY
 # overlapping session, so concurrent bookings stack correctly (e.g. two private
 # events using 2 + 1 sheets at the same time leave 1 free).
-ALWAYS_SHOW_TYPES = ("Practice", "LTC", "Private")
+ALWAYS_SHOW_TYPES = ("Practice", "LTC", "Private", "Reserved Ice")
 SHOW_IF_FREE_TYPES = ("League",)
 
 
