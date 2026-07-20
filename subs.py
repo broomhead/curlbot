@@ -2,12 +2,15 @@
 Subs board — an interactive, persistent Discord widget for "I need a sub" /
 "I can sub" coordination.
 
-One live board message per channel. It is never pinned — instead, any change
-(new request, cancel, availability added/removed, a sub added or dropped) reposts
-the board fresh at the bottom of the channel so everyone sees it. The board groups
-open games by date with a 🔴/🟡/🟢 status per spot and lists who's available for
-each. Members can also pull up a private copy with /subs. Interaction is entirely
-on the board:
+Requests and availability are SHARED across every server the bot is in; each
+server renders its own board of that same data. A change made anywhere updates the
+shared data and reposts the board on the SERVER WHERE IT HAPPENED (so testing on
+one server doesn't spam another) — other servers pick up the change the next time
+someone acts there. `/subs` shows a private copy; `/subs show:True` (re)posts a
+server's public board in the current channel. The board is never pinned — it
+reposts fresh at the bottom on each change. It groups open games by date with a
+🔴/🟡/🟢 status per spot and lists who's available for each. Interaction is on the
+board:
 
   ➕ Need a sub      — league → team → game → spots (all picked from the system).
   🙋 I'm free        — list your availability so you get tagged for matching games.
@@ -476,7 +479,7 @@ class FillForMemberSelect(discord.ui.UserSelect):
         member = self.values[0]
         if cog._is_repeat_click(cog._click_cooldown, ("fillfor", interaction.user.id, self.rid, member.id)):
             return
-        result, req = await cog.fill_spot_for(interaction.user, self.rid, member)
+        result, req = await cog.fill_spot_for(interaction.user, self.rid, member, interaction.channel)
         when = fmt_when(req["game_ts"]) if req else "that game"
         msgs = {
             "added": f"✅  Marked **{member.display_name}** in for **{when}** — they and the requester were notified.",
@@ -585,7 +588,7 @@ class ConfirmRemoveSubView(discord.ui.View):
         cog: "Subs" = interaction.client.get_cog("Subs")
         if cog._is_repeat_click(cog._click_cooldown, ("rmsub", interaction.user.id, self.rid, self.target)):
             return
-        result, req = await cog.remove_sub_by_anyone(interaction.user, self.rid, self.target)
+        result, req = await cog.remove_sub_by_anyone(interaction.user, self.rid, self.target, interaction.channel)
         when = fmt_when(req["game_ts"]) if req else "that game"
         if result == "removed":
             msg = f"✖️  Removed **{self.name}** from **{when}** — they and the requester were notified."
@@ -642,7 +645,7 @@ class ConfirmCancelView(discord.ui.View):
             return
         if cog._is_repeat_click(cog._click_cooldown, ("cancelreq", interaction.user.id, self.rid)):
             return
-        await cog.close_request(self.rid)
+        await cog.close_request(self.rid, interaction.channel)
         await interaction.edit_original_response(content="✖️  Request cancelled and removed from the board.", view=None)
 
     @discord.ui.button(label="Keep", style=discord.ButtonStyle.secondary)
@@ -932,7 +935,8 @@ class PostAvailButton(discord.ui.Button):
             return  # leave the flow open so they can pick a league
         title = clean_title(lg.get("title", ""))
         cog: "Subs" = interaction.client.get_cog("Subs")
-        await cog.add_availability(user=interaction.user, league_id=view.league_id, league=title, games=view.game_isos)
+        await cog.add_availability(user=interaction.user, league_id=view.league_id, league=title,
+                                   games=view.game_isos, channel=interaction.channel)
         gtxt = ", ".join(fmt_when(g) for g in view.game_isos) if view.game_isos else "any game"
         await interaction.edit_original_response(
             content=f"✅  Listed you as available for **{title}** · {gtxt}.", view=None)
@@ -1016,7 +1020,7 @@ class RemoveAvailSelect(discord.ui.Select):
         await interaction.response.defer()
         cog: "Subs" = interaction.client.get_cog("Subs")
         league_id = "" if self.values[0] == "__nolg__" else self.values[0]
-        removed = await cog.remove_availability(interaction.user.id, league_id)
+        removed = await cog.remove_availability(interaction.user.id, league_id, interaction.channel)
         msg = "🗑️  Removed that availability listing." if removed else "That listing was already gone."
         await interaction.edit_original_response(content=msg, view=None)
 
@@ -1050,7 +1054,7 @@ class PageClaimButton(discord.ui.DynamicItem[discord.ui.Button],
         cog: "Subs" = interaction.client.get_cog("Subs")
         if cog._is_repeat_click(cog._click_cooldown, ("take", interaction.user.id, self.rid)):
             return
-        result, req = await cog.claim_from_page(interaction.user, self.rid)
+        result, req = await cog.claim_from_page(interaction.user, self.rid, interaction.channel)
         when = fmt_when(req["game_ts"]) if req else "that game"
         msgs = {
             "added": f"✅  You're in for **{when}** — thanks for subbing! The requester's been notified.",
@@ -1085,11 +1089,11 @@ class Subs(commands.Cog):
         self.reminder_loop.cancel()
 
     async def startup(self):
-        """Prune expired requests and re-render the board after a (re)connect."""
+        """Prune expired requests and re-render every server's board after a (re)connect."""
         async with self._lock:
             store.expire(self.state, club_now(), GRACE_HOURS)
             store.save(STORE_PATH, self.state)
-        await self.render_board()
+        await self.render_all_boards()
 
     # -- persistence + board refresh ----------------------------------------
     def _save(self):
@@ -1104,18 +1108,30 @@ class Subs(commands.Cog):
                 return None
         return ch
 
+    @staticmethod
+    def _guild_id(channel) -> int | None:
+        g = getattr(channel, "guild", None)
+        return g.id if g is not None else None
+
+    def _board_ptr(self, guild_id):
+        return self.state.get("boards", {}).get(str(guild_id)) if guild_id is not None else None
+
     async def _post_board(self, channel):
-        """Post a fresh board message in `channel` and repoint state at it, deleting
-        the previous board message so only the newest one remains. Nothing is ever
-        pinned — visibility comes from the board being the newest message in the
-        channel (so the bot needs no Manage Messages permission). Returns the message."""
-        old = self.state.get("board")
+        """Post a fresh board for `channel`'s SERVER and repoint that server's pointer
+        at it, deleting that server's previous board message. Requests/availability
+        are shared across servers; each server just renders its own board of the same
+        data. Not pinned — visibility comes from being the newest message (so the bot
+        needs no Manage Messages permission). Returns the message (or None in a DM)."""
+        gid = self._guild_id(channel)
+        if gid is None:
+            return None
+        key = str(gid)
+        old = self.state.get("boards", {}).get(key)
         msg = await channel.send(embed=build_embed(self.state), view=build_view(self.state))
         async with self._lock:
-            self.state["board"] = {"channel_id": channel.id, "message_id": msg.id}
+            self.state.setdefault("boards", {})[key] = {"channel_id": channel.id, "message_id": msg.id}
             self._save()
-        # Delete the previous board message (same channel or another) so the board
-        # never duplicates as it hops to the bottom of the chat.
+        # Delete this server's previous board so it doesn't duplicate as it hops down.
         if old:
             prev_ch = await self._resolve_channel(old["channel_id"])
             if prev_ch is not None:
@@ -1125,55 +1141,59 @@ class Subs(commands.Cog):
                     pass
         return msg
 
-    async def bump_board(self, fallback_channel=None):
-        """Repost the board as a fresh message at the BOTTOM of its channel so the
-        whole channel sees the change in the chat flow. Used for every outcome that
-        should be public (new request, close, availability add/remove, a sub
-        committing or dropping a spot). Falls back to `fallback_channel` when no
-        board exists yet (first-ever action creates it there, like /sheets)."""
-        board = self.state.get("board")
-        channel = await self._resolve_channel(board["channel_id"]) if board else None
+    async def bump_board(self, guild_id, fallback_channel=None):
+        """Repost ONE server's board at the bottom of its channel so that server sees
+        the change. Only the acting server's board moves; other servers keep theirs
+        (they refresh the shared data the next time someone acts there). Falls back to
+        `fallback_channel` when that server has no board yet."""
+        if guild_id is None:
+            return
+        ptr = self._board_ptr(guild_id)
+        channel = await self._resolve_channel(ptr["channel_id"]) if ptr else None
         if channel is None:
             channel = fallback_channel
         if channel is None:
             return
         await self._post_board(channel)
 
-    async def render_board(self, fallback_channel=None):
-        board = self.state.get("board")
-        if not board:
-            # No shared board yet. If an action just happened in a channel, lazily
-            # create one there — the same way the practice board appears on the
-            # first /sheets sign-up, instead of waiting for someone to run /subsboard.
+    async def render_board(self, guild_id, fallback_channel=None):
+        """Edit one server's board in place (no repost). Lazily create it in
+        `fallback_channel` if that server has none yet."""
+        if guild_id is None:
+            return
+        ptr = self._board_ptr(guild_id)
+        if not ptr:
             if fallback_channel is not None:
                 await self._post_board(fallback_channel)
             return
-        channel = await self._resolve_channel(board["channel_id"])
+        channel = await self._resolve_channel(ptr["channel_id"])
         if channel is None:
             return
         try:
-            # Edit by ID through a partial message rather than fetch_message()+edit.
-            # fetch_message() needs the Read Message History permission and silently
-            # 403s without it — which is what left the board frozen after every action.
             # get_partial_message() makes no API call and editing our own message
-            # doesn't need history; NotFound is raised only if it was deleted.
-            partial = channel.get_partial_message(board["message_id"])
-            await partial.edit(
-                embed=build_embed(self.state), view=build_view(self.state))
+            # doesn't need Read Message History; NotFound only if it was deleted.
+            partial = channel.get_partial_message(ptr["message_id"])
+            await partial.edit(embed=build_embed(self.state), view=build_view(self.state))
         except discord.NotFound:
             await self._post_board(channel)  # board was deleted — repost so it stays live
         except discord.Forbidden as e:
-            # 50005 = "cannot edit a message authored by another user": the stored
-            # board belongs to a different bot identity. Repost one we own (and sweep
-            # our own strays) rather than leaving a board that never updates.
-            if e.code == 50005:
+            if e.code == 50005:  # message authored by a different bot identity
                 log.warning("Subs board %s authored by another bot — reposting our own.",
-                            board["message_id"])
+                            ptr["message_id"])
                 await self._post_board(channel)
             else:
                 log.warning("Forbidden editing subs board: %s", e)
         except discord.HTTPException as e:
             log.warning("Could not edit subs board: %s", e)
+
+    async def render_all_boards(self):
+        """Refresh every server's board in place — used on startup and after the
+        background expiry prune, where there's no single acting server."""
+        for key in list(self.state.get("boards", {}).keys()):
+            try:
+                await self.render_board(int(key))
+            except (ValueError, TypeError):
+                continue
 
 
     # -- alert pages ("sub needed" pings + one-tap claim) -------------------
@@ -1199,11 +1219,6 @@ class Subs(commands.Cog):
             tail = "_No one's listed as available yet — first to tap grabs it:_"
         return f"{heads.get(reason, heads['new'])}\n{detail}\n{tail}"
 
-    async def _page_channel(self, fallback_channel=None):
-        board = self.state.get("board")
-        ch = await self._resolve_channel(board["channel_id"]) if board else None
-        return ch or fallback_channel
-
     async def _delete_page(self, req: dict):
         """Delete a request's live alert message (if any) and clear its pointer."""
         alert = req.get("alert") or {}
@@ -1224,7 +1239,9 @@ class Subs(commands.Cog):
         Retires any earlier page for the same request so alerts don't stack."""
         if store.open_spots(req) <= 0:
             return
-        ch = await self._page_channel(channel)
+        # Alerts go to the request's origin channel (where it was posted), so a
+        # request made on LSCC pings on LSCC even though the data is shared.
+        ch = channel or await self._resolve_channel(req.get("channel_id"))
         if ch is None:
             return
         await self._delete_page(req)
@@ -1266,21 +1283,21 @@ class Subs(commands.Cog):
                 self._save()
 
 
-    async def claim_from_page(self, user, rid: str) -> tuple[str, dict | None]:
+    async def claim_from_page(self, user, rid: str, channel=None) -> tuple[str, dict | None]:
         """One-tap claim from an alert page. Returns (result, req) where result is
-        "added" | "already" | "requester" | "full" | "closed"."""
+        "added" | "already" | "requester" | "full" | "locked" | "closed"."""
         async with self._lock:
             req = store.find_request(self.state, rid)
             if req is None:
                 return ("closed", None)
             if user.id == req.get("requester_id"):
                 return ("requester", req)
-        return await self.fill_request_spot(user, rid)  # board bump + page refresh + notify
+        return await self.fill_request_spot(user, rid, channel)  # board bump + page refresh + DM
 
-    async def remove_sub_by_anyone(self, actor, rid: str, target_uid: int) -> tuple[str, dict | None]:
+    async def remove_sub_by_anyone(self, actor, rid: str, target_uid: int, channel=None) -> tuple[str, dict | None]:
         """Anyone removes a listed sub from a request (offline sync). DMs the requester
-        that a spot opened back up, and reposts the board. Returns (result, req) where
-        result is "removed" | "absent" | "locked" | "closed"."""
+        that a spot opened back up, and reposts the acting server's board. Returns
+        (result, req) where result is "removed" | "absent" | "locked" | "closed"."""
         async with self._lock:
             req = store.find_request(self.state, rid)
             if req is None:
@@ -1296,7 +1313,7 @@ class Subs(commands.Cog):
             self._save()
         if result != "removed":
             return (result, req)
-        await self.bump_board()
+        await self.bump_board(self._guild_id(channel), fallback_channel=channel)
         await self.refresh_page(req)
         if requester_id != actor.id:
             await self._dm_requester(
@@ -1333,14 +1350,15 @@ class Subs(commands.Cog):
                 league_id=league_id,
                 league=league,
                 team=team,
+                guild_id=self._guild_id(channel),
+                channel_id=getattr(channel, "id", None),
                 now=club_now(),
             )
             self._save()
-        # Keep the board current, then post the public alert page — that's the
-        # announcement: it pings the members listed as available for this league/game
-        # and carries a one-tap "I'll take it" button. Pass the channel so the board
-        # is created here if it doesn't exist yet (like the first /sheets sign-up).
-        await self.render_board(fallback_channel=channel)
+        # Refresh this server's board (create it here if it has none yet), then post
+        # the public alert page in this channel — it pings the members available for
+        # this game and carries a one-tap "I'll take it" button.
+        await self.render_board(self._guild_id(channel), fallback_channel=channel)
         await self.post_page(req, reason="new", channel=channel)
         return ("created", req)
 
@@ -1358,21 +1376,21 @@ class Subs(commands.Cog):
                 del cooldown[k]
         return last is not None and now_m - last < CLICK_DEBOUNCE_SECONDS
 
-    async def add_availability(self, *, user, league_id, league, games) -> str:
+    async def add_availability(self, *, user, league_id, league, games, channel=None) -> str:
         async with self._lock:
             result = store.upsert_availability(
                 self.state, user_id=user.id, name=user.display_name,
                 league_id=league_id, league=league, games=games, now=club_now(),
             )
             self._save()
-        await self.bump_board()
+        await self.bump_board(self._guild_id(channel), fallback_channel=channel)
         return result
 
-    async def remove_availability(self, user_id: int, league_id) -> bool:
+    async def remove_availability(self, user_id: int, league_id, channel=None) -> bool:
         async with self._lock:
             removed = store.remove_availability(self.state, user_id, league_id)
             self._save()
-        await self.bump_board()
+        await self.bump_board(self._guild_id(channel), fallback_channel=channel)
         return removed
 
 
@@ -1386,7 +1404,7 @@ class Subs(commands.Cog):
         except (discord.Forbidden, discord.HTTPException, discord.NotFound):
             pass
 
-    async def fill_request_spot(self, user, rid: str) -> tuple[str, dict | None]:
+    async def fill_request_spot(self, user, rid: str, channel=None) -> tuple[str, dict | None]:
         """A sub self-fills an open request (hand-raise / alert-page claim). Adds them
         to the spot and DMs the requester. Returns (result, req) where result is
         "added" | "already" | "full" | "locked" | "closed"."""
@@ -1401,7 +1419,7 @@ class Subs(commands.Cog):
             requester_id = req["requester_id"]
             opn = store.open_spots(req)
             self._save()
-        await self.bump_board()
+        await self.bump_board(self._guild_id(channel), fallback_channel=channel)
         await self.refresh_page(req)
         if result == "added" and requester_id != user.id:
             await self._dm_requester(
@@ -1409,10 +1427,10 @@ class Subs(commands.Cog):
                 f"🥌 {user.display_name} took a sub spot for your {when} game — {opn} still open.")
         return (result, req)
 
-    async def fill_spot_for(self, actor, rid: str, member) -> tuple[str, dict | None]:
+    async def fill_spot_for(self, actor, rid: str, member, channel=None) -> tuple[str, dict | None]:
         """Any member marks `member` into an open spot on request `rid` (offline sync).
         Direct fill — no confirmation. DMs the requester that their game got a sub, and
-        reposts the board. Returns (result, req):
+        reposts the acting server's board. Returns (result, req):
         "added" | "already" | "requester" | "full" | "locked" | "closed"."""
         async with self._lock:
             req = store.find_request(self.state, rid)
@@ -1429,7 +1447,7 @@ class Subs(commands.Cog):
             self._save()
         if result != "added":
             return (result, req)
-        await self.bump_board()
+        await self.bump_board(self._guild_id(channel), fallback_channel=channel)
         await self.refresh_page(req)
         if requester_id != actor.id:
             await self._dm_requester(
@@ -1439,16 +1457,13 @@ class Subs(commands.Cog):
         return (result, req)
 
 
-    async def close_request(self, rid: str):
-        # Capture the subs (filled + pending) before closing so we can tell them the
-        # request they were on is gone — they were removed by someone else (the
-        # requester), so they get a heads-up. The requester themselves is skipped.
+    async def close_request(self, rid: str, channel=None):
         async with self._lock:
             req = store.find_request(self.state, rid)
             alert = req.get("alert") if req is not None else None
             store.close_request(self.state, rid)
             self._save()
-        await self.bump_board()
+        await self.bump_board(self._guild_id(channel), fallback_channel=channel)
         # Retire the alert page for the closed request.
         if alert and alert.get("message_id"):
             ch = await self._resolve_channel(alert["channel_id"])
@@ -1477,7 +1492,7 @@ class Subs(commands.Cog):
                     except discord.HTTPException:
                         pass
         if changed:
-            await self.render_board()
+            await self.render_all_boards()
 
     @expiry_loop.before_loop
     async def _before_expiry(self):
@@ -1514,25 +1529,30 @@ class Subs(commands.Cog):
         await self.bot.wait_until_ready()
 
     # -- slash commands -----------------------------------------------------
-    @app_commands.command(name="subs", description="Open your private subs board — only you can see it.")
-    async def subs_cmd(self, interaction: discord.Interaction):
-        """An ephemeral, interactive copy of the board, visible only to the caller.
-        Taking a spot / posting / inviting all update the shared board."""
-        await interaction.response.send_message(
-            content="Your subs board (only you can see this):",
-            embed=build_embed(self.state), view=build_view(self.state), ephemeral=True)
-
-    @app_commands.command(name="subsboard", description="Post the shared subs board in this channel (organizers).")
-    @app_commands.default_permissions(manage_messages=True)
-    async def subsboard_cmd(self, interaction: discord.Interaction):
-        # _post_board posts a fresh board here and repoints state at it, deleting any
-        # prior board so there's only ever one. It's not pinned — the board reposts
-        # itself to the bottom of the channel whenever something changes.
+    @app_commands.command(
+        name="subs",
+        description="Show the subs board — private to you, or post it here for everyone with show:True.")
+    @app_commands.describe(
+        show="Post the board in this channel for everyone (default: private — only you see it).")
+    async def subs_cmd(self, interaction: discord.Interaction, show: bool = False):
+        """Default: an ephemeral copy only the caller sees. `show:True`: (re)posts this
+        server's shared board right here, visible to all — this is that server's board
+        from now on, refreshed whenever someone acts here. Data is shared across
+        servers; each server shows its own board."""
+        if not show:
+            await interaction.response.send_message(
+                content="Your subs board (only you can see this):",
+                embed=build_embed(self.state), view=build_view(self.state), ephemeral=True)
+            return
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "Run `/subs show` in a server channel to post the board.", ephemeral=True)
+            return
         await interaction.response.defer(ephemeral=True)
         await self._post_board(interaction.channel)
         await interaction.followup.send(
-            "🥌  Shared subs board posted here. It'll repost itself to the bottom "
-            "whenever something changes, so it stays visible.", ephemeral=True)
+            "🥌  Posted the subs board here. It refreshes in place, and hops to the "
+            "bottom whenever something changes on this server.", ephemeral=True)
 
 
 async def setup(bot: commands.Bot):

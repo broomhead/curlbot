@@ -55,7 +55,11 @@ DEFAULT_AVAIL_DAYS = 14
 # ── Persistence ─────────────────────────────────────────────────────────────
 
 def empty_state() -> dict:
-    return {"board": None, "requests": [], "availability": []}
+    # `boards` maps a Discord guild id (str) -> that server's board pointer
+    # {"channel_id", "message_id"}. Requests and availability are GLOBAL (shared by
+    # every server the bot is in); each server just renders its own board of the
+    # same shared data. See new_request for the per-request origin guild/channel.
+    return {"boards": {}, "requests": [], "availability": []}
 
 
 def load(path: str) -> dict:
@@ -67,7 +71,11 @@ def load(path: str) -> dict:
     except (json.JSONDecodeError, OSError):
         return empty_state()
     # Tolerate older/partial files.
-    state.setdefault("board", None)
+    state.setdefault("boards", {})
+    # Migrate the old single-server pointer: we can't key the legacy board by guild
+    # (it only stored a channel_id), so drop it. Each server posts a fresh board on
+    # its next action; the stale legacy message, if any, is just left in place.
+    state.pop("board", None)
     state.setdefault("requests", [])
     state.setdefault("availability", [])
     for r in state["requests"]:  # tolerate stores written before these fields existed
@@ -75,6 +83,8 @@ def load(path: str) -> dict:
         r.setdefault("pending", [])
         r.setdefault("alert", {"channel_id": None, "message_id": None})
         r.setdefault("reminded", False)
+        r.setdefault("guild_id", None)    # server the request was posted from
+        r.setdefault("channel_id", None)  # channel it was posted in (for alerts)
     return state
 
 
@@ -128,6 +138,8 @@ def new_request(
     position: str = "",
     notes: str = "",
     kind: str = "sub",
+    guild_id=None,
+    channel_id=None,
     now: Optional[datetime] = None,
 ) -> dict:
     now = now or datetime.now()
@@ -136,6 +148,10 @@ def new_request(
         "kind": kind,
         "requester_id": requester_id,
         "requester_name": requester_name,
+        # Origin server + channel: alerts/reminders for this request go here, so a
+        # request posted on LSCC pings in LSCC even though the data is shared.
+        "guild_id": int(guild_id) if guild_id is not None else None,
+        "channel_id": int(channel_id) if channel_id is not None else None,
         "league_id": str(league_id) if league_id not in (None, "") else "",
         "league": league.strip(),
         "team": team.strip(),
