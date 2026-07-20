@@ -379,9 +379,9 @@ async def setup_hook():
     bot.add_dynamic_items(
         subs.NewRequestButton,
         subs.AvailableButton,
-        subs.ManageButton,
-        subs.ConfirmButton,
-        subs.DeclineButton,
+        subs.FillForButton,
+        subs.RemoveButton,
+        subs.PageClaimButton,
         JoinPracticeButton,
     )
     await bot.add_cog(subs.Subs(bot))

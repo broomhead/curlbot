@@ -73,6 +73,8 @@ def load(path: str) -> dict:
     for r in state["requests"]:  # tolerate stores written before these fields existed
         r.setdefault("filled", [])
         r.setdefault("pending", [])
+        r.setdefault("alert", {"channel_id": None, "message_id": None})
+        r.setdefault("reminded", False)
     return state
 
 
@@ -143,6 +145,10 @@ def new_request(
         "spots_needed": max(1, int(spots_needed)),
         "filled": [],
         "pending": [],
+        # The live "sub needed" alert message we posted for this request (so we can
+        # edit/replace/retire it), and whether the pre-game reminder has fired.
+        "alert": {"channel_id": None, "message_id": None},
+        "reminded": False,
         "created_ts": _now_iso(now),
     }
     state["requests"].append(req)
@@ -184,38 +190,6 @@ def remove_sub(req: dict, user_id: int) -> str:
         req["pending"] = [p for p in req["pending"] if p["user_id"] != user_id]
         return "removed"
     return "absent"
-
-
-# ── Invitations (requester invites an available sub; they confirm via DM) ────
-
-def invite_sub(req: dict, user_id: int, name: str, now: Optional[datetime] = None) -> str:
-    """Reserve a spot for an invited sub, pending their confirmation.
-    Returns "invited" | "already" (filled or already pending) | "full"."""
-    if is_involved(req, user_id):
-        return "already"
-    if open_spots(req) <= 0:
-        return "full"
-    req.setdefault("pending", []).append(
-        {"user_id": user_id, "name": name, "ts": _now_iso(now or datetime.now())})
-    return "invited"
-
-
-def confirm_sub(req: dict, user_id: int, name: str, now: Optional[datetime] = None) -> str:
-    """Invited sub accepts: move them from pending to filled. Returns "confirmed" | "absent"."""
-    if not is_pending_by(req, user_id):
-        return "absent"
-    req["pending"] = [p for p in req["pending"] if p["user_id"] != user_id]
-    req.setdefault("filled", []).append(
-        {"user_id": user_id, "name": name, "ts": _now_iso(now or datetime.now())})
-    return "confirmed"
-
-
-def decline_sub(req: dict, user_id: int) -> str:
-    """Invited sub declines: free the reserved spot. Returns "declined" | "absent"."""
-    if not is_pending_by(req, user_id):
-        return "absent"
-    req["pending"] = [p for p in req["pending"] if p["user_id"] != user_id]
-    return "declined"
 
 
 def close_request(state: dict, rid: str) -> bool:
