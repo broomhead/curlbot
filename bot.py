@@ -1,6 +1,6 @@
 """
 Curling Club Practice-Ice Bot
-Slash command: /sheets [weeks]
+Slash command: /sheets [weeks] [stats] [show]  (stats:True = streak records, show:True = post board)
 
 Reports practice ice from four sources, in time order: designated practice
 blocks, Learn-to-Curls that don't fill the ice, league draws that don't fill the
@@ -65,6 +65,11 @@ TIMEZONE_OFFSET = -5  # America/Chicago (CST = UTC-5, CDT = UTC-6)
 POND_ICS_URLS = [u.strip() for u in os.environ.get("POND_ICS_URLS", "").split(",") if u.strip()]
 POND_MATCH    = os.environ.get("POND_MATCH", "curl")
 POND_CACHE_TTL = int(os.environ.get("POND_CACHE_TTL", "21600"))  # 6h
+# /sheets makes several network calls (calendar + Gravity Forms). That data changes
+# slowly, so cache the built opportunities and reuse them for SHEETS_CACHE_TTL —
+# same 6h cadence as the league cache. In-memory, so it also refetches once per app
+# launch. See fetch_opps_cached.
+SHEETS_CACHE_TTL = int(os.environ.get("SHEETS_CACHE_TTL", "21600"))  # 6h
 
 # Practice sign-up pool (shared across members; interactions stay private).
 PRACTICE_STORE_PATH = os.environ.get("PRACTICE_STORE_PATH", "practice_signups.json")
@@ -408,8 +413,8 @@ bot.setup_hook = setup_hook
 async def on_ready():
     cog = bot.get_cog("Subs")
     if cog is not None:
-        await cog.startup()  # prune expired requests and refresh the pinned board
-    await restore_practice_board()  # re-render + re-pin the practice board after a (re)boot
+        await cog.startup()  # prune expired requests and refresh each server's board
+    await restore_practice_board()  # re-render the practice board after a (re)boot
     print(f"✅  Logged in as {bot.user}.")
 
 
@@ -451,21 +456,63 @@ async def fetch_opps(weeks: int) -> list[dict]:
     return pi.practice_opportunities(sessions, TOTAL_SHEETS)
 
 
+# Cache the fetched opportunities per `weeks` window so /sheets (and every sign-up
+# button re-render) doesn't hit the backend each time. Refetch only when the entry
+# is older than SHEETS_CACHE_TTL (or on first use after launch). On a refetch
+# failure, serve the stale entry rather than erroring.
+_opps_cache: dict[int, tuple[float, list[dict]]] = {}
+_opps_cache_lock = asyncio.Lock()
+
+
+def _fresh_opps(opps: list[dict]) -> list[dict]:
+    """Drop opportunities that have already ended, so a long-lived cache never shows a
+    clearly-past slot; everything still upcoming (within its window) is kept as-is."""
+    cutoff = now_club() - timedelta(hours=SHEETS_GRACE_HOURS)
+    return [o for o in opps if o.get("end") is None or o["end"] > cutoff]
+
+
+async def fetch_opps_cached(weeks: int) -> list[dict]:
+    now_m = time.monotonic()
+    entry = _opps_cache.get(weeks)
+    if entry is None or now_m - entry[0] > SHEETS_CACHE_TTL:
+        async with _opps_cache_lock:
+            entry = _opps_cache.get(weeks)  # re-check: another task may have refetched
+            if entry is None or time.monotonic() - entry[0] > SHEETS_CACHE_TTL:
+                try:
+                    opps = await fetch_opps(weeks)
+                except SheetsError:
+                    if entry is not None:
+                        log.warning("Sheets refetch failed — serving cached opportunities.")
+                        return _fresh_opps(entry[1])
+                    raise
+                entry = (time.monotonic(), opps)
+                _opps_cache[weeks] = entry
+    return _fresh_opps(entry[1])
+
+
 async def build_sheets_payload(weeks: int, user) -> tuple[discord.Embed, discord.ui.View | None]:
     """Build the (ephemeral) practice-ice embed + sign-up view for a member."""
-    opps = await fetch_opps(weeks)
+    opps = await fetch_opps_cached(weeks)
 
-    # Register each session and snapshot sign-up counts under the lock.
+    # Register each session and snapshot sign-up counts under the lock. Sessions are
+    # keyed by start minute, so two opportunities at the same time share ONE sign-up
+    # pool — collapse them to a single row + button (a second button would reuse the
+    # custom_id, which Discord rejects with 50035 "custom id cannot be duplicated").
     async with _practice_lock:
         ps.expire(_practice_state, now_club())
-        keyed = []
-        for o in opps[:MAX_SIGNUP_BUTTONS]:
+        keyed, seen_keys = [], set()
+        for o in opps:
             key = session_key(o)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
             label = f"{o['start'].strftime('%a %b %-d')} · {o['start'].strftime('%-I:%M %p')}"
             ps.register_session(_practice_state, key, when_ts=o["start"].isoformat(),
                                 label=label, sheets=o.get("free"))
             keyed.append((o, key, ps.count(_practice_state, key),
                           ps.is_signed_up(_practice_state, key, user.id)))
+            if len(keyed) >= MAX_SIGNUP_BUTTONS:
+                break
         ps.save(PRACTICE_STORE_PATH, _practice_state)
 
     embed = discord.Embed(title=f"🥌  Practice Ice — {CLUB_NAME}", color=0x1a6bb5)
@@ -478,11 +525,49 @@ async def build_sheets_payload(weeks: int, user) -> tuple[discord.Embed, discord
     for o, key, n, mine in keyed:
         line = pi.format_opportunity(o, TOTAL_SHEETS)[1]
         line += f"\n    🧹 **{n}** signed up to practice" + (" · you're in" if mine else "")
+        # No free ice → nothing to practice on, so don't let people sign up. Someone
+        # already signed up keeps a button (to withdraw); everyone else gets none.
+        full = o.get("free", 0) <= 0
+        if full and not mine:
+            line += "\n    ⛔ no open ice — sign-up closed for this slot"
         lines.append(line)
-        view.add_item(JoinPracticeButton(key, weeks, o["start"], n, mine))
+        if mine or not full:
+            view.add_item(JoinPracticeButton(key, weeks, o["start"], n, mine))
     embed.description = "\n\n".join(lines)
     embed.set_footer(text="Tap a slot to sign up · only you can see this report")
-    return embed, view
+    return embed, (view if view.children else None)
+
+
+def _ordinal(n: int) -> str:
+    suffix = "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def _streak_rows(rows: list[dict], key: str, n: int = 5) -> str:
+    """Format a leaderboard as a high-score list: 🥇/🥈/🥉 then numbered."""
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    out = []
+    for i, r in enumerate(rows[:n], start=1):
+        w = r[key]
+        out.append(f"{medals.get(i, f'`{i}.`')}  **{r['name']}** — {w} wk{'s' if w != 1 else ''}")
+    return "\n".join(out) or "—"
+
+
+def build_streak_leaderboard_embed() -> discord.Embed:
+    """The /sheets stats:True screen — arcade high-score board: who's hot right now,
+    plus the all-time records that stand forever."""
+    now = now_club()
+    current = ps.streak_leaderboard(_practice_state, now)
+    all_time = ps.all_time_leaderboard(_practice_state)
+    e = discord.Embed(title=f"🏆  Practice Streak Records — {CLUB_NAME}", color=0xE0632D)
+    if not current and not all_time:
+        e.description = ("No streaks on the board yet — sign up two weeks running (and show up!) "
+                         "to get your name up here. Run **/sheets** to find open ice.")
+        return e
+    e.add_field(name="🔥  Current streaks", value=_streak_rows(current, "streak"), inline=True)
+    e.add_field(name="🏆  All-time records", value=_streak_rows(all_time, "best"), inline=True)
+    e.set_footer(text="Consecutive weeks practiced · current resets if you miss a week · records stand forever")
+    return e
 
 
 def build_practice_board_embed() -> discord.Embed:
@@ -499,118 +584,86 @@ def build_practice_board_embed() -> discord.Embed:
             names = ", ".join(u["name"] for u in s["users"])
             lines.append(f"🧹  **{s.get('label', s['key'])}** · {free}{len(s['users'])} in\n    {names}")
         e.description = "\n\n".join(lines)
-    e.set_footer(text="Use /sheets to join · updates as people sign up")
+    # Current top-5 streaks on the public board (all-time records via /sheets stats:True).
+    lb = ps.streak_leaderboard(_practice_state, now_club())
+    if lb:
+        e.add_field(name="🔥  Current streaks (top 5)", value=_streak_rows(lb, "streak"), inline=False)
+    e.set_footer(text="/sheets to join · /sheets stats:True for all-time records")
     return e
 
 
+async def _post_practice_board(channel):
+    """Post a fresh practice board in `channel`, repoint state at it, and delete the
+    previous board message. Never pinned — visibility comes from being the newest
+    message in the channel (so the bot needs no Manage Messages permission)."""
+    async with _practice_lock:
+        embed = build_practice_board_embed()
+        old = _practice_state.get("board")
+    try:
+        msg = await channel.send(embed=embed)
+    except discord.HTTPException:
+        return
+    async with _practice_lock:
+        _practice_state["board"] = {"channel_id": channel.id, "message_id": msg.id}
+        ps.save(PRACTICE_STORE_PATH, _practice_state)
+    if old:
+        try:
+            ch = bot.get_channel(old["channel_id"]) or await bot.fetch_channel(old["channel_id"])
+            if ch is not None:
+                await ch.get_partial_message(old["message_id"]).delete()
+        except discord.HTTPException:
+            pass
+
+
+async def bump_practice_board(channel):
+    """Publish the updated board by reposting it to the BOTTOM of `channel`, so the
+    change is visible to everyone in the chat flow. Used on every sign-up / cancel."""
+    if channel is None:
+        return
+    async with _practice_lock:
+        ps.expire(_practice_state, now_club())
+        ps.save(PRACTICE_STORE_PATH, _practice_state)
+    await _post_practice_board(channel)
+
+
 async def render_practice_board(target_channel=None):
-    """Edit the pinned practice board (creating/moving it to `target_channel` when
-    given). Safe to call with no target — it just refreshes an existing board."""
+    """Edit the existing board in place (no repost); if it's gone, or none exists and
+    a `target_channel` is given, (re)post one. Used on boot. Sign-ups use
+    bump_practice_board so the update surfaces at the bottom of the channel."""
     async with _practice_lock:
         ps.expire(_practice_state, now_club())
         embed = build_practice_board_embed()
         board = _practice_state.get("board")
         ps.save(PRACTICE_STORE_PATH, _practice_state)
-
-    # If the board exists in a different channel than where the action happened,
-    # move it (people want it where they're using the bot).
-    if board and target_channel is not None and board.get("channel_id") != target_channel.id:
-        try:
-            ch = bot.get_channel(board["channel_id"]) or await bot.fetch_channel(board["channel_id"])
-            await ch.get_partial_message(board["message_id"]).delete()
-        except discord.HTTPException:
-            pass
-        board = None
-
     if board:
         try:
             ch = bot.get_channel(board["channel_id"]) or await bot.fetch_channel(board["channel_id"])
-            # Edit by ID through a partial message rather than fetch_message()+edit.
-            # fetch_message() needs the Read Message History permission and silently
-            # 403s without it — which is what left the board frozen after a sign-up or
-            # cancel. get_partial_message() makes no API call and editing our own
-            # message doesn't need history; NotFound is raised only if it was deleted.
-            partial = ch.get_partial_message(board["message_id"])
-            await partial.edit(embed=embed)
-            # Self-heal pinning: if the board was created while we lacked Manage
-            # Messages, its pin silently failed and "pinned" stays falsy. Retry once
-            # now (no fetch) and remember success so we don't re-pin on every edit.
-            if not board.get("pinned"):
-                try:
-                    await partial.pin()
-                    async with _practice_lock:
-                        if _practice_state.get("board"):
-                            _practice_state["board"]["pinned"] = True
-                        ps.save(PRACTICE_STORE_PATH, _practice_state)
-                except discord.HTTPException as e:
-                    log.warning("Couldn't pin practice board %s: %s", board["message_id"], e)
-                    await _warn_pin_permission(ch)
+            # get_partial_message() makes no API call and editing our own message
+            # doesn't need Read Message History; NotFound only if it was deleted.
+            await ch.get_partial_message(board["message_id"]).edit(embed=embed)
             return
         except discord.NotFound:
-            board = None  # board was deleted — fall through and repost it
+            pass  # deleted while we were down — repost below if we have a target
         except discord.Forbidden as e:
-            # 50005 = board authored by another bot identity (e.g. a dev bot reusing
-            # the prod data dir). Drop the stale pointer and fall through to repost
-            # one we own (when called with a target channel).
-            if e.code == 50005:
-                log.warning("Practice board %s authored by another bot — clearing stale pointer.",
-                            board["message_id"])
+            if e.code == 50005:  # authored by another bot identity — drop stale pointer
                 async with _practice_lock:
                     _practice_state["board"] = None
                     ps.save(PRACTICE_STORE_PATH, _practice_state)
-                board = None
             else:
                 log.warning("Couldn't edit practice board %s: %s", board["message_id"], e)
                 return
         except discord.HTTPException as e:
             log.warning("Couldn't edit practice board %s: %s", board["message_id"], e)
             return
-
     if target_channel is not None:
-        try:
-            msg = await target_channel.send(embed=embed)
-            pinned_ok = True
-            try:
-                await msg.pin()
-            except discord.HTTPException:
-                pinned_ok = False  # no Manage Messages — board still works unpinned
-        except discord.HTTPException:
-            return
-        async with _practice_lock:
-            _practice_state["board"] = {"channel_id": target_channel.id,
-                                        "message_id": msg.id, "pinned": pinned_ok}
-            ps.save(PRACTICE_STORE_PATH, _practice_state)
-        if not pinned_ok:
-            await _warn_pin_permission(target_channel)
-
-
-async def _warn_pin_permission(channel):
-    """Post a one-time, in-channel note when we can't pin the practice board, so an
-    admin can fix the channel permission without anyone reading the logs. Guarded by
-    a `pin_warned` flag on the board state so it never spams (one message per board
-    until it pins or is recreated)."""
-    board = _practice_state.get("board")
-    if board is None or board.get("pin_warned"):
-        return
-    try:
-        await channel.send(
-            "📌  Heads up: I couldn't **pin** the practice sign-up board, so it won't stay at "
-            "the top of this channel. I need the **Manage Messages** permission here — an admin "
-            "can allow it for my role in this channel's permission settings, and I'll pin it "
-            "automatically from then on. (The board still works unpinned in the meantime.)")
-    except discord.HTTPException:
-        return  # can't even post — nothing more to do
-    async with _practice_lock:
-        if _practice_state.get("board"):
-            _practice_state["board"]["pin_warned"] = True
-            ps.save(PRACTICE_STORE_PATH, _practice_state)
+        await _post_practice_board(target_channel)
 
 
 async def restore_practice_board():
     """On (re)boot, re-establish the practice board from its stored pointer: refresh
-    its contents and re-pin it, reposting it in the same channel if the message was
-    deleted while we were down. No-op if no board has been created yet (it'll be
-    created on the first /sheets sign-up). Mirrors the subs cog's startup()."""
+    its contents in place, reposting it in the same channel if the message was
+    deleted while we were down. No-op if no board has been created yet (it's created
+    on the first /sheets sign-up). Mirrors the subs cog's startup()."""
     board = _practice_state.get("board")
     if not board:
         return
@@ -697,16 +750,21 @@ class JoinPracticeButton(discord.ui.DynamicItem[discord.ui.Button],
             log.warning("Couldn't refresh the private /sheets report after a toggle.")
 
         if repeat:
-            return  # nothing changed — don't re-ping the channel or re-notify
+            return  # nothing changed — don't re-publish or re-notify
 
-        # Update the shared, pinned practice board in this channel…
-        await render_practice_board(interaction.channel)
-        # …and ping the channel when someone newly joins, so others can join in.
+        # Publish the updated board (reposted to the bottom of this channel)…
+        await bump_practice_board(interaction.channel)
+        # …and, on a new sign-up, post a one-line note — with their practice streak
+        # and club ranking if it's a real streak (> 1 week).
         if result == "joined" and interaction.channel is not None:
+            note = f"🧹  **{interaction.user.display_name}** is in for **{label}** — {n} signed up."
+            streak = ps.current_streak(_practice_state, interaction.user.id, now_club())
+            if streak > 1:
+                rank, _total, tied = ps.streak_rank(_practice_state, interaction.user.id, now_club())
+                place = f"{'tied for ' if tied else ''}{_ordinal(rank)} longest in the club"
+                note += f" That's a **{streak}-week** practice streak — {place}! 🔥"
             try:
-                await interaction.channel.send(
-                    f"🧹  **{interaction.user.display_name}** is in for **{label}** "
-                    f"— {n} signed up to practice. Come throw some rocks!")
+                await interaction.channel.send(note)
             except discord.HTTPException:
                 pass
 
@@ -716,9 +774,28 @@ class JoinPracticeButton(discord.ui.DynamicItem[discord.ui.Button],
             ephemeral=True)
 
 
-@bot.tree.command(name="sheets", description="Check free sheets and sign up to practice (only you see it)")
-@app_commands.describe(weeks="How many weeks ahead to show (1–4, default 1)")
-async def sheets_cmd(interaction: discord.Interaction, weeks: int = 1):
+# One bare command with optional flags (so bare `/sheets` still works): default is
+# the private free-ice report (`weeks` ahead); `stats:True` posts the streak records
+# to the channel; `show:True` posts the practice sign-up board to the channel.
+@bot.tree.command(name="sheets", description="Free ice + sign-up (private) · stats:True records · show:True post board")
+@app_commands.describe(
+    weeks="How many weeks ahead to show (1–4, default 1)",
+    stats="Post the practice-streak records (current + all-time) to the channel",
+    show="Post the practice sign-up board in this channel for everyone")
+async def sheets_cmd(interaction: discord.Interaction, weeks: int = 1,
+                     stats: bool = False, show: bool = False):
+    if stats:
+        # Public arcade high-score board — visible to the whole channel.
+        await interaction.response.send_message(embed=build_streak_leaderboard_embed())
+        return
+    if show:
+        if interaction.guild_id is None:
+            await interaction.response.send_message("Use `show:True` in a server channel.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        await bump_practice_board(interaction.channel)
+        await interaction.followup.send("🧹  Posted the practice sign-up board here.", ephemeral=True)
+        return
     weeks = max(1, min(weeks, 4))
     await interaction.response.defer(ephemeral=True)
     try:

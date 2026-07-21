@@ -1528,17 +1528,19 @@ class Subs(commands.Cog):
     async def _before_reminder(self):
         await self.bot.wait_until_ready()
 
-    # -- slash commands -----------------------------------------------------
+    # -- slash command ------------------------------------------------------
+    # One bare command with an optional flag: `/subs` shows a private copy; add
+    # `show:True` to instead post this server's shared board in the channel for all.
     @app_commands.command(
         name="subs",
-        description="Show the subs board — private to you, or post it here for everyone with show:True.")
+        description="Show your subs board (private) — or post the shared board with show:True")
     @app_commands.describe(
-        show="Post the board in this channel for everyone (default: private — only you see it).")
+        show="Post this server's shared board here for everyone (default: private, only you)")
     async def subs_cmd(self, interaction: discord.Interaction, show: bool = False):
-        """Default: an ephemeral copy only the caller sees. `show:True`: (re)posts this
-        server's shared board right here, visible to all — this is that server's board
-        from now on, refreshed whenever someone acts here. Data is shared across
-        servers; each server shows its own board."""
+        """Bare `/subs`: a private, ephemeral copy (only the caller sees it). `show:True`:
+        (re)posts this server's shared board in the current channel, visible to all —
+        that becomes the server's board. Data is shared across servers; each shows its
+        own board."""
         if not show:
             await interaction.response.send_message(
                 content="Your subs board (only you can see this):",
@@ -1546,7 +1548,7 @@ class Subs(commands.Cog):
             return
         if interaction.guild_id is None:
             await interaction.response.send_message(
-                "Run `/subs show` in a server channel to post the board.", ephemeral=True)
+                "Use `show:True` in a server channel to post the board.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
         await self._post_board(interaction.channel)

@@ -28,14 +28,20 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
 from typing import Optional
 
 DEFAULT_GRACE_HOURS = 3
 
 
 def empty_state() -> dict:
-    return {"sessions": {}, "board": None}
+    # `attendance` is a PERSISTENT per-user record of the ISO weeks a member's
+    # practice has been CONFIRMED — i.e. a session they were signed up for that has
+    # since passed (weeks are added in expire(), never at sign-up, so future sign-ups
+    # don't count yet): {"<user_id>": {"name": str, "weeks": ["2026-W24", ...]}}. It's
+    # never pruned when a streak breaks — a gap just ends the current streak — so the
+    # full history survives. See current_streak / streak_leaderboard.
+    return {"sessions": {}, "board": None, "attendance": {}}
 
 
 def load(path: str) -> dict:
@@ -48,6 +54,7 @@ def load(path: str) -> dict:
         return empty_state()
     state.setdefault("sessions", {})
     state.setdefault("board", None)
+    state.setdefault("attendance", {})
     for s in state["sessions"].values():
         s.setdefault("users", [])
     return state
@@ -112,7 +119,10 @@ def toggle(
     sheets=None,
     now: Optional[datetime] = None,
 ) -> str:
-    """Join or leave a session's practice pool. Returns "joined" | "left"."""
+    """Join or leave a session's practice pool. Returns "joined" | "left". Streak
+    attendance is NOT touched here — a week is only counted once its session has
+    PASSED (see expire), so a future sign-up doesn't inflate a streak until the
+    practice actually happens (and only if the member hasn't left by then)."""
     s = register_session(state, key, when_ts=when_ts, label=label, sheets=sheets)
     if any(u["user_id"] == user_id for u in s["users"]):
         s["users"] = [u for u in s["users"] if u["user_id"] != user_id]
@@ -121,8 +131,126 @@ def toggle(
     return "joined"
 
 
+# ── Weekly practice streaks ──────────────────────────────────────────────────
+# A "week" is an ISO week string "GGGG-Www". A user's attendance holds only weeks
+# whose practice has already PASSED and that the user was still signed up for (weeks
+# are added in expire(), never at sign-up). A streak is the run of consecutive such
+# weeks ending at their most recent one; it stays "active" until a completed week
+# goes by with no practice (then it's over, but the historical weeks are kept).
+
+def _week_of(ts: str) -> Optional[str]:
+    try:
+        y, w, _ = datetime.fromisoformat(ts).isocalendar()
+    except (ValueError, TypeError):
+        return None
+    return f"{y:04d}-W{w:02d}"
+
+
+def _week_monday(iso_week: str) -> Optional[date]:
+    try:
+        y, w = iso_week.split("-W")
+        return date.fromisocalendar(int(y), int(w), 1)
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _add_week(state: dict, user_id: int, name: str, week: Optional[str]) -> None:
+    if not week:
+        return
+    rec = state.setdefault("attendance", {}).setdefault(str(user_id), {"name": name, "weeks": []})
+    if name:
+        rec["name"] = name
+    if week not in rec["weeks"]:
+        rec["weeks"].append(week)
+        rec["weeks"].sort()
+
+
+def current_streak(state: dict, user_id: int, now: datetime) -> int:
+    """Consecutive PASSED weeks of practice ending at the user's latest one. Returns 0
+    once a completed week has been missed (streak broken). Future sign-ups don't count
+    — attendance only holds weeks whose practice has already happened."""
+    rec = state.get("attendance", {}).get(str(user_id))
+    if not rec or not rec.get("weeks"):
+        return 0
+    mondays = sorted({m for m in (_week_monday(w) for w in rec["weeks"]) if m})
+    if not mondays:
+        return 0
+    this_week = _week_monday(_week_of(now.isoformat()))
+    # Broken if they skipped a whole completed week (latest is >1 week behind now).
+    if this_week is not None and mondays[-1] < this_week - timedelta(days=7):
+        return 0
+    n = 1
+    for i in range(len(mondays) - 1, 0, -1):
+        if (mondays[i] - mondays[i - 1]).days == 7:
+            n += 1
+        else:
+            break
+    return n
+
+
+def streak_leaderboard(state: dict, now: datetime) -> list[dict]:
+    """Members with an active streak, longest first. Each: {user_id, name, streak}."""
+    out = []
+    for uid_str, rec in state.get("attendance", {}).items():
+        try:
+            uid = int(uid_str)
+        except (ValueError, TypeError):
+            continue
+        s = current_streak(state, uid, now)
+        if s >= 1:
+            out.append({"user_id": uid, "name": rec.get("name", ""), "streak": s})
+    out.sort(key=lambda x: (-x["streak"], (x["name"] or "").casefold()))
+    return out
+
+
+def best_streak(state: dict, user_id: int) -> int:
+    """All-time record: the longest run of consecutive practiced weeks anywhere in the
+    user's history (not just the current one). Derived from the kept attendance."""
+    rec = state.get("attendance", {}).get(str(user_id))
+    if not rec or not rec.get("weeks"):
+        return 0
+    mondays = sorted({m for m in (_week_monday(w) for w in rec["weeks"]) if m})
+    if not mondays:
+        return 0
+    best = run = 1
+    for i in range(1, len(mondays)):
+        run = run + 1 if (mondays[i] - mondays[i - 1]).days == 7 else 1
+        best = max(best, run)
+    return best
+
+
+def all_time_leaderboard(state: dict) -> list[dict]:
+    """Every member's best-ever streak, longest first. Each: {user_id, name, best}.
+    Unlike the current leaderboard this includes broken streaks — records stand."""
+    out = []
+    for uid_str, rec in state.get("attendance", {}).items():
+        try:
+            uid = int(uid_str)
+        except (ValueError, TypeError):
+            continue
+        b = best_streak(state, uid)
+        if b >= 1:
+            out.append({"user_id": uid, "name": rec.get("name", ""), "best": b})
+    out.sort(key=lambda x: (-x["best"], (x["name"] or "").casefold()))
+    return out
+
+
+def streak_rank(state: dict, user_id: int, now: datetime) -> tuple[int, int, bool]:
+    """(rank, total_active, tied) for a user among active streaks; rank 1 = longest.
+    Ties share a rank (competition ranking). rank 0 means no active streak."""
+    lb = streak_leaderboard(state, now)
+    me = next((e for e in lb if e["user_id"] == user_id), None)
+    if me is None:
+        return (0, len(lb), False)
+    higher = sum(1 for e in lb if e["streak"] > me["streak"])
+    tied = sum(1 for e in lb if e["streak"] == me["streak"]) > 1
+    return (higher + 1, len(lb), tied)
+
+
 def expire(state: dict, now: datetime, grace_hours: int = DEFAULT_GRACE_HOURS) -> list[str]:
-    """Drop sessions whose start time has passed (+grace). Returns removed keys."""
+    """Drop sessions whose start time has passed (+grace), and — since the practice
+    has now happened — confirm streak attendance for everyone who was still signed up
+    for it (this is the ONLY place a week is added to a streak). Returns removed keys."""
     cutoff = now - timedelta(hours=grace_hours)
     dropped = []
     for key, s in list(state["sessions"].items()):
@@ -131,6 +259,10 @@ def expire(state: dict, now: datetime, grace_hours: int = DEFAULT_GRACE_HOURS) -
         except (ValueError, KeyError, TypeError):
             continue
         if when < cutoff:
+            week = _week_of(s.get("when_ts", ""))
+            if week:
+                for u in s.get("users", []):
+                    _add_week(state, u["user_id"], u.get("name", ""), week)
             dropped.append(key)
             del state["sessions"][key]
     return dropped
