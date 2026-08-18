@@ -8,7 +8,7 @@ columns, a "(if needed)" name, a CPATH row with no attendee count) because every
 parsing bug this thing can have comes from the sheet being hand-maintained. The
 names are invented: this repo is public and the real sheet is full of members.
 """
-from datetime import date
+from datetime import date, timedelta as _TD
 
 import ice
 import instructor_board as board
@@ -115,26 +115,58 @@ check("staff/override reads from the sheet",
 
 
 # ── The rendered board ───────────────────────────────────────────────────────
-# One chronological table, no grouping by how short an event is: Brian asked for
-# date, event, time, and signed-up versus wanted, and nothing else.
-text = board.render(EVENTS)
-block = text.split("```")[1].strip().splitlines()
-# Rows are the table lines; each is followed by its names on an indented line.
-rows = [l for l in block[2:] if not l.startswith(board.NAME_INDENT)]
-names = [l for l in block[2:] if l.startswith(board.NAME_INDENT)]
+# Grouped by URGENCY, not by severity: 8/25 and 8/29 are inside the 14 day
+# window and are the only things anyone should be chased about today; 9/19 and
+# 10/17 are short too, and can wait.
+text = board.render(EVENTS, today=TODAY)
+blocks = [b.strip().splitlines() for b in text.split("```")[1::2]]
+near_block, later_block = blocks
+block = near_block + later_block         # the table lines, both groups
+# Rows are the table lines; each is followed by its names on indented lines.
+rows = [l for b in blocks for l in b[2:] if not l.startswith(board.NAME_INDENT)]
+names = [l for b in blocks for l in b[2:] if l.startswith(board.NAME_INDENT)]
+headings = [l for l in text.splitlines() if l.startswith(("🔴", "🟡", "🟢"))]
 
-check("board/no grouping headings",
-      [l for l in text.splitlines() if l.startswith("**Short-handed")
-       or l.startswith("**Could use more") or l.startswith("**Covered")], [])
-check("board/is a code block so columns line up", text.count("```"), 2)
-check("board/header row", block[0].split(), ["Date", "Event", "Time", "Have/Need"])
-check("board/separator row", set(block[1]) <= {"-", " "}, True)
+check("board/two groups, one table each", text.count("```"), 4)
+check("board/urgent group first",
+      [l.split()[1] for l in near_block[2:] if not l.startswith(board.NAME_INDENT)],
+      ["8/25", "8/29"])
+check("board/later group after it",
+      [l.split()[1] for l in later_block[2:] if not l.startswith(board.NAME_INDENT)],
+      ["9/19", "10/17"])
+check("board/urgent heading is red",
+      headings[0], "🔴  **Needs instructors now (next 14 days)**")
+check("board/later heading is amber", headings[1], "🟡  **Coming up later**")
+check("board/lights stay out of the code block, where they'd break alignment",
+      [l for b in blocks for l in b if any(c in l for c in "🔴🟡🟢")], [])
+check("board/header row", near_block[0].split(), ["Date", "Event", "Time", "Have/Need"])
+check("board/separator row", set(near_block[1]) <= {"-", " "}, True)
 check("board/one row per event", len(rows), len(EVENTS))
-check("board/one name line per event", len(names), len(EVENTS))
-check("board/chronological, as the sheet is sorted",
+check("board/at least one name line per event", len(names) >= len(EVENTS), True)
+check("board/chronological within a group",
       [l.split()[1] for l in rows], ["8/25", "8/29", "9/19", "10/17"])
-check("board/columns align", len({len(l) - len(l.rsplit("  ", 1)[-1]) for l in rows}), 1)
+check("board/columns align", len({len(l) - len(l.rsplit("  ", 1)[-1]) for l in near_block[2:]
+                                 if not l.startswith(board.NAME_INDENT)}), 1)
 check("board/table rows stay narrow", max(len(l) for l in rows) <= 50, True)
+
+# The window itself: 14 days out is still urgent, 15 is not.
+edge = [Event(type="LTC", date=TODAY + _TD(days=n), time="2 - 4 pm", attendees=16)
+        for n in (14, 15)]
+check("board/the boundary day counts as urgent",
+      [board.is_urgent(e, TODAY) for e in edge], [True, False])
+check("board/a past event on the sheet is urgent, not calm",
+      board.is_urgent(Event(type="LTC", date=TODAY - _TD(days=1), time="", attendees=16),
+                      TODAY), True)
+check("board/one group means one table",
+      board.render(edge[:1], today=TODAY).count("```"), 2)
+check("board/a quiet fortnight still says so",
+      board.render([e for e in EVENTS if e.date.month > 8], today=TODAY).splitlines()[0],
+      "**Nothing urgent. 2 later events are still short.**")
+check("board/covered urgent group gets a green heading",
+      board.render([Event(type="LTC", date=TODAY + _TD(days=3), time="2 - 4 pm",
+                          attendees=16, instructors=list("ABCD"))],
+                   today=TODAY).splitlines()[2],
+      "🟢  **Next 14 days, fully staffed**")
 
 # The four things asked for, on one row, then the names beneath it.
 i = next(n for n, l in enumerate(block) if l.startswith("Tue 8/25"))
@@ -143,34 +175,56 @@ check("board/date", row.startswith("Tue 8/25"), True)
 check("board/event name, without the noise word", "Private" in row and "Event" not in row, True)
 check("board/time", "12:30-2:45 pm" in row, True)
 check("board/have vs need", row.split()[-1], "6/8")
-check("board/names under the row", who.strip(),
+# The names sit under their row, wrapped by us at whole names and indented on
+# every line: Discord would otherwise put a wrapped continuation flush left,
+# where it reads as another table row.
+who_lines = []
+for l in block[i + 1:]:
+    if not l.startswith(board.NAME_INDENT):
+        break
+    who_lines.append(l)
+check("board/names under the row", " ".join(l.strip() for l in who_lines),
       "Ann Adams, Bo Brooks, Cara Cole, Dev Diaz, Eve Ellis, Finn Ford")
+check("board/a long name list wraps", len(who_lines) > 1, True)
+check("board/every name line is indented",
+      all(l.startswith(board.NAME_INDENT) for l in names), True)
+check("board/wrapped name lines are no wider than the table",
+      max(len(l) for l in names)
+      <= max([board.NAME_WRAP] + [len(l) for l in block
+                                  if not l.startswith(board.NAME_INDENT)]), True)
+check("board/wrapping never splits a name",
+      [l for l in board.wrap_names("Ann Adams, Bo Brooks, Cara Cole, Dev Diaz, "
+                                   "Eve Ellis, Finn Ford", 44)],
+      ["   Ann Adams, Bo Brooks, Cara Cole,", "   Dev Diaz, Eve Ellis, Finn Ford"])
+check("board/a short list stays on one line",
+      board.wrap_names("Ann Adams", 44), ["   Ann Adams"])
+check("board/commas end the line they belong to",
+      all(not l.strip().startswith(",") for l in names), True)
 check("board/empty roster reads plainly",
       next(l for l in names if "nobody" in l).strip(), "nobody yet")
 
 # No attendee count means no target: show who is in, don't invent a shortfall.
 cpath = [Event(type="CPATH", date=date(2026, 9, 5), time="2 - 4 pm", attendees=None,
                instructors=["A", "B"])]
-cpath_block = board.render(cpath).split("```")[1].strip().splitlines()
+cpath_block = board.render(cpath, today=TODAY).split("```")[1].strip().splitlines()
 check("board/no target shows a bare count", cpath_block[2].split()[-1], "2")
-check("board/no target is explained", "no target" in board.render(cpath), True)
+check("board/no target is explained", "no target" in board.render(cpath, today=TODAY), True)
 
 # A tentative name is listed with its qualifier, and still not counted.
 tent = [Event(type="LTC", date=date(2026, 9, 5), time="2 - 4 pm", attendees=16,
               instructors=["A"], tentative=["B"])]
-tent_block = board.render(tent).split("```")[1].strip().splitlines()
+tent_block = board.render(tent, today=TODAY).split("```")[1].strip().splitlines()
 check("board/tentative not counted", tent_block[2].split()[-1], "1/4")
 check("board/tentative named with its qualifier", tent_block[3].strip(), "A, B (if needed)")
 
 # Discord rejects an over-long description with a 400, which would mean no board
 # at all. A row plus its names runs 120 to 200 characters, so a busy stretch can
 # reach the limit; the far end is dropped until it fits.
-from datetime import timedelta as _td
 # Worst realistic case: every event a full LTC with nine long names on it.
-many = [Event(type="Private Event", date=date(2026, 9, 1) + _td(days=2 * i),
+many = [Event(type="Private Event", date=date(2026, 9, 1) + _TD(days=2 * i),
               time="12:30 - 2:45 pm", attendees=32,
               instructors=[f"Firstname Lastname{n}" for n in range(9)]) for i in range(60)]
-long_text = board.render(many)
+long_text = board.render(many, today=TODAY)
 check("board/fits Discord's limit", len(long_text) <= board.DESCRIPTION_LIMIT, True)
 check("board/trims only as much as it must",
       len(long_text) > board.DESCRIPTION_LIMIT - 300, True)
@@ -182,11 +236,12 @@ check("board/no trim note when it fits",
       any(l.startswith("Showing the next ") for l in text.splitlines()), False)
 
 # Headline counts the asks; footer links the sheet people actually edit.
-check("board/headline counts short events", text.splitlines()[0],
-      "**4 events still need instructors.**")
+check("board/headline counts only the urgent asks", text.splitlines()[0],
+      "**2 events in the next 14 days need instructors.**")
 check("board/headline when all staffed",
       board.render([Event(type="LTC", date=date(2026, 9, 5), time="2 - 4 pm",
-                          attendees=16, instructors=list("ABCD"))]).splitlines()[0],
+                          attendees=16, instructors=list("ABCD"))],
+                   today=TODAY).splitlines()[0],
       "**Every event is fully staffed.**")
 check("board/links the sheet",
       "[instructor sheet](https://docs.google.com/spreadsheets/d/TEST_SHEET_ID/edit)" in text,
@@ -198,26 +253,36 @@ check("board/no en dash", "–" in text, False)
 
 # Determinism is load-bearing: the text IS the state, so anything time varying
 # would make every check look like a change and spam the channel twice a day.
-check("board/deterministic", board.render(parse_events(CSV, today=TODAY)), text)
+check("board/deterministic",
+      board.render(parse_events(CSV, today=TODAY), today=TODAY), text)
 check("board/no clock in the output",
       any(w in text.lower() for w in ("as of", "updated", "generated")), False)
 check("board/title not in the description", board.BOARD_TITLE in text, False)
 
-check("board/empty sheet says so", "No events" in board.render([]), True)
+check("board/empty sheet says so", "No events" in board.render([], today=TODAY), True)
 
 # Embed colour still signals the worst state, which is not grouping: the rows
 # stay in date order either way.
 full = [Event(type="LTC", date=date(2026, 9, 5), time="2 - 4 pm", attendees=16,
               instructors=["A", "B", "C", "D"])]
-check("board/colour red when short-handed", board.color(EVENTS), board.COLOR_SHORT)
-check("board/colour green when covered", board.color(full), board.COLOR_OK)
-check("board/colour amber when merely under target", board.color(
-    [Event(type="LTC", date=date(2026, 9, 5), time="2 - 4 pm", attendees=16,
-           instructors=["A", "B", "C"])]), board.COLOR_UNDER)
+check("board/colour red when something urgent is short",
+      board.color(EVENTS, today=TODAY), board.COLOR_SHORT)
+check("board/colour green when covered", board.color(full, today=TODAY), board.COLOR_OK)
+# The same empty event, near and far: proximity is what makes the bar red, so an
+# October LTC with nobody on it is a yellow board, not an emergency.
+bare_near = [Event(type="LTC", date=TODAY + _TD(days=5), time="2 - 4 pm", attendees=16)]
+bare_far = [Event(type="LTC", date=TODAY + _TD(days=45), time="2 - 4 pm", attendees=16)]
+check("board/colour red for a near gap", board.color(bare_near, today=TODAY),
+      board.COLOR_SHORT)
+check("board/colour amber for the same gap months out",
+      board.color(bare_far, today=TODAY), board.COLOR_UNDER)
 
-check("summary/all staffed", board.summary_line(full), "1 upcoming events, all fully staffed")
-check("summary/counts the gap", board.summary_line(EVENTS),
-      "4 upcoming events, 4 under target (20 instructor slots to fill), 3 short-handed")
+check("summary/all staffed", board.summary_line(full, today=TODAY),
+      "1 upcoming events, all fully staffed")
+check("summary/leads with the urgent count", board.summary_line(EVENTS, today=TODAY),
+      "4 upcoming events, 4 under target (20 instructor slots to fill), 2 inside 14 days")
+check("summary/says when nothing is urgent", board.summary_line(bare_far, today=TODAY),
+      "1 upcoming events, 1 under target (4 instructor slots to fill), none inside 14 days")
 
 
 # ── Fetch guards ─────────────────────────────────────────────────────────────

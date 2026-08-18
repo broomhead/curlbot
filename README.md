@@ -167,6 +167,7 @@ All configuration is via environment variables (see `.env.example`):
 | `INSTRUCTOR_CHANNEL_ID` | Channel the instructor board posts to. Unset = feature off |
 | `SHEET_ID` | Google Sheet id for the instructor sheet |
 | `CHECK_TIMES` | Club-local instructor-board checks (default `09:00,16:00`) |
+| `URGENT_DAYS` | How close an event has to be to count as urgent (default `14`) |
 | `INSTRUCTORS_PER_SHEET` / `MIN_INSTRUCTORS_PER_SHEET` | Staffing target and floor (2 / 1) |
 
 Sheet count is set via `NUM_SHEETS`. A few other site-specific constants live at
@@ -242,30 +243,49 @@ short. This posts the same ask into a Discord channel instead.
 
 ### What it posts
 
-One table in date order, in a code block so the columns line up (Discord has no
-markdown tables):
+Two groups, split by how close the event is, each a table in date order inside a
+code block so the columns line up (Discord has no markdown tables):
 
+**2 events in the next 14 days need instructors.**
+
+🔴  **Needs instructors now (next 14 days)**
 ```
-Date       Event    Time           Have/Need
----------  -------  -------------  ---------
-Tue 8/25   Private  12:30-2:45 pm  6/8
-   Ann Adams, Bo Brooks, Cara Cole, Dev Diaz, Eve Ellis, Finn Ford
-Sat 8/29   Private  1:30-3:45 pm   1/6
+Date      Event    Time           Have/Need
+--------  -------  -------------  ---------
+Tue 8/25  Private  12:30-2:45 pm  6/8
+   Ann Adams, Bo Brooks, Cara Cole,
+   Dev Diaz, Eve Ellis, Finn Ford
+Sat 8/29  Private  1:30-3:45 pm   1/6
    Ann Adams
-Sat 9/19   LTC      2-4:15 pm      1/8
-   Bo Brooks
 ```
 
-No grouping and no sections: date, event, time, signed up against wanted, and
-who is in. The embed's colour is the at-a-glance signal instead (red if any
-event is below the floor, amber if any is under target, green when all are
-covered), and a headline counts the asks.
+🟡  **Coming up later**
+```
+Date       Event  Time       Have/Need
+---------  -----  ---------  ---------
+Sat 9/19   LTC    2-4:15 pm  1/8
+   Bo Brooks
+Sat 10/17  LTC    2-4:15 pm  0/6
+   nobody yet
+```
 
-A long name list wraps within its own line, so the rows below it stay aligned.
-A row plus its names runs 120 to 200 characters depending on how full the roster
-is, so a busy stretch can reach Discord's 4096 character description limit;
-events are dropped off the far end until it fits, with a note saying how many.
-The near events are the ones anyone can still act on.
+**Urgency is proximity, not severity.** An LTC eleven days out with half its
+instructors is this week's problem; the same gap in October is not, and a board
+that shouts about both teaches people to ignore it. The line is `URGENT_DAYS`
+(default 14). The traffic lights are the same red/amber/green the subs and
+practice boards use, and they sit on the headings rather than inside the code
+block, where an emoji is not one monospace cell wide and would shove that row's
+columns out of line. The embed's bar follows the same rule: red only when
+something inside the window is short, amber when the only gaps are further out,
+green when everything is covered. The headline counts the urgent asks only, so a
+quiet fortnight reads as "Nothing urgent" even with October wide open.
+
+A long name list is wrapped by the bot at whole names, every line indented, since
+Discord would otherwise put the continuation flush left where it reads as
+another row. A row plus its names runs 120 to 200 characters depending on how
+full the roster is, so a busy stretch can reach Discord's 4096 character
+description limit; events are dropped off the far end until it fits, with a note
+saying how many. The near events are the ones anyone can still act on.
 
 ### How many instructors an event needs
 
@@ -283,7 +303,7 @@ three across three), which is why there's a floor as well as a target.
 
 An event with no attendee count gets no target at all: its row shows just how
 many are signed up, rather than a shortfall invented from nothing. A name
-written as `Jane Doe (if needed)` is tentative, flagged with `*` and not counted
+written as `Jane Doe (if needed)` is tentative, listed with that qualifier and not counted
 in the total, since counting a maybe would hide a real gap. Adding an
 **`Instructors Needed`** column to the sheet overrides the computed target per
 row; without one, everything works as-is.

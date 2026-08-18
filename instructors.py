@@ -71,10 +71,16 @@ def parse_times(spec: str) -> list[tuple[int, int]]:
 
 
 async def render() -> tuple[str, str, int]:
-    """(board text, one-line summary, embed colour), straight from the sheet."""
-    events = instructor_sheet.parse_events(
-        await instructor_sheet.fetch_csv(), today=club_now().date())
-    return board.render(events), board.summary_line(events), board.color(events)
+    """(board text, one-line summary, embed colour), straight from the sheet.
+
+    The club's date, not UTC's and not the box's: the board groups events by how
+    close they are, so which side of midnight we think it is decides what counts
+    as urgent."""
+    today = club_now().date()
+    events = instructor_sheet.parse_events(await instructor_sheet.fetch_csv(), today=today)
+    return (board.render(events, today=today),
+            board.summary_line(events, today=today),
+            board.color(events, today=today))
 
 
 def build_embed(text: str, colour: int) -> discord.Embed:
