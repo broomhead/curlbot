@@ -31,7 +31,9 @@ from discord import app_commands
 from discord.ext import commands
 
 from gf_client import GFClient
+from ice import PEOPLE_PER_SHEET, TOTAL_SHEETS, sheets_for_people
 from league_client import get_cached_leagues, draw_to_datetime
+import instructors
 import practice_ice as pi
 import practice_store as ps
 import pond_ice
@@ -49,8 +51,9 @@ DEV_GUILD_ID  = int(os.environ["DEV_GUILD_ID"]) if os.environ.get("DEV_GUILD_ID"
 SITE_BASE_URL = os.environ.get("SITE_BASE_URL", "https://example.com")
 CLUB_NAME     = os.environ.get("CLUB_NAME", "Curling Club")
 WP_API        = f"{SITE_BASE_URL}/wp-json/tribe/events/v1"
-# Sheet count varies by facility — configure via NUM_SHEETS (default 4).
-TOTAL_SHEETS  = int(os.environ.get("NUM_SHEETS", "4"))
+# NUM_SHEETS / PEOPLE_PER_SHEET and sheets_for_people() come from ice.py (imported
+# above) so the /sheets report and the instructor board can never disagree about
+# how much ice a headcount needs.
 # How long a session keeps showing in /sheets after it ends, so latecomers still
 # see a just-finished slot. Past this grace it drops off (set 0 for a hard cutoff
 # at end time). Applies to every source (practice/LTC/league/reserved ice).
@@ -100,7 +103,6 @@ PRIVATE_EVENT_FORM_ID = 116   # "Private Event Registration"
 LTC_FORM_ID           = 110   # "Learn to Curl Registration"
 
 PRICE_PER_PERSON = 55   # private event rate per person
-PEOPLE_PER_SHEET = 8    # max people per sheet
 
 # League draws expose a start time but no end; assume a standard draw length
 # (typical evening leagues run ~2h15m) for overlap math.
@@ -246,7 +248,9 @@ async def sheets_for_event(event: dict, gf: GFClient) -> int | None:
         raw = entries[0].get("14.2", "0")
         price = float(str(raw).replace("$", "").replace(",", "").strip() or "0")
         people = price / PRICE_PER_PERSON
-        return max(1, math.ceil(people / PEOPLE_PER_SHEET))
+        # Uncapped: a big enough booking can imply more ice than the club has,
+        # and the caller wants to see that rather than a silent clamp.
+        return sheets_for_people(people, cap=False)
 
     # ── Learn to Curls ────────────────────────────────────────────────────
     if "learn-to-curls" in slugs or "ltc-instructional-leagues" in slugs:
@@ -262,7 +266,7 @@ async def sheets_for_event(event: dict, gf: GFClient) -> int | None:
         total_people = sum(_people(e.get("2")) for e in entries)
         if total_people == 0:
             return None
-        return max(1, min(TOTAL_SHEETS, math.ceil(total_people / PEOPLE_PER_SHEET)))
+        return sheets_for_people(total_people)
 
     # ── Other categories (leagues, bonspiels, etc.): no reliable data ─────
     # Leagues: team vs individual registration mix makes counting unreliable.
@@ -393,6 +397,15 @@ async def setup_hook():
         JoinPracticeButton,
     )
     await bot.add_cog(subs.Subs(bot))
+
+    # Instructor board (adds /instructors + the scheduled channel post). Entirely
+    # optional: with no channel or sheet id configured the cog never loads and
+    # nothing else changes.
+    if instructors.configured():
+        await bot.add_cog(instructors.Instructors(bot))
+    else:
+        log.info("Instructor board not configured (INSTRUCTOR_CHANNEL_ID / SHEET_ID); "
+                 "skipping that cog")
 
     # Sync slash commands once, here (on_ready can fire repeatedly on reconnect).
     if DEV_GUILD_ID:

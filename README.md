@@ -1,6 +1,6 @@
 # Curling Club Discord Bot
 
-A Discord bot that helps a curling club coordinate ice time. It has three
+A Discord bot that helps a curling club coordinate ice time. It has four
 features:
 
 - **Practice ice (`/sheets`)** — reports how many sheets are free during upcoming
@@ -11,6 +11,9 @@ features:
 - **Subs board (`/subs`)** — "I need a sub" / "I can sub" coordination tied to real
   league teams and game dates (the team is optional — you can post before teams
   are set), with spot-filling, DM confirmations, and notifications.
+- **Instructor board (`/instructors`)** — posts which upcoming Learn-to-Curls and
+  events are short of instructors, read from a Google Sheet. Optional:
+  unconfigured, it never loads and nothing else changes.
 
 Everything is configured for a single site via environment variables — the
 target domain, club name, and sheet count are not hardcoded. The number of sheets
@@ -160,6 +163,11 @@ All configuration is via environment variables (see `.env.example`):
 | `SUBS_STORE_PATH` | Subs board state file (default `subs_store.json`) |
 | `SUBS_GRACE_HOURS` | Hours after game start before a request expires (default 3) |
 | `SUBS_UNDATED_DAYS` | Days a legacy request with no game date lasts before ageing out (default 14) |
+| `PEOPLE_PER_SHEET` | Max people on one sheet of ice (default 8) |
+| `INSTRUCTOR_CHANNEL_ID` | Channel the instructor board posts to. Unset = feature off |
+| `SHEET_ID` | Google Sheet id for the instructor sheet |
+| `CHECK_TIMES` | Club-local instructor-board checks (default `09:00,16:00`) |
+| `INSTRUCTORS_PER_SHEET` / `MIN_INSTRUCTORS_PER_SHEET` | Staffing target and floor (2 / 1) |
 
 Sheet count is set via `NUM_SHEETS`. A few other site-specific constants live at
 the top of `bot.py` — `PEOPLE_PER_SHEET`, `PRICE_PER_PERSON`, `TIMEZONE_OFFSET`,
@@ -214,3 +222,96 @@ One-off exploration/diagnostic scripts (run via
 
 Any always-on machine works — a small VPS, a Raspberry Pi, or a free-tier cloud
 service. Set the environment variables and run the bot.
+
+## Instructor board
+
+Optional. A coordinator keeps a Google Sheet of upcoming LTCs, private events and CPATH events with the
+instructors signed up for each, then chases people by email when an event is
+short. This posts the same ask into a Discord channel instead.
+
+- **The sheet is the only source of truth.** No database, no state file, nothing
+  to back up. Every check re-reads it.
+- **The board in the channel is the state.** Each check renders the board and
+  compares it against the last one the bot posted. Identical means nothing
+  changed, so it stays quiet. Different means the sheet moved, so the old board
+  is deleted and a fresh one posted at the bottom where people will see it.
+- **No Google credentials.** The sheet is shared for link access, so the CSV
+  export endpoint works unauthenticated. If sharing is ever revoked, Google
+  returns a sign-in page with HTTP 200; the bot says so rather than parsing HTML
+  as data.
+
+### What it posts
+
+One table in date order, in a code block so the columns line up (Discord has no
+markdown tables):
+
+```
+Date       Event    Time           Have/Need
+---------  -------  -------------  ---------
+Tue 8/25   Private  12:30-2:45 pm  6/8
+   Ann Adams, Bo Brooks, Cara Cole, Dev Diaz, Eve Ellis, Finn Ford
+Sat 8/29   Private  1:30-3:45 pm   1/6
+   Ann Adams
+Sat 9/19   LTC      2-4:15 pm      1/8
+   Bo Brooks
+```
+
+No grouping and no sections: date, event, time, signed up against wanted, and
+who is in. The embed's colour is the at-a-glance signal instead (red if any
+event is below the floor, amber if any is under target, green when all are
+covered), and a headline counts the asks.
+
+A long name list wraps within its own line, so the rows below it stay aligned.
+A row plus its names runs 120 to 200 characters depending on how full the roster
+is, so a busy stretch can reach Discord's 4096 character description limit;
+events are dropped off the far end until it fits, with a note saying how many.
+The near events are the ones anyone can still act on.
+
+### How many instructors an event needs
+
+From **sheets of ice**, using the same `ice.sheets_for_people()` that `/sheets`
+uses, so the two can never disagree:
+
+```
+sheets = ceil(attendees / PEOPLE_PER_SHEET), capped at NUM_SHEETS
+target = INSTRUCTORS_PER_SHEET per sheet      (default 2)
+floor  = MIN_INSTRUCTORS_PER_SHEET per sheet  (default 1)
+```
+
+Two per sheet is the goal; a club can stretch below it (three across two sheets,
+three across three), which is why there's a floor as well as a target.
+
+An event with no attendee count gets no target at all: its row shows just how
+many are signed up, rather than a shortfall invented from nothing. A name
+written as `Jane Doe (if needed)` is tentative, flagged with `*` and not counted
+in the total, since counting a maybe would hide a real gap. Adding an
+**`Instructors Needed`** column to the sheet overrides the computed target per
+row; without one, everything works as-is.
+
+### Setting it up
+
+1. Turn on Developer Mode in Discord (Settings, Advanced), right click the
+   channel you want the board in, Copy Channel ID, and put it in
+   `INSTRUCTOR_CHANNEL_ID`.
+2. Put the sheet's id in `SHEET_ID` and make sure the sheet is shared as
+   "anyone with the link can view".
+
+That's it. No extra tokens and no extra permissions: the bot posts and deletes
+its own messages, which needs nothing beyond what it already has.
+
+### Running it
+
+Checks happen inside the bot process at `CHECK_TIMES` (default 09:00 and 16:00
+club local). `/instructors` posts a fresh board immediately, replying privately
+with what it did.
+
+To see the board without touching Discord at all (handy while developing, and
+it needs only `SHEET_ID`):
+
+```bash
+python refresh_instructors.py
+```
+
+> The board's text must stay a pure function of the sheet. A timestamp in it
+> would make every check look like a change and post to the channel twice a day
+> forever. There's a test for that, and for the no-em-dash house style.

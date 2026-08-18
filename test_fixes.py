@@ -337,7 +337,7 @@ check("ou/weekday from the title alone",
 
 
 # ── 2c. Surviving a site that injects junk into its own API ──────────────────
-# 2026-08-16: lonestarcurling.com began serving SEO-spam anchor tags ahead of
+# 2026-08-16: the club's WordPress began serving SEO-spam anchor tags ahead of
 # EVERY response, REST API included, so json.loads died at char 0 with
 # "Expecting value: line 1 column 1" and the bot fell back to a stale cache.
 SPAM = ('<a style="display:none;" href="https://live-drawhk.vip/">live draw hk</a>\n'

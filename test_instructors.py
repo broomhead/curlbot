@@ -1,0 +1,246 @@
+"""
+Tests for the instructor board. No network, no Google, no Discord gateway.
+
+Run:  python3 test_instructors.py
+
+The fixture mirrors the real sheet's SHAPE exactly (blank spacer rows, ragged
+columns, a "(if needed)" name, a CPATH row with no attendee count) because every
+parsing bug this thing can have comes from the sheet being hand-maintained. The
+names are invented: this repo is public and the real sheet is full of members.
+"""
+from datetime import date
+
+import ice
+import instructor_board as board
+import instructor_sheet
+from instructor_sheet import Event, parse_events
+
+FAILS = []
+
+
+def check(name, got, want):
+    if got != want:
+        FAILS.append(f"{name}\n   got:  {got!r}\n   want: {want!r}")
+
+
+# Pin the sheet id rather than inheriting whatever is in the developer's .env,
+# so the footer link and the "no id" guard behave the same for everyone.
+instructor_sheet.SHEET_ID = "TEST_SHEET_ID"
+
+CSV = open("fixture_instructor_sheet.csv").read()
+TODAY = date(2026, 8, 18)
+EVENTS = parse_events(CSV, today=TODAY)
+
+
+def by_date(d):
+    return next(e for e in EVENTS if e.date == date.fromisoformat(d))
+
+
+# ── Parsing a hand-maintained sheet ──────────────────────────────────────────
+check("parse/only upcoming", [e.date.isoformat() for e in EVENTS],
+      ["2026-08-25", "2026-08-29", "2026-09-19", "2026-10-17"])
+check("parse/blank spacer rows don't end the data",
+      by_date("2026-08-25").type, "Private Event")     # sits below two blank rows
+check("parse/attendees", by_date("2026-08-25").attendees, 30)
+check("parse/time verbatim", by_date("2026-08-25").time, "12:30 - 2:45 pm")
+check("parse/instructors", by_date("2026-08-29").instructors, ["Ann Adams"])
+check("parse/empty instructor row", by_date("2026-10-17").instructors, [])
+check("parse/horizon excludes 11/14", [e for e in EVENTS if e.date.month == 11], [])
+
+# Past events are gone, including one on today's date boundary.
+check("parse/today is still upcoming",
+      [e.date for e in parse_events(CSV, today=date(2026, 8, 25))][0], date(2026, 8, 25))
+check("parse/yesterday is dropped",
+      date(2026, 8, 25) in [e.date for e in parse_events(CSV, today=date(2026, 8, 26))], False)
+
+# "Lisa Calder (if needed)" is a maybe. Counting it as filled would hide a real
+# shortfall, so it's listed separately and doesn't fill a slot.
+tent = parse_events(CSV, today=date(2026, 7, 1))
+jul18 = next(e for e in tent if e.date == date(2026, 7, 18))
+check("parse/tentative not counted", jul18.filled, 8)
+check("parse/tentative listed", jul18.tentative, ["Jo James"])
+
+# Sheets are reordered and renamed by hand; don't be brittle about it.
+reordered = "Date,Time,Type of Event,# of Attendees,Instructor1,Instructor2\n" \
+            "9/5/26,2 - 4 pm,LTC,16,Ann,Bob\n"
+ev = parse_events(reordered, today=TODAY)[0]
+check("parse/column order irrelevant", (ev.type, ev.attendees, ev.instructors),
+      ("LTC", 16, ["Ann", "Bob"]))
+try:
+    parse_events("Nope,Nothing\n1,2\n", today=TODAY)
+    check("parse/no date column raises", "no error", "RuntimeError")
+except RuntimeError as e:
+    check("parse/no date column raises", "Date column" in str(e), True)
+
+
+# ── Staffing: sheets of ice, not a headcount ratio ───────────────────────────
+# The sheet count comes from ice.sheets_for_people, the SAME call /sheets uses
+# for an LTC, so the report and the board can never disagree about how much ice
+# a headcount needs. Two instructors per sheet is the target, one per sheet is
+# the floor we can stretch to.
+check("staff/uses the shared ice math",
+      [ice.sheets_for_people(n) for n in (8, 9, 20, 32, 400)], [1, 2, 3, 4, 4])
+def staffing(attendees, filled=0):
+    e = Event(type="LTC", date=TODAY, time="", attendees=attendees,
+              instructors=[f"P{i}" for i in range(filled)])
+    return (e.sheets, e.needed, e.minimum, e.short_by, e.critical)
+
+check("staff/8 attendees is one sheet", staffing(8), (1, 2, 1, 2, True))
+check("staff/9 attendees is two sheets", staffing(9), (2, 4, 2, 4, True))
+check("staff/20 attendees is three sheets", staffing(20), (3, 6, 3, 6, True))
+check("staff/32 attendees is four sheets", staffing(32), (4, 8, 4, 8, True))
+check("staff/capped at the facility's sheets", staffing(400)[0], 4)
+# Brian's stretch cases: workable but under target, NOT short-handed.
+check("staff/3 instructors across 2 sheets", staffing(16, 3), (2, 4, 2, 1, False))
+check("staff/3 instructors across 3 sheets", staffing(24, 3), (3, 6, 3, 3, False))
+# One under the floor is short-handed.
+check("staff/2 across 3 sheets is short-handed", staffing(24, 2)[4], True)
+check("staff/at target is covered", staffing(24, 6), (3, 6, 3, 0, False))
+check("staff/over target stays covered", staffing(24, 9)[3], 0)
+
+# CPATH events carry no attendee count, so we can't claim a shortfall at all.
+cpath = Event(type="CPATH", date=TODAY, time="", attendees=None, instructors=["A"])
+check("staff/no attendees means no target", (cpath.sheets, cpath.needed, cpath.minimum),
+      (None, None, None))
+check("staff/no attendees is never short", (cpath.short_by, cpath.critical), (0, False))
+check("staff/cpath note", cpath.note, "no club credit for this one")
+
+# A sheet column, if one is ever added, overrides the computed target.
+override = Event(type="LTC", date=TODAY, time="", attendees=32,
+                 instructors=["A"], needed_override=3)
+check("staff/column overrides the ratio", (override.needed, override.short_by), (3, 2))
+check("staff/override reads from the sheet",
+      parse_events("Date,# of Attendees,Instructors Needed,Instructor1\n"
+                   "9/5/26,32,3,Ann\n", today=TODAY)[0].needed, 3)
+
+
+# ── The rendered board ───────────────────────────────────────────────────────
+# One chronological table, no grouping by how short an event is: Brian asked for
+# date, event, time, and signed-up versus wanted, and nothing else.
+text = board.render(EVENTS)
+block = text.split("```")[1].strip().splitlines()
+# Rows are the table lines; each is followed by its names on an indented line.
+rows = [l for l in block[2:] if not l.startswith(board.NAME_INDENT)]
+names = [l for l in block[2:] if l.startswith(board.NAME_INDENT)]
+
+check("board/no grouping headings",
+      [l for l in text.splitlines() if l.startswith("**Short-handed")
+       or l.startswith("**Could use more") or l.startswith("**Covered")], [])
+check("board/is a code block so columns line up", text.count("```"), 2)
+check("board/header row", block[0].split(), ["Date", "Event", "Time", "Have/Need"])
+check("board/separator row", set(block[1]) <= {"-", " "}, True)
+check("board/one row per event", len(rows), len(EVENTS))
+check("board/one name line per event", len(names), len(EVENTS))
+check("board/chronological, as the sheet is sorted",
+      [l.split()[1] for l in rows], ["8/25", "8/29", "9/19", "10/17"])
+check("board/columns align", len({len(l) - len(l.rsplit("  ", 1)[-1]) for l in rows}), 1)
+check("board/table rows stay narrow", max(len(l) for l in rows) <= 50, True)
+
+# The four things asked for, on one row, then the names beneath it.
+i = next(n for n, l in enumerate(block) if l.startswith("Tue 8/25"))
+row, who = block[i], block[i + 1]
+check("board/date", row.startswith("Tue 8/25"), True)
+check("board/event name, without the noise word", "Private" in row and "Event" not in row, True)
+check("board/time", "12:30-2:45 pm" in row, True)
+check("board/have vs need", row.split()[-1], "6/8")
+check("board/names under the row", who.strip(),
+      "Ann Adams, Bo Brooks, Cara Cole, Dev Diaz, Eve Ellis, Finn Ford")
+check("board/empty roster reads plainly",
+      next(l for l in names if "nobody" in l).strip(), "nobody yet")
+
+# No attendee count means no target: show who is in, don't invent a shortfall.
+cpath = [Event(type="CPATH", date=date(2026, 9, 5), time="2 - 4 pm", attendees=None,
+               instructors=["A", "B"])]
+cpath_block = board.render(cpath).split("```")[1].strip().splitlines()
+check("board/no target shows a bare count", cpath_block[2].split()[-1], "2")
+check("board/no target is explained", "no target" in board.render(cpath), True)
+
+# A tentative name is listed with its qualifier, and still not counted.
+tent = [Event(type="LTC", date=date(2026, 9, 5), time="2 - 4 pm", attendees=16,
+              instructors=["A"], tentative=["B"])]
+tent_block = board.render(tent).split("```")[1].strip().splitlines()
+check("board/tentative not counted", tent_block[2].split()[-1], "1/4")
+check("board/tentative named with its qualifier", tent_block[3].strip(), "A, B (if needed)")
+
+# Discord rejects an over-long description with a 400, which would mean no board
+# at all. A row plus its names runs 120 to 200 characters, so a busy stretch can
+# reach the limit; the far end is dropped until it fits.
+from datetime import timedelta as _td
+# Worst realistic case: every event a full LTC with nine long names on it.
+many = [Event(type="Private Event", date=date(2026, 9, 1) + _td(days=2 * i),
+              time="12:30 - 2:45 pm", attendees=32,
+              instructors=[f"Firstname Lastname{n}" for n in range(9)]) for i in range(60)]
+long_text = board.render(many)
+check("board/fits Discord's limit", len(long_text) <= board.DESCRIPTION_LIMIT, True)
+check("board/trims only as much as it must",
+      len(long_text) > board.DESCRIPTION_LIMIT - 300, True)
+check("board/says what it trimmed",
+      any(l.startswith("Showing the next ") and "further events are on the sheet." in l
+          for l in long_text.splitlines()), True)
+check("board/keeps the near events", "Tue 9/1" in long_text, True)
+check("board/no trim note when it fits",
+      any(l.startswith("Showing the next ") for l in text.splitlines()), False)
+
+# Headline counts the asks; footer links the sheet people actually edit.
+check("board/headline counts short events", text.splitlines()[0],
+      "**4 events still need instructors.**")
+check("board/headline when all staffed",
+      board.render([Event(type="LTC", date=date(2026, 9, 5), time="2 - 4 pm",
+                          attendees=16, instructors=list("ABCD"))]).splitlines()[0],
+      "**Every event is fully staffed.**")
+check("board/links the sheet",
+      "[instructor sheet](https://docs.google.com/spreadsheets/d/TEST_SHEET_ID/edit)" in text,
+      True)
+
+# House style: no em dashes or en dashes anywhere in member facing copy.
+check("board/no em dash", "—" in text, False)
+check("board/no en dash", "–" in text, False)
+
+# Determinism is load-bearing: the text IS the state, so anything time varying
+# would make every check look like a change and spam the channel twice a day.
+check("board/deterministic", board.render(parse_events(CSV, today=TODAY)), text)
+check("board/no clock in the output",
+      any(w in text.lower() for w in ("as of", "updated", "generated")), False)
+check("board/title not in the description", board.BOARD_TITLE in text, False)
+
+check("board/empty sheet says so", "No events" in board.render([]), True)
+
+# Embed colour still signals the worst state, which is not grouping: the rows
+# stay in date order either way.
+full = [Event(type="LTC", date=date(2026, 9, 5), time="2 - 4 pm", attendees=16,
+              instructors=["A", "B", "C", "D"])]
+check("board/colour red when short-handed", board.color(EVENTS), board.COLOR_SHORT)
+check("board/colour green when covered", board.color(full), board.COLOR_OK)
+check("board/colour amber when merely under target", board.color(
+    [Event(type="LTC", date=date(2026, 9, 5), time="2 - 4 pm", attendees=16,
+           instructors=["A", "B", "C"])]), board.COLOR_UNDER)
+
+check("summary/all staffed", board.summary_line(full), "1 upcoming events, all fully staffed")
+check("summary/counts the gap", board.summary_line(EVENTS),
+      "4 upcoming events, 4 under target (20 instructor slots to fill), 3 short-handed")
+
+
+# ── Fetch guards ─────────────────────────────────────────────────────────────
+check("url/basic", instructor_sheet.csv_url("ABC"),
+      "https://docs.google.com/spreadsheets/d/ABC/export?format=csv")
+check("url/with tab", instructor_sheet.csv_url("ABC", "12345"),
+      "https://docs.google.com/spreadsheets/d/ABC/export?format=csv&gid=12345")
+_saved, instructor_sheet.SHEET_ID = instructor_sheet.SHEET_ID, ""
+try:
+    instructor_sheet.csv_url()
+    check("url/no id raises", "no error", "RuntimeError")
+except RuntimeError:
+    check("url/no id raises", True, True)
+check("url/no id means no footer link", instructor_sheet.edit_url(), "")
+instructor_sheet.SHEET_ID = _saved
+check("url/edit link", instructor_sheet.edit_url(),
+      "https://docs.google.com/spreadsheets/d/TEST_SHEET_ID/edit")
+
+# The fixture must not carry real member names: this repo is public.
+_REAL = ("landon", "larry", "shravik", "darin", "alyssa", "roetheli", "feldman",
+         "russell", "broek", "guydosh", "poklitar", "cavallario", "slager")
+check("fixture/no real names in a public repo",
+      [w for w in _REAL if w in CSV.casefold()], [])
+
+print("\n".join("FAIL: " + f for f in FAILS) or f"All checks passed.")
+raise SystemExit(1 if FAILS else 0)
