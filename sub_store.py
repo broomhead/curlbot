@@ -4,9 +4,12 @@ unit-testable (mirrors practice_ice.py).
 
 Two small lists, persisted to one JSON file:
 
-  requests      — "I need a sub" posts. Each has a game date/time, how many
-                  spots are needed, and who has filled them. A request auto-
-                  expires once its game time has passed (plus a grace window).
+  requests      — "I need a sub" posts: a game date/time, how many spots are
+                  needed, and who has filled them. A request auto-expires once
+                  its game time has passed (plus a grace window).
+                  `game_ts` may be "" on records created while the UI briefly
+                  allowed dateless requests; those are still rendered and age out
+                  `undated_days` after posting. Nothing creates them any more.
   availability  — "I can sub" sign-ups: members offering to fill in. These age
                   out after a fixed number of days.
 
@@ -23,7 +26,7 @@ State shape:
         "kind": "sub",
         "requester_id": int,
         "requester_name": str,
-        "game_ts": "2026-06-20T19:30:00",   # ISO, club-local naive
+        "game_ts": "2026-06-20T19:30:00",   # ISO, club-local naive; "" = date TBD
         "position": str,                       # e.g. "Lead", "Vice" (optional)
         "notes": str,                          # free text (optional)
         "spots_needed": int,
@@ -50,6 +53,10 @@ from typing import Any, Optional
 DEFAULT_GRACE_HOURS = 3
 # How long an "I can sub" sign-up stays on the board before aging out.
 DEFAULT_AVAIL_DAYS = 14
+# How long a legacy request with NO game date lingers. A dated request expires off
+# the back of its game; an undated one has nothing to expire against, so it would
+# sit on the board forever without this. (The UI no longer creates these.)
+DEFAULT_UNDATED_DAYS = 14
 
 
 # ── Persistence ─────────────────────────────────────────────────────────────
@@ -130,8 +137,8 @@ def new_request(
     *,
     requester_id: int,
     requester_name: str,
-    game_ts: str,
     spots_needed: int,
+    game_ts: str = "",
     league_id="",
     league: str = "",
     team: str = "",
@@ -155,7 +162,7 @@ def new_request(
         "league_id": str(league_id) if league_id not in (None, "") else "",
         "league": league.strip(),
         "team": team.strip(),
-        "game_ts": game_ts,
+        "game_ts": (game_ts or "").strip(),
         "position": position.strip(),
         "notes": notes.strip(),
         "spots_needed": max(1, int(spots_needed)),
@@ -215,7 +222,7 @@ def close_request(state: dict, rid: str) -> bool:
 
 
 def requests_sorted(state: dict) -> list[dict]:
-    """Open requests, soonest game first; unparseable game_ts sinks to the end."""
+    """Open requests, soonest game first; undated (and unparseable) sink to the end."""
     def key(r):
         try:
             return (0, datetime.fromisoformat(r["game_ts"]))
@@ -317,15 +324,28 @@ def expire(
     now: datetime,
     grace_hours: int = DEFAULT_GRACE_HOURS,
     avail_days: int = DEFAULT_AVAIL_DAYS,
+    undated_days: int = DEFAULT_UNDATED_DAYS,
 ) -> dict:
     """
     Drop played-out requests and stale availability sign-ups. Mutates `state`
     and returns the removed items: {"requests": [...], "availability": [...]}.
-    A request whose game_ts can't be parsed is kept (never silently lost).
+    A request with no game date ages out `undated_days` after it was posted; one
+    whose timestamps can't be parsed at all is kept (never silently lost).
     """
     cutoff = now - timedelta(hours=grace_hours)
+    undated_cutoff = now - timedelta(days=undated_days)
     kept_reqs, dropped_reqs = [], []
     for r in state["requests"]:
+        if not (r.get("game_ts") or "").strip():
+            # "Someone needs a sub, date TBD" — no game to expire against, so age
+            # it out from when it was posted or it sits on the board forever.
+            try:
+                created = datetime.fromisoformat(r["created_ts"])
+            except (ValueError, KeyError, TypeError):
+                kept_reqs.append(r)
+                continue
+            (dropped_reqs if created < undated_cutoff else kept_reqs).append(r)
+            continue
         try:
             game = datetime.fromisoformat(r["game_ts"])
         except (ValueError, KeyError):

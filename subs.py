@@ -12,7 +12,12 @@ reposts fresh at the bottom on each change. It groups open games by date with a
 🔴/🟡/🟢 status per spot and lists who's available for each. Interaction is on the
 board:
 
-  ➕ Need a sub      — league → team → game → spots (all picked from the system).
+  ➕ Need a sub      — league → team → game → spots (picked from the system). The
+                       TEAM is optional — chairs often don't set teams until a day
+                       or two before the first draw. The GAME never is: when you
+                       need a sub is the point. A league with no schedule posted
+                       still offers real dates, projected weekly from its title's
+                       start date onto its own night.
   🙋 I'm free        — list your availability so you get tagged for matching games.
   ➕ Fill for someone — mark another member into an open spot (offline sync).
   ➖ Remove          — cancel a sub (click a name → confirm), cancel a request you
@@ -25,7 +30,9 @@ public alert that @-mentions the members available for that game, each carrying 
 them know their game just gained or lost a sub; everything else is in the channel.
 
 Sub rosters freeze LOCK_MINUTES before game time. Requests auto-expire a few hours
-after their game. State lives in a small JSON file (see sub_store).
+after their game. (Requests can no longer be posted without a date, but ones made
+while that was allowed still render and age out after SUBS_UNDATED_DAYS.)
+State lives in a small JSON file (see sub_store).
 
 discord.py >= 2.4 is required for DynamicItem (persistent buttons that survive a
 bot restart without re-registering each message).
@@ -38,7 +45,12 @@ import re
 import html
 import time
 import logging
+# NB: `time` (the stdlib module, imported above) is used for monotonic clocks in
+# the click debounce. Import datetime's time CLASS under another name — plain
+# `from datetime import time` shadows the module and turns time.monotonic() into
+# an AttributeError at the first button click.
 from datetime import datetime, date, timedelta, timezone
+from datetime import time as clock_time
 
 import discord
 from discord import app_commands
@@ -53,6 +65,9 @@ STORE_PATH      = os.environ.get("SUBS_STORE_PATH", "subs_store.json")
 CLUB_NAME       = os.environ.get("CLUB_NAME", "Curling Club")
 TIMEZONE_OFFSET = int(os.environ.get("TIMEZONE_OFFSET", "-5"))  # America/Chicago default
 GRACE_HOURS     = int(os.environ.get("SUBS_GRACE_HOURS", str(store.DEFAULT_GRACE_HOURS)))
+# A request with no game date has nothing to expire against — it ages out this
+# many days after it was posted instead.
+UNDATED_DAYS    = int(os.environ.get("SUBS_UNDATED_DAYS", str(store.DEFAULT_UNDATED_DAYS)))
 # How close to game time an unfilled request gets an automatic re-alert (once).
 REMINDER_HOURS  = int(os.environ.get("SUBS_REMINDER_HOURS", "24"))
 # Sub rosters freeze this many minutes before tip-off — no more adds/removes/claims.
@@ -90,11 +105,24 @@ def is_locked(req: dict, *, now: datetime | None = None) -> bool:
 # ── Date/time formatting ────────────────────────────────────────────────────
 
 
+# A league night whose start time the club hasn't settled yet. Expiry, locking
+# and sorting all key off a real timestamp, so we park these at the very end of
+# their day: the request then lives through the whole draw day instead of dying
+# at midnight, and never locks early. No draw starts at 23:59, so the value
+# doubles as the marker that the time is still to be confirmed.
+TIME_TBC = clock_time(23, 59)
+
+
 def fmt_when(game_ts: str) -> str:
+    """A game's date/time for display. Two non-obvious cases are normal, not
+    errors: an empty timestamp (a legacy request posted with no date at all) and
+    TIME_TBC (date known, start time not announced yet)."""
     try:
         dt = datetime.fromisoformat(game_ts)
     except (ValueError, TypeError):
-        return game_ts or "TBD"
+        return game_ts or "date TBD"
+    if dt.time() == TIME_TBC:
+        return f"{dt.strftime('%a %b %-d')} · time TBC"
     return f"{dt.strftime('%a %b %-d')} · {dt.strftime('%-I:%M %p')}"
 
 
@@ -103,6 +131,8 @@ def fmt_when_short(game_ts: str) -> str:
         dt = datetime.fromisoformat(game_ts)
     except (ValueError, TypeError):
         return "TBD"
+    if dt.time() == TIME_TBC:
+        return f"{dt.strftime('%a %-m/%-d')} TBC"
     h = dt.strftime('%-I:%M%p').lower().replace(":00", "")
     return f"{dt.strftime('%a %-m/%-d')} {h}"
 
@@ -144,9 +174,177 @@ def clean_title(title: str) -> str:
     return t.strip(" –—-·,")
 
 
+# "Summer 2026 League 2" tells a sub nothing — after clean_title strips the season
+# and year, the bare sequence number ("League 2", "League #3") is pure noise too.
+_LEAGUE_SEQ = re.compile(r"[\s–—\-·,]*\bLeagues?\s*#?\s*\d+\s*$", re.I)
+
+
+def league_name(title: str) -> str:
+    """Human league name: clean_title minus a trailing sequence number
+    ("Thursday League – Summer 2026 League 3 – Begins August 6" → "Thursday League").
+    Never returns empty — falls back to the cleaned title if stripping ate it all."""
+    base = clean_title(title)
+    stripped = _LEAGUE_SEQ.sub("", base).strip(" –—-·,")
+    return stripped or base
+
+
+def _draw_dates(league: dict) -> list[date]:
+    out = []
+    for d in league.get("draws", []) or []:
+        try:
+            out.append(date.fromisoformat(d["date"]))
+        except (ValueError, KeyError, TypeError):
+            continue
+    return sorted(set(out))
+
+
+# Every league title at this club ends "– Begins September 6" / "– Begins Sept 4".
+# clean_title() strips that as noise for DISPLAY, but it's the only machine-readable
+# start date a league has before its schedule is posted — which is exactly when we
+# need one. Parsed off the RAW title, before clean_title eats it.
+_BEGINS_RE = re.compile(rf"\bBegins\b\s*:?\s*({_MONTHS})\.?\s+(\d{{1,2}})", re.I)
+_TITLE_YEAR_RE = re.compile(r"\b(20\d{2})\b")
+_MONTH_NUM = {m: i for i, m in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun",
+     "jul", "aug", "sep", "oct", "nov", "dec"), start=1)}
+
+
+def title_start_date(title: str, *, today: date | None = None) -> date | None:
+    """The date in a league title's "Begins …" tail, or None.
+
+    The year comes from the season in the same title ("Fall 2026") when it's
+    there; otherwise we take whichever year puts the date nearest to now, so a
+    January league read in December lands next year rather than eleven months
+    ago."""
+    raw = html.unescape(title or "")
+    m = _BEGINS_RE.search(raw)
+    if not m:
+        return None
+    month = _MONTH_NUM.get(m.group(1)[:3].casefold())
+    if not month:
+        return None
+    day = int(m.group(2))
+    ym = _TITLE_YEAR_RE.search(raw)
+    today = today or date.today()
+    years = [int(ym.group(1))] if ym else [today.year - 1, today.year, today.year + 1]
+    best = None
+    for y in years:
+        try:
+            cand = date(y, month, day)
+        except ValueError:
+            continue                    # e.g. "Begins February 30"
+        if best is None or abs((cand - today).days) < abs((best - today).days):
+            best = cand
+    return best
+
+
+def league_start_date(league: dict, *, today: date | None = None) -> date | None:
+    """When this league starts: its first scheduled draw, else the date in its
+    title. The title is all we have for a league whose schedule isn't posted."""
+    dates = _draw_dates(league)
+    if dates:
+        return dates[0]
+    return title_start_date(league.get("title", ""), today=today)
+
+
+def league_date_range(league: dict) -> str:
+    """"8/2 – 8/30" across a league's scheduled draws. With no schedule posted,
+    falls back to "from 9/6" off the title, so a Fall league is still identifiable
+    in a picker that lists several leagues on the same night."""
+    dates = _draw_dates(league)
+    if not dates:
+        start = league_start_date(league)
+        return f"from {start.month}/{start.day}" if start else ""
+    first, last = dates[0], dates[-1]
+    a = f"{first.month}/{first.day}"
+    if first == last:
+        return a
+    return f"{a} – {last.month}/{last.day}"
+
+
+def league_label(league: dict) -> str:
+    """What a league is called everywhere a human reads it: name + run dates, e.g.
+    "Sunday Rise & Shine League 8/2 – 8/30". The dates are what tell someone on the
+    sub board WHICH Sunday league this is; the admin's "League 2" never did."""
+    name = league_name(league.get("title", ""))
+    rng = league_date_range(league)
+    return f"{name} {rng}".strip() if rng else name
+
+
+_WEEKDAY_ORDER = {d: i for i, d in enumerate(
+    ("sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"))}
+
+
+def league_weekday_index(league: dict) -> int:
+    """0 = Sunday … 6 = Saturday; 7 when the day can't be determined (sorts last).
+    Prefers the league's own `day`, then a draw's parsed weekday, then the first
+    draw's date."""
+    d = (league.get("day") or "").strip().casefold()
+    if d in _WEEKDAY_ORDER:
+        return _WEEKDAY_ORDER[d]
+    for dr in league.get("draws", []) or []:
+        wd = (dr.get("weekday") or "").strip().casefold()
+        if wd in _WEEKDAY_ORDER:
+            return _WEEKDAY_ORDER[wd]
+    start = league_start_date(league)
+    if start:
+        return (start.weekday() + 1) % 7      # date.weekday() is Mon=0; we want Sun=0
+    return 7
+
+
+def league_sort_key(league: dict):
+    """Sort order for every league list a member sees: day of week Sun→Sat, then
+    start date within that day, then name. Leagues on the same night land together,
+    earliest-starting first — so "which Sunday league is this?" is answered by
+    position as well as by the label."""
+    start = league_start_date(league)
+    return (league_weekday_index(league),
+            start or date.max,
+            league_name(league.get("title", "")).casefold())
+
+
+def league_sub_label(league: dict) -> str:
+    """Secondary line for a league picker: when it's played."""
+    bits = [x for x in ((league.get("day") or ""), (league.get("time") or "")) if x]
+    return " · ".join(bits)
+
+
+def stored_league(text: str) -> str:
+    """Display a league name that was already labelled when it was stored. Do NOT
+    run clean_title over these — it would strip the very dates league_label added."""
+    return html.unescape(text or "").strip()
+
+
 def _truncate(s: str, n: int) -> str:
     s = s or ""
     return s if len(s) <= n else s[: n - 1] + "…"
+
+
+_CLOCK_RE = re.compile(r"^\s*(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m\.?\s*$", re.I)
+
+
+def _parse_clock(text: str) -> clock_time | None:
+    """'7:45 pm' / '9am' / '9:00 a.m.' -> time. None if it isn't a clock time."""
+    m = _CLOCK_RE.match(text or "")
+    if not m:
+        return None
+    hour = int(m.group(1)) % 12
+    if m.group(3).lower() == "p":
+        hour += 12
+    return clock_time(hour, int(m.group(2) or 0))
+
+
+def _league_time(league: dict) -> clock_time | None:
+    """The league's start time, from its `time` field or, failing that, whatever
+    time its known draws are at. None if we can't tell."""
+    t = _parse_clock(league.get("time") or "")
+    if t is not None:
+        return t
+    for d in league.get("draws", []) or []:
+        t = _parse_clock(d.get("time") or "")
+        if t is not None:
+            return t
+    return None
 
 
 def league_games(league: dict, now: datetime) -> list[dict]:
@@ -163,7 +361,13 @@ def league_games(league: dict, now: datetime) -> list[dict]:
             continue
         if dd < today:
             continue
-        dt = draw_to_datetime(d) or datetime.combine(dd, datetime.min.time())
+        dt = draw_to_datetime(d)
+        if dt is None or (dt.hour == 0 and dt.minute == 0):
+            # draw_to_datetime falls back to midnight when a row's time is
+            # missing or unparseable. No club draws at midnight, so read that as
+            # "time unknown" and use the league's start time instead — otherwise
+            # the picker offers "12:00 AM" and the request expires a day early.
+            dt = datetime.combine(dd, _league_time(league) or time(0, 0))
         dt = dt.replace(second=0, microsecond=0)
         out.append({"iso": dt.isoformat(), "label": fmt_when(dt.isoformat()), "dt": dt})
     out.sort(key=lambda g: g["dt"])
@@ -172,8 +376,76 @@ def league_games(league: dict, now: datetime) -> list[dict]:
         if g["iso"] in seen:
             continue
         seen.add(g["iso"])
+        g["projected"] = False
         uniq.append(g)
     return uniq
+
+
+# How many nights to offer when a league's schedule isn't published yet. Discord
+# caps a select at 25 options; 8 weeks is a season and leaves room to spare.
+PROJECTED_NIGHTS = 8
+
+def projected_games(league: dict, now: datetime, *, start: date | None = None,
+                    count: int = PROJECTED_NIGHTS) -> list[dict]:
+    """Upcoming *league nights* worked out from the league's day and start date,
+    for the stretch before the chair posts a schedule. When you need a sub is the
+    whole point of a request, so an unscheduled league still has to offer real
+    dates: weekly on its own night, starting from the league's own start date, so
+    a date that isn't a league night can't be picked.
+
+    The START TIME may legitimately be unknown — the club itself sometimes hasn't
+    settled it ("either 6pm or 7pm", per the Fall over/under league page). We
+    don't guess it (a neighbouring league's time would be flat wrong: Sunday
+    morning is 9am, Sunday night is not) and we don't let it block the date,
+    which is the part people actually need. Those entries carry TIME_TBC."""
+    idx = league_weekday_index(league)
+    if idx > 6:
+        return []                      # no idea what night this league plays
+    t = _league_time(league)
+    time_known = t is not None
+    target = (idx - 1) % 7             # our Sun=0…Sat=6 → date.weekday()'s Mon=0…Sun=6
+    begins = start if start is not None else league_start_date(league, today=now.date())
+    d = max(begins or now.date(), now.date())
+    d += timedelta(days=(target - d.weekday()) % 7)
+    out: list[dict] = []
+    while len(out) < count:
+        dt = datetime.combine(d, t or TIME_TBC)
+        d += timedelta(days=7)
+        if dt <= now:
+            continue                   # tonight's draw already started
+        out.append({"iso": dt.isoformat(), "label": fmt_when(dt.isoformat()),
+                    "dt": dt, "projected": True, "time_known": time_known})
+    return out
+
+
+def league_is_over(league: dict, now: datetime) -> bool:
+    """True when every draw this league has is in the past. Finished seasons sit
+    in the cache for weeks without an `ended` flag; they're dead ends in a picker
+    (nothing left to sub for), so we hide them. A league with NO draws is not
+    over — that's a season whose schedule simply hasn't been posted."""
+    dates = _draw_dates(league)
+    return bool(dates) and dates[-1] < now.date()
+
+
+def game_options(league: dict, now: datetime, *, cap: int = 25) -> list[dict]:
+    """What the game picker offers.
+
+    A posted schedule always wins — we never invent dates that contradict one,
+    even to extend past its last draw. Projected nights are strictly the
+    no-schedule-yet case, which is the one that used to leave the picker empty
+    and the request unpostable. A league whose draws have ALL been played is a
+    finished season, not an unscheduled one: it gets nothing, so old leagues
+    lingering in the cache without an `ended` flag can't be picked."""
+    real = league_games(league, now)
+    if real:
+        return real[:cap]
+    if _draw_dates(league) or league.get("fetch_failed"):
+        # Either the schedule exists and it's all in the past, or we couldn't read
+        # the league's page at all. "No draws" only means "not scheduled yet" when
+        # we actually managed to look — otherwise a site outage would have us
+        # inventing league nights out of nothing.
+        return []
+    return projected_games(league, now)[:cap]
 
 
 # ── Board rendering ─────────────────────────────────────────────────────────
@@ -215,14 +487,22 @@ def _embed_color(reqs: list[dict]) -> int:
 INDENT = "\u00a0\u00a0\u00a0"  # non-breaking spaces: Discord keeps these, so lines indent under the date
 
 
+def _req_for(req: dict) -> str:
+    """Who the spot is for: the team when one is named, otherwise the person who
+    asked (teams often aren't set until a day or two before the first draw)."""
+    if req.get("team"):
+        return f"Team {req['team']}"
+    who = first_name(req.get("requester_name", ""))
+    return f"{who}'s spot" if who else "Sub"
+
+
 def _req_status_line(req: dict) -> str:
     needed = int(req["spots_needed"])
     covered = needed - store.open_spots(req)
     names = [f["name"] for f in req.get("filled", [])]
     names += [f"{p['name']} (pending)" for p in req.get("pending", [])]
-    team = f"Team {req['team']}" if req.get("team") else "Sub"
     who = ", ".join(names) if names else "nobody yet"
-    return f"{INDENT}{_req_icon(req)} {team} — {covered}/{needed} · {who}"
+    return f"{INDENT}{_req_icon(req)} {_req_for(req)} — {covered}/{needed} · {who}"
 
 
 def _available_for_group(state: dict, grp: dict, key: str) -> list[str]:
@@ -271,24 +551,34 @@ def build_embed(state: dict) -> discord.Embed:
     # with willing subs shows up even before anyone opens a request for it.
     groups: dict[str, dict] = {}
     for r in reqs:
-        k = _game_key(r.get("game_ts", ""))
-        groups.setdefault(k, {"iso": r.get("game_ts", ""), "reqs": []})["reqs"].append(r)
+        ts = r.get("game_ts", "")
+        if ts:
+            k = _game_key(ts)
+            groups.setdefault(k, {"iso": ts, "label": fmt_when(ts), "reqs": []})["reqs"].append(r)
+        else:
+            # Undated requests group per league rather than into one anonymous
+            # "date TBD" pile — the league is the only context they carry, and
+            # it's what tells a would-be sub whether it's their night.
+            k = f"tbd:{r.get('league_id') or ''}"
+            lg = stored_league(r.get("league", ""))
+            groups.setdefault(k, {"iso": "", "reqs": [],
+                                  "label": "Date TBD" + (f" · {lg}" if lg else "")})["reqs"].append(r)
     for a in state.get("availability", []):
         for iso in (a.get("games") or []):
-            groups.setdefault(_game_key(iso), {"iso": iso, "reqs": []})
+            groups.setdefault(_game_key(iso), {"iso": iso, "label": fmt_when(iso), "reqs": []})
 
     def _sort_key(k: str):
         try:
-            return (0, datetime.fromisoformat(groups[k]["iso"]))
+            return (0, datetime.fromisoformat(groups[k]["iso"]), "")
         except (ValueError, TypeError):
-            return (1, datetime.max)
+            return (1, datetime.max, k)   # undated sinks below every real date
 
     order = sorted(groups, key=_sort_key)
 
     blocks = []
     for k in order[:MAX_BUTTON_REQUESTS]:
         grp = groups[k]
-        lines = [f"**{fmt_when(grp['iso'])}**"]
+        lines = [f"**{grp['label']}**"]
         for r in grp["reqs"]:
             lines.append(_req_status_line(r))
         free = _available_for_group(state, grp, k)
@@ -313,7 +603,7 @@ def build_embed(state: dict) -> discord.Embed:
             continue  # game-specific availability shows on the "available:" lines above
         lkey = str(a.get("league_id") or "")
         if lkey not in anytime:
-            anytime[lkey] = {"title": clean_title(a.get("league", "")) or "Any league", "names": []}
+            anytime[lkey] = {"title": stored_league(a.get("league", "")) or "Any league", "names": []}
             aorder.append(lkey)
         anytime[lkey]["names"].append(a["name"])
     if aorder:
@@ -337,8 +627,9 @@ def build_view(state: dict) -> discord.ui.View:
     open_reqs = [r for r in store.requests_sorted(state)
                  if store.open_spots(r) > 0 and not is_locked(r)]
     for i, r in enumerate(open_reqs[:20]):   # rows 1–4, 5 buttons each
-        label = _truncate(f"{fmt_when_short(r['game_ts'])}"
-                          + (f" {r['team']}" if r.get("team") else ""), 80)
+        who = r["team"] if r.get("team") else first_name(r.get("requester_name", ""))
+        when = fmt_when_short(r["game_ts"]) if r.get("game_ts") else "TBD"
+        label = _truncate(f"{when} {who}", 80)
         view.add_item(PageClaimButton(r["id"], label=label,
                                       style=discord.ButtonStyle.success, row=1 + i // 5))
     return view
@@ -448,8 +739,7 @@ class FillForPick(discord.ui.Select):
     def __init__(self, reqs: list[dict], selected, row: int = 0):
         opts = _unique_options([
             discord.SelectOption(
-                label=_truncate(f"{fmt_when_short(r['game_ts'])}"
-                                + (f" · Team {r['team']}" if r.get("team") else ""), 100),
+                label=_truncate(f"{fmt_when_short(r['game_ts'])} · {_req_for(r)}", 100),
                 value=r["id"],
                 description=_truncate(f"{store.open_spots(r)} open", 100),
                 default=(r["id"] == selected),
@@ -552,8 +842,7 @@ class RemoveSubSelect(discord.ui.Select):
             discord.SelectOption(
                 label=_truncate(m["name"], 100),
                 value=f"{rid}:{m['user_id']}",
-                description=_truncate(f"{fmt_when_short(r['game_ts'])}"
-                                     + (f" · Team {r['team']}" if r.get("team") else ""), 100),
+                description=_truncate(f"{fmt_when_short(r['game_ts'])} · {_req_for(r)}", 100),
             )
             for (rid, r, m) in sorted(subs, key=lambda t: (t[2]["name"] or "").casefold())[:25]
         ])
@@ -609,8 +898,7 @@ class CancelRequestSelect(discord.ui.Select):
     def __init__(self, reqs: list[dict], row: int = 1):
         opts = _unique_options([
             discord.SelectOption(
-                label=_truncate(f"{fmt_when_short(r['game_ts'])}"
-                                + (f" · Team {r['team']}" if r.get("team") else ""), 100),
+                label=_truncate(f"{fmt_when_short(r['game_ts'])} · {_req_for(r)}", 100),
                 value=r["id"],
                 description=_truncate(f"{store.open_spots(r)} open · cancel this request", 100),
             )
@@ -670,12 +958,12 @@ def _unique_options(opts: list[discord.SelectOption]) -> list[discord.SelectOpti
 
 class LeagueSelect(discord.ui.Select):
     def __init__(self, leagues: list[dict], selected, row: int = 0):
-        ordered = sorted(leagues, key=lambda l: clean_title(l.get("title", "")).casefold())
+        ordered = sorted(leagues, key=league_sort_key)
         opts = [
             discord.SelectOption(
-                label=_truncate(clean_title(l.get("title", "")), 100),
+                label=_truncate(league_label(l), 100),
                 value=str(l["id"]),
-                description=(l.get("day") or None),
+                description=(league_sub_label(l) or None),
                 default=(str(l["id"]) == str(selected)),
             )
             for l in ordered[:25]
@@ -692,37 +980,58 @@ class LeagueSelect(discord.ui.Select):
         await self.view.refresh(interaction)
 
 
+NO_TEAM = "__noteam__"
+
+
 class TeamSelect(discord.ui.Select):
+    """Team is OPTIONAL. Chairs often don't lock in teams until a day or two before
+    the first draw, but people need to line up subs before that — so a request can
+    always be posted as "this person needs a sub" with no team attached."""
+
     def __init__(self, names: list[str], selected, row: int = 1):
         # Only teams the system knows about — no free-typing. Alphabetized.
         opts = _unique_options([
             discord.SelectOption(label=_truncate(n, 100), value=_truncate(n, 100), default=(n == selected))
-            for n in sorted(names, key=str.casefold)[:25]
+            for n in sorted(names, key=str.casefold)[:24]
         ])
-        disabled = not opts
-        if disabled:
-            opts = [discord.SelectOption(label="No teams listed for this league", value="__none__")]
-        super().__init__(placeholder=("No teams listed" if disabled else "Your team…"),
-                         min_values=1, max_values=1, options=opts, disabled=disabled, row=row)
+        no_teams_yet = not opts
+        opts.append(discord.SelectOption(
+            label=("Teams aren't set yet — post without one" if no_teams_yet else "No team / not sure"),
+            value=NO_TEAM,
+            description="Posts as “needs a sub”, no team named",
+            default=(selected == ""),
+        ))
+        super().__init__(
+            placeholder=("Teams aren't set yet — optional" if no_teams_yet else "Your team… (optional)"),
+            min_values=1, max_values=1, options=opts, row=row)
 
     async def callback(self, interaction: discord.Interaction):
-        if self.values[0] == "__none__":
-            await interaction.response.defer()
-            return
-        self.view.team = self.values[0]
+        self.view.team = "" if self.values[0] == NO_TEAM else self.values[0]
         await self.view.refresh(interaction)
 
 
 class GameSelect(discord.ui.Select):
     def __init__(self, games: list[dict], selected_isos, *, multi: bool, row: int = 2):
         self.multi = multi
-        # Only real, scheduled draws — no manual date entry. Kept in date order.
+        # Real draws, plus the league's own upcoming nights where the schedule
+        # doesn't reach yet (flagged in the description so nobody mistakes a
+        # projected night for a posted one). Still a pick-list, never free text:
+        # every option is a real league night at the league's start time.
         opts = _unique_options([
-            discord.SelectOption(label=_truncate(g["label"], 100), value=g["iso"], default=(g["iso"] in (selected_isos or [])))
+            discord.SelectOption(
+                label=_truncate(g["label"], 100),
+                value=g["iso"],
+                description=("not on the schedule yet" if g.get("projected") else None),
+                default=(g["iso"] in (selected_isos or [])),
+            )
             for g in games[:25]
         ])
         if not opts:
-            opts = [discord.SelectOption(label="No scheduled games in the next 2 weeks", value="__none__")]
+            # Only reachable for a league with no schedule, no start date in its
+            # title AND no known night — nothing to build a date from.
+            opts = [discord.SelectOption(
+                label="No dates available for this league", value="__none__",
+                description="No schedule and no start date posted yet")]
         super().__init__(
             placeholder=("Games you can cover…" if multi else "Which game…"),
             min_values=1, max_values=(len(opts) if multi else 1), options=opts, row=row,
@@ -783,7 +1092,7 @@ class NeedSubFlowView(discord.ui.View):
             # Team is picked from the league's roster only (no free-typing).
             self.add_item(TeamSelect(names, self.team, row=1))
             self.add_item(GameSelect(
-                league_games(lg, club_now()),
+                game_options(lg, club_now()),
                 [self.game_iso] if self.game_iso else [],
                 multi=False, row=2,
             ))
@@ -792,22 +1101,24 @@ class NeedSubFlowView(discord.ui.View):
         return self
 
     def ready(self) -> bool:
-        lg = self.league()
-        if not lg:
-            return False
-        return bool(self.team) and bool(self.game_iso)
+        # League + game. WHEN you need a sub is the point of the request, so a
+        # date is never optional — for an unscheduled league the picker projects
+        # real league nights off the title's start date rather than letting the
+        # request go out dateless (see projected_games). Only the TEAM is
+        # optional, since chairs set teams late.
+        return self.league() is not None and bool(self.game_iso)
 
     def prompt(self) -> str:
         lg = self.league()
         if not lg:
             return "**Need a sub** — pick the league:"
-        parts = [f"League: **{clean_title(lg.get('title', ''))}**"]
-        if self.team:
-            parts.append(f"Team: **{self.team}**")
-        if self.game_iso:
-            parts.append(f"Game: **{fmt_when(self.game_iso)}**")
+        parts = [f"League: **{league_label(lg)}**"]
+        parts.append(f"Team: **{self.team}**" if self.team else "Team: **not set**")
+        parts.append(f"Game: **{fmt_when(self.game_iso)}**" if self.game_iso
+                     else "Game: **not set**")
         parts.append(f"Spots: **{self.spots}**")
-        tail = "Press **Post request**." if self.ready() else "Pick team, game, and spots."
+        tail = ("Press **Post request**." if self.ready()
+                else "Pick which game — the team is optional if it isn't set yet.")
         return "**Need a sub** — " + " · ".join(parts) + f"\n{tail}"
 
     async def refresh(self, interaction: discord.Interaction):
@@ -839,7 +1150,7 @@ class PostNeedButton(discord.ui.Button):
             pass
 
         lg = f.league()
-        title = clean_title(lg.get("title", "")) if lg else ""
+        title = league_label(lg) if lg else ""
         cog: "Subs" = interaction.client.get_cog("Subs")
         status, req = await cog.add_request(
             requester=interaction.user,
@@ -854,9 +1165,10 @@ class PostNeedButton(discord.ui.Button):
             # Don't stack an identical request on the board. Keep the flow open so
             # they can tweak the team/game and re-post if it really is different.
             f.posted = False
+            who = f"**{f.team}**" if f.team else "**you**"
             await interaction.edit_original_response(
-                content=(f"⚠️  There's already an open request for **{f.team}** · "
-                         f"{fmt_when(f.game_iso)}. Claim or **Manage** that one instead — "
+                content=(f"⚠️  There's already an open request for {who} · "
+                         f"{fmt_when(f.game_iso)}. Claim or **Remove** that one instead — "
                          "or change the team/game below and re-post.\n\n" + f.prompt()),
                 view=f.build(),
             )
@@ -864,7 +1176,8 @@ class PostNeedButton(discord.ui.Button):
         # No invites/DMs — anyone available is tagged on the board's alert and can
         # just hit "I'll take it".
         await interaction.edit_original_response(
-            content=(f"✅  Posted: **{title}** · {f.team or '—'} · {fmt_when(f.game_iso)} · needs {f.spots}.\n"
+            content=(f"✅  Posted: **{title}** · {f.team or 'no team named'} · "
+                     f"{fmt_when(f.game_iso)} · needs {f.spots}.\n"
                      "It's on the board — anyone available has been tagged and can hit **I'll take it**."),
             view=None)
 
@@ -898,7 +1211,7 @@ class AvailFlowView(discord.ui.View):
         row += 1
         lg = self.league()
         if lg:
-            games = league_games(lg, club_now())
+            games = game_options(lg, club_now())
             if games:
                 self.add_item(GameSelect(games, self.game_isos, multi=True, row=row))
                 row += 1
@@ -910,7 +1223,7 @@ class AvailFlowView(discord.ui.View):
                  "matching game needs someone."]
         lg = self.league()
         if lg:
-            s = f"League: **{clean_title(lg.get('title', ''))}**"
+            s = f"League: **{league_label(lg)}**"
             if self.game_isos:
                 s += " · " + ", ".join(fmt_when(g) for g in self.game_isos)
             lines.append(f"{s} — choose games (or none for any), then **Post availability**.")
@@ -933,7 +1246,7 @@ class PostAvailButton(discord.ui.Button):
         lg = view.league()
         if not lg:
             return  # leave the flow open so they can pick a league
-        title = clean_title(lg.get("title", ""))
+        title = league_label(lg)
         cog: "Subs" = interaction.client.get_cog("Subs")
         await cog.add_availability(user=interaction.user, league_id=view.league_id, league=title,
                                    games=view.game_isos, channel=interaction.channel)
@@ -956,15 +1269,22 @@ def _same_game(a_iso: str, b_iso: str) -> bool:
         return False
 
 
-def _find_open_duplicate(state: dict, league_id, game_ts: str, team: str) -> dict | None:
+def _find_open_duplicate(state: dict, league_id, game_ts: str, team: str,
+                         requester_id=None) -> dict | None:
     """An existing open request for the same league + game + team (case/space
-    tolerant), or None. All requests on the board are open, so a match is a dup."""
+    tolerant), or None. All requests on the board are open, so a match is a dup.
+
+    With NO team named, "same team" can't be the test — two different members can
+    each legitimately need a sub for the same draw. So a team-less request is only
+    a duplicate of another team-less request BY THE SAME PERSON (a double-tap)."""
     lid = str(league_id or "")
     team_norm = (team or "").strip().casefold()
     for r in state.get("requests", []):
         if str(r.get("league_id") or "") != lid:
             continue
         if (r.get("team") or "").strip().casefold() != team_norm:
+            continue
+        if not team_norm and r.get("requester_id") != requester_id:
             continue
         if _same_game(r.get("game_ts", ""), game_ts or ""):
             return r
@@ -1006,7 +1326,7 @@ class RemoveAvailSelect(discord.ui.Select):
     def __init__(self, entries: list[dict], row: int | None = None):
         opts = _unique_options([
             discord.SelectOption(
-                label=_truncate(clean_title(a.get("league", "")) or "League", 100),
+                label=_truncate(stored_league(a.get("league", "")) or "League", 100),
                 value=(str(a.get("league_id")) if a.get("league_id") else "__nolg__"),
                 description=_truncate(
                     ", ".join(fmt_when_short(g) for g in (a.get("games") or [])) or "any game", 100),
@@ -1091,7 +1411,7 @@ class Subs(commands.Cog):
     async def startup(self):
         """Prune expired requests and re-render every server's board after a (re)connect."""
         async with self._lock:
-            store.expire(self.state, club_now(), GRACE_HOURS)
+            store.expire(self.state, club_now(), GRACE_HOURS, undated_days=UNDATED_DAYS)
             store.save(STORE_PATH, self.state)
         await self.render_all_boards()
 
@@ -1203,12 +1523,11 @@ class Subs(commands.Cog):
             "bump":     "🔔 **Still need a sub**",
             "reminder": "⏰ **Game soon — still need a sub**",
         }
-        league = clean_title(req.get("league", ""))
-        team = req.get("team", "")
+        league = stored_league(req.get("league", ""))
         when = fmt_when(req["game_ts"])
         opn = store.open_spots(req)
         detail = " · ".join(x for x in [
-            league or None, (f"Team {team}" if team else None), when,
+            league or None, _req_for(req), when,
             f"{opn} spot{'s' if opn != 1 else ''} open",
         ] if x)
         subs = _availability_for_request(self.state, req)
@@ -1324,21 +1643,28 @@ class Subs(commands.Cog):
 
     # -- league data --------------------------------------------------------
     async def get_leagues(self) -> list[dict]:
-        """Active (non-ended) leagues from the shared league cache."""
+        """Leagues you could still need a sub for: not flagged ended, and not a
+        finished season sitting in the cache unflagged (see league_is_over)."""
         try:
             leagues = await get_cached_leagues()
         except Exception as e:  # noqa: BLE001 — network/cache failure shouldn't crash the button
             log.warning("League fetch failed: %s", e)
             return []
-        return [lg for lg in leagues if not lg.get("ended")]
+        now = club_now()
+        return [lg for lg in leagues
+                if not lg.get("ended") and not league_is_over(lg, now)]
 
     # -- mutations (called from button/modal callbacks) ---------------------
-    async def add_request(self, *, requester, game_ts, spots, league_id="", league="", team="", channel=None):
+    async def add_request(self, *, requester, spots, game_ts="", league_id="", league="",
+                          team="", channel=None):
         """Create a request, unless an open one already exists for the same league +
         game + team. Returns (status, req): ("duplicate", existing) or ("created", new).
-        The dup check + create happen under one lock so two posts can't both slip in."""
+        The dup check + create happen under one lock so two posts can't both slip in.
+        `game_ts` and `team` are both optional — a request may be no more than
+        "<name> needs a sub in <league>"."""
         async with self._lock:
-            dup = _find_open_duplicate(self.state, league_id, game_ts, team)
+            dup = _find_open_duplicate(self.state, league_id, game_ts, team,
+                                       requester_id=requester.id)
             if dup is not None:
                 return ("duplicate", dup)
             req = store.new_request(
@@ -1477,7 +1803,8 @@ class Subs(commands.Cog):
     @tasks.loop(minutes=15)
     async def expiry_loop(self):
         async with self._lock:
-            dropped = store.expire(self.state, club_now(), GRACE_HOURS)
+            dropped = store.expire(self.state, club_now(), GRACE_HOURS,
+                                   undated_days=UNDATED_DAYS)
             changed = bool(dropped["requests"] or dropped["availability"])
             if changed:
                 self._save()

@@ -9,8 +9,8 @@ features:
 - **Practice sign-ups** — an open pool to say "I want to practice this slot," with
   a shared, auto-updating board so members can rally when someone's going.
 - **Subs board (`/subs`)** — "I need a sub" / "I can sub" coordination tied to real
-  league teams and game dates, with spot-filling, DM confirmations, and
-  notifications.
+  league teams and game dates (the team is optional — you can post before teams
+  are set), with spot-filling, DM confirmations, and notifications.
 
 Everything is configured for a single site via environment variables — the
 target domain, club name, and sheet count are not hardcoded. The number of sheets
@@ -67,8 +67,23 @@ board refreshes it in place. The buttons:
 - **➕ Need a sub** walks you through league → your team → which game → how many
   spots. Leagues, teams, and games are pulled live from the club's league pages
   (the same source as `/sheets`), so you pick from real data instead of typing
-  it. (No game listed? Pick *Enter date manually*.) After posting you can invite
-  an available sub right away.
+  it. **The team is optional** — chairs often don't set teams until a day or two
+  before the first draw, so a request can go up as "*<name>* needs a sub" and
+  gain a team later. **The date never is:** when you need a sub is the point of
+  the request.
+  Leagues are shown by name and run dates ("Thursday League 8/6 – 8/27") rather
+  than the admin's "Summer 2026 League 3", and are listed by night of the week
+  (Sunday → Saturday) then by start date, so the leagues on one night sit
+  together (finished seasons drop off the list). A league that hasn't started
+  yet shows "from 9/6", read out of its title's "Begins …" tail.
+  When a league's schedule isn't posted, the game picker projects its upcoming
+  **league nights** — weekly, on its own night, from that same start date — so
+  there's always a real date to attach a request to. A posted schedule always
+  wins; projected nights are marked "not on the schedule yet". If the club
+  hasn't announced the start time either, the option reads "Sun Sep 6 · time
+  TBC" rather than guessing one: the date is what matters, and a neighbouring
+  league's time would be wrong (Sunday morning is 9am, Sunday night isn't).
+  After posting you can invite an available sub right away.
 - A numbered **Sub for …** button appears per open request. Click to take an
   open spot, click again to drop it. The requester is notified of every change.
 - **🙋 I can sub** lets you pick a league and the upcoming games you can cover
@@ -80,10 +95,14 @@ When inviting an available sub, they receive a DM with **Confirm / Can't**
 buttons; the spot is held as **pending** (shown on the board) until they accept,
 then it flips to filled. Either way the requester is notified.
 
-Game pickers show **all upcoming games** for the chosen league. Requests carry
-the game's date/time and **auto-expire** a few hours after it starts
-(`SUBS_GRACE_HOURS`, default 3); availability tied to specific games expires once
-those games pass — checked every 15 minutes and on startup.
+Game pickers show **all upcoming games** for the chosen league. A request
+**auto-expires** a few hours after its game starts (`SUBS_GRACE_HOURS`, default
+3); a night whose start time is still TBC is treated as ending with that day, so
+it survives the whole day it's needed. Availability tied to specific games
+expires once those games pass — all checked every 15 minutes and on startup.
+(Requests can no longer be posted without a date. Any made while that was briefly
+allowed still show under a **Date TBD** heading and age out after
+`SUBS_UNDATED_DAYS`.)
 
 Notifications try a DM first and fall back to an @-mention in the board channel
 if the member has DMs closed.
@@ -140,6 +159,7 @@ All configuration is via environment variables (see `.env.example`):
 | `TIMEZONE_OFFSET` | Club UTC offset for subs date/time parsing (default -5) |
 | `SUBS_STORE_PATH` | Subs board state file (default `subs_store.json`) |
 | `SUBS_GRACE_HOURS` | Hours after game start before a request expires (default 3) |
+| `SUBS_UNDATED_DAYS` | Days a legacy request with no game date lasts before ageing out (default 14) |
 
 Sheet count is set via `NUM_SHEETS`. A few other site-specific constants live at
 the top of `bot.py` — `PEOPLE_PER_SHEET`, `PRICE_PER_PERSON`, `TIMEZONE_OFFSET`,

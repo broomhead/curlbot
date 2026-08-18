@@ -57,6 +57,52 @@ DAY_BY_CATEGORY = {
     "friday-tgif": "Friday",
 }
 
+# Markers that identify what a non-JSON body actually was, so a failure names
+# itself in the log instead of arriving as "Expecting value: line 1 column 1".
+_CF_MARKERS = ("just a moment", "cf-browser-verification", "attention required",
+               "checking your browser", "cloudflare")
+
+
+def _describe_body(body: str, content_type: str) -> str:
+    """A short, log-safe description of a response body we couldn't use."""
+    if not body.strip():
+        return f"an empty body (content-type {content_type or 'none'})"
+    low = body[:2000].lower()
+    if any(m in low for m in _CF_MARKERS):
+        return "a Cloudflare challenge page"
+    head = " ".join(body[:160].split())
+    return f"{len(body)} bytes of {content_type or 'unknown type'} starting {head!r}"
+
+
+def _salvage_json(body: str):
+    """Parse JSON from a body that may have junk glued to the front or back.
+
+    The club's WordPress has been seen serving SEO-spam anchor tags ahead of
+    EVERY response, REST API included — the JSON is intact, it just isn't at
+    byte 0 any more. raw_decode() reads one value from an offset and ignores
+    whatever trails it, so we recover the payload instead of losing the league
+    data to someone else's injected markup. Returns (value, junk_prefix) or
+    (None, None) when there's no JSON in there at all.
+    """
+    try:
+        return json.loads(body), ""
+    except json.JSONDecodeError:
+        pass
+    starts = [i for i in (body.find("["), body.find("{")) if i >= 0]
+    if not starts:
+        return None, None
+    start = min(starts)
+    try:
+        value, _end = json.JSONDecoder().raw_decode(body, start)
+    except (json.JSONDecodeError, ValueError):
+        return None, None
+    return value, body[:start]
+
+
+class LeagueFetchError(RuntimeError):
+    """A league endpoint returned something we can't use (with the why)."""
+
+
 _BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -154,20 +200,23 @@ def parse_league_html(html: str) -> dict[str, Any]:
     upcoming = [d for d in draws if d["upcoming"]]
 
     # Day + time: prefer real draw data, fall back to None (caller can use slug).
+    # NB: named draw_time, not `time` — this module imports the stdlib `time`
+    # module for the cache clock, and a local of that name is a trap waiting for
+    # whoever next adds a time.time() call in here.
     day = draws[0]["weekday"] if draws else None
-    time = None
+    draw_time = None
     if draws:
         # most common time across draws
         times = [d["time"] for d in draws if d["time"]]
         if times:
-            time = max(set(times), key=times.count)
+            draw_time = max(set(times), key=times.count)
 
     return {
         "teams": teams,
         "team_names": team_names,
         "ended": ended,
         "day": day,
-        "time": time,
+        "time": draw_time,
         "draws": draws,
         "upcoming_draws": upcoming,
         "next_draw": upcoming[0] if upcoming else None,
@@ -200,7 +249,25 @@ class LeagueClient:
         }
         async with self._session.get(LEAGUES_ENDPOINT, params=params) as r:
             r.raise_for_status()
-            posts = await r.json()
+            body = await r.text()
+            ctype = r.headers.get("Content-Type", "")
+
+        posts, junk = _salvage_json(body)
+        if posts is None:
+            # Log the endpoint path only — never the full URL with params.
+            raise LeagueFetchError(
+                f"wp/v2/leagues returned {_describe_body(body, ctype)}")
+        if junk:
+            # Recovered, but say so loudly and every time: content prepended to
+            # the site's API responses means the SITE is injecting it, which is
+            # a problem well beyond this bot.
+            log.warning(
+                "wp/v2/leagues had %d bytes of junk before the JSON — the site is "
+                "injecting content into its API responses. Recovered the payload; "
+                "prefix began %r", len(junk), " ".join(junk[:120].split()))
+        if not isinstance(posts, list):
+            raise LeagueFetchError(
+                f"wp/v2/leagues returned {type(posts).__name__}, expected a list")
 
         out = []
         for p in posts:
@@ -231,7 +298,11 @@ class LeagueClient:
                 info = await self.league_info(lg["link"])
             except Exception as e:  # noqa: BLE001
                 log.warning("Failed to parse league %s: %s", lg["link"], e)
-                info = {}
+                # Flag it rather than returning a bare entry: a league with no
+                # `draws` is otherwise indistinguishable from one whose schedule
+                # simply isn't posted yet, and the sub board invents league
+                # nights for those (see subs.game_options).
+                info = {"fetch_failed": True}
             merged = {**lg, **info}
             # Fall back to category-derived day if the page had no draws.
             if not merged.get("day"):
@@ -299,6 +370,12 @@ async def get_cached_leagues(
     try:
         async with LeagueClient() as lc:
             leagues = await lc.all_active_league_info()
+        if leagues and all(lg.get("fetch_failed") for lg in leagues):
+            # Every page failed: the list call worked but the site is unwell.
+            # Caching this would overwrite good data with a set of leagues that
+            # have no teams and no draws.
+            raise LeagueFetchError(
+                f"all {len(leagues)} league pages failed to load; keeping the old cache")
         _write_cache(cache_path, leagues)
         return leagues
     except Exception as e:  # noqa: BLE001 — fall back to stale cache on network errors

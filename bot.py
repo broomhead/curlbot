@@ -342,7 +342,10 @@ async def collect_sessions(practices, window_start, window_end, gf) -> list[dict
                 continue
             sessions.append({
                 "start": dt, "end": dend, "type": "League",
-                "title": lg.get("title", "League"),
+                # Same de-noising the subs board uses: "Thursday League – Summer
+                # 2026 League 3 – Begins August 6" → "Thursday League". The row
+                # already carries this draw's date/time, so no range here.
+                "title": subs.league_name(lg.get("title", "")) or "League",
                 "sheets_used": d.get("sheets_used"),
             })
 
@@ -544,13 +547,32 @@ def _ordinal(n: int) -> str:
 
 
 def _streak_rows(rows: list[dict], key: str, n: int = 5) -> str:
-    """Format a leaderboard as a high-score list: 🥇/🥈/🥉 then numbered."""
+    """Format a leaderboard as a high-score list: 🥇/🥈/🥉 then numbered.
+
+    Placing is by STREAK LENGTH, not by position in the list — everyone on the same
+    number of weeks shares a medal (three people tied on the club record all get 🥇).
+    Competition ranking, so the group after a 3-way tie for 1st is 4th — the same
+    rule ps.streak_rank uses for the "3rd longest in the club" line on a sign-up.
+    The cut-off never splits a tied group: if the 5th and 6th names are level, both
+    show — up to HARD_CAP, since early in a season the whole club can be tied on one
+    week and an embed field dies past 1024 characters."""
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    HARD_CAP = 12
+    if not rows:
+        return "—"
+    shown = list(rows[:n])
+    cutoff = shown[-1][key]
+    tied_rest = [r for r in rows[n:] if r[key] == cutoff]
+    shown += tied_rest[: HARD_CAP - len(shown)]
     out = []
-    for i, r in enumerate(rows[:n], start=1):
+    for r in shown:
         w = r[key]
-        out.append(f"{medals.get(i, f'`{i}.`')}  **{r['name']}** — {w} wk{'s' if w != 1 else ''}")
-    return "\n".join(out) or "—"
+        rank = 1 + sum(1 for x in rows if x[key] > w)   # ties share a rank
+        out.append(f"{medals.get(rank, f'`{rank}.`')}  **{r['name']}** — {w} wk{'s' if w != 1 else ''}")
+    hidden = len(tied_rest) - (len(shown) - min(len(rows), n))
+    if hidden > 0:
+        out.append(f"…and {hidden} more tied at {cutoff} wk{'s' if cutoff != 1 else ''}")
+    return "\n".join(out)
 
 
 def build_streak_leaderboard_embed() -> discord.Embed:
