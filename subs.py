@@ -1579,7 +1579,8 @@ class Subs(commands.Cog):
         if store.open_spots(req) <= 0:
             return
         # Alerts go to the request's origin channel (where it was posted), so a
-        # request made on LSCC pings on LSCC even though the data is shared.
+        # request made on one server pings on that server even though the data
+        # is shared.
         ch = channel or await self._resolve_channel(req.get("channel_id"))
         if ch is None:
             return

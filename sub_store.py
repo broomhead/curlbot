@@ -156,7 +156,8 @@ def new_request(
         "requester_id": requester_id,
         "requester_name": requester_name,
         # Origin server + channel: alerts/reminders for this request go here, so a
-        # request posted on LSCC pings in LSCC even though the data is shared.
+        # request posted on one server pings in that server even though the
+        # data is shared.
         "guild_id": int(guild_id) if guild_id is not None else None,
         "channel_id": int(channel_id) if channel_id is not None else None,
         "league_id": str(league_id) if league_id not in (None, "") else "",

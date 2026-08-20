@@ -401,42 +401,46 @@ check("clock/a different target is not a repeat",
 check("clock/a different user is not a repeat",
       subs.Subs._is_repeat_click(_cd, ("cancelreq", 2, "abc")), False)
 
-# ── 3. Streak medals group by streak length ──────────────────────────────────
+# ── 3. Streak board: one line per streak length, all the names on it ─────────
+# Superseded the per-person list (2026-08-20). That version repeated a medal down
+# the board — three people tied on the record each got their own 🥇 row — and then
+# showed the next pair as a bare "4.", which read as a numbering glitch instead of
+# a place. Grouping says the same thing in one line per place.
 def rows(*pairs):
     return [{"name": n, "streak": w} for n, w in pairs]
 
 
-# Brian's case: three people tied on the club record all wear gold.
+# Brian's case: the tied group is one gold line, and the group under it is SILVER.
 out = botmod._streak_rows(rows(("Ann", 2), ("Bo", 2), ("Cy", 2), ("Di", 1)), "streak")
-check("medals/3-way tie for 1st", [l.split()[0] for l in out.splitlines()],
-      ["🥇", "🥇", "🥇", "`4.`"])
-# Competition ranking: a 2-way tie for 2nd leaves no bronze, next is 4th.
+check("board/3-way tie is one gold line", out.splitlines(),
+      ["🥇  **2 wks** — Ann, Bo, Cy", "🥈  **1 wk** — Di"])
+check("board/no bare rank after a tie", "`4.`" in out, False)
+# Dense placing: distinct streak lengths, not people, so a 2-way tie is followed by 3rd.
 out = botmod._streak_rows(rows(("Ann", 5), ("Bo", 3), ("Cy", 3), ("Di", 2)), "streak")
-check("medals/tie for 2nd", [l.split()[0] for l in out.splitlines()],
-      ["🥇", "🥈", "🥈", "`4.`"])
-# No ties behaves exactly as before.
+check("board/tie for 2nd", [l.split()[0] for l in out.splitlines()], ["🥇", "🥈", "🥉"])
+# No ties: one name per line, same as it always looked.
 out = botmod._streak_rows(rows(("A", 4), ("B", 3), ("C", 2), ("D", 1)), "streak")
-check("medals/no ties", [l.split()[0] for l in out.splitlines()],
-      ["🥇", "🥈", "🥉", "`4.`"])
-# The top-5 cut never splits a tied group.
+check("board/no ties", [l.split()[0] for l in out.splitlines()], ["🥇", "🥈", "🥉", "`4.`"])
+# Five groups maximum, with everyone below them accounted for in the tail.
 out = botmod._streak_rows(rows(("A", 9), ("B", 8), ("C", 7), ("D", 6), ("E", 2), ("F", 2), ("G", 1)),
                           "streak")
-check("medals/tie at the cutoff", [l.split("**")[1] for l in out.splitlines()],
-      ["A", "B", "C", "D", "E", "F"])
+check("board/five groups then a tail", len(out.splitlines()), 6)
+check("board/E and F share the fifth line", out.splitlines()[4], "`5.`  **2 wks** — E, F")
+check("board/tail counts the rest", out.splitlines()[-1], "…and 1 more with shorter streaks")
 # A whole club tied on one week must not blow past the 1024-char embed field cap.
 big = rows(*[(f"P{i}", 1) for i in range(30)])
 out = botmod._streak_rows(big, "streak")
-check("medals/hard cap rows", len(out.splitlines()), 13)
-check("medals/hard cap tail", out.splitlines()[-1], "…and 18 more tied at 1 wk")
-check("medals/hard cap length", len(out) < 1024, True)
-check("medals/empty", botmod._streak_rows([], "streak"), "—")
-check("medals/all-time key", botmod._streak_rows([{"name": "A", "best": 1}], "best"),
-      "🥇  **A** — 1 wk")
-# Board medal and the "Nth longest in the club" sign-up line must agree.
+check("board/one line for one big tie", len(out.splitlines()), 1)
+check("board/big tie summarised", "+20 more" in out, True)
+check("board/big tie length", len(out) < 1024, True)
+check("board/empty", botmod._streak_rows([], "streak"), "—")
+check("board/all-time key", botmod._streak_rows([{"name": "A", "best": 1}], "best"),
+      "🥇  **1 wk** — A")
+# Board placing and the "Nth longest in the club" sign-up line must agree — both
+# count distinct streak LENGTHS above you (dense ranking).
 lb = rows(("Ann", 2), ("Bo", 2), ("Cy", 1))
-ranks = {l.split("**")[1]: l.split()[0] for l in botmod._streak_rows(lb, "streak").splitlines()}
-# Ann & Bo tie for gold; Cy sits at rank 3 (competition ranking) → bronze, no silver.
-check("medals match streak_rank", ranks["Cy"], "🥉")
+places = {l.split("**")[1]: l.split()[0] for l in botmod._streak_rows(lb, "streak").splitlines()}
+check("board/Cy's group is silver", places["1 wk"], "🥈")
 
 
 print("\n".join(f"FAIL: {f}" for f in FAILS) or f"All checks passed.")

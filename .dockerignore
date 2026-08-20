@@ -1,0 +1,42 @@
+# Docker does NOT read .gitignore. Without this file `COPY . .` in the Dockerfile
+# bakes the entire checkout into the image — including secrets and local state —
+# and the image then travels to the production box via `docker save | docker load`.
+#
+# This bit us for real (2026-08-20): a sheet block placed while testing locally
+# was written to ./sheet_blocks.json, got copied into the image, and every deploy
+# shipped that dev block to production while wiping production's own — because a
+# store that isn't on the /data volume lives INSIDE the image, so redeploying
+# resets it to whatever was on the laptop at build time.
+
+# Secrets. The Dockerfile says secrets are never baked in; this file is what
+# makes that true.
+.env
+.env.*
+!.env.example
+
+# Runtime state. Production keeps these on the /data volume and dev bind-mounts
+# ./data — neither wants the laptop's copy inside the image.
+data/
+*.json
+*.json.tmp
+
+# Version control, caches, local noise
+.git/
+.gitignore
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.log
+.DS_Store
+
+# Tests and one-off exploration scripts: not needed at runtime, and every file
+# here is a file that has to be re-shipped on each deploy.
+test_*.py
+discover_*.py
+fixture_*.csv
+
+# Docker/compose files themselves aren't needed inside the image
+Dockerfile
+.dockerignore
+docker-compose*.yml

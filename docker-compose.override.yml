@@ -4,6 +4,10 @@ services:
       - LEAGUE_CACHE_PATH=/data/league_cache.json
       - PRACTICE_STORE_PATH=/data/practice_signups.json
       - SUBS_STORE_PATH=/data/subs_store.json
+      # Keep dev's stores on the ./data mount too — a store at its bare default
+      # lands in the bind-mounted source tree, where `COPY . .` sweeps it into the
+      # next image and ships your local test data to production.
+      - BLOCK_STORE_PATH=/data/sheet_blocks.json
     volumes:
       - .:/app
       - ./data:/data

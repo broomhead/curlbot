@@ -237,12 +237,18 @@ def all_time_leaderboard(state: dict) -> list[dict]:
 
 def streak_rank(state: dict, user_id: int, now: datetime) -> tuple[int, int, bool]:
     """(rank, total_active, tied) for a user among active streaks; rank 1 = longest.
-    Ties share a rank (competition ranking). rank 0 means no active streak."""
+    rank 0 means no active streak.
+
+    DENSE ranking — the rank counts distinct streak LENGTHS above this one, not
+    people. So the group below a three-way tie for first is 2nd, not 4th. This has
+    to match how the leaderboard groups its lines (bot._streak_rows), because the
+    sign-up ping says "2nd longest in the club" about the very board the member is
+    about to look at; counting people made the two disagree."""
     lb = streak_leaderboard(state, now)
     me = next((e for e in lb if e["user_id"] == user_id), None)
     if me is None:
         return (0, len(lb), False)
-    higher = sum(1 for e in lb if e["streak"] > me["streak"])
+    higher = len({e["streak"] for e in lb if e["streak"] > me["streak"]})
     tied = sum(1 for e in lb if e["streak"] == me["streak"]) > 1
     return (higher + 1, len(lb), tied)
 

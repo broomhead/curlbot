@@ -93,6 +93,70 @@ BLOCK_GRACE_HOURS = float(os.environ.get("BLOCK_GRACE_HOURS", "1"))
 _block_state = bs.load(BLOCK_STORE_PATH)
 _block_lock = asyncio.Lock()
 
+# ── Where state actually lives ────────────────────────────────────────────────
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+# Secrets the bot cannot work without. DISCORD_TOKEN is read at import and fails
+# immediately, but the Gravity Forms pair is only touched when GFClient() is
+# constructed — deep inside the first /sheets call. That meant a missing key
+# booted a perfectly healthy-looking bot that then threw KeyError at the first
+# member who used the command.
+REQUIRED_SECRETS = ("DISCORD_TOKEN", "GF_CONSUMER_KEY", "GF_CONSUMER_SECRET")
+
+
+def _check_required_env() -> None:
+    """Fail at boot, loudly and by name, if a required secret is missing.
+
+    Learned the hard way (2026-08-20): prod never declared the Gravity Forms
+    credentials. It worked anyway because `COPY . .` had baked the developer's
+    .env into the image and load_dotenv() read it from /app/.env — so production
+    was quietly running on dev's keys. Adding a .dockerignore removed that file
+    and the real gap surfaced as a KeyError mid-command. A missing secret should
+    stop the bot at startup where the operator sees it, not ambush a member."""
+    missing = [k for k in REQUIRED_SECRETS if not os.environ.get(k)]
+    if missing:
+        raise SystemExit(
+            "FATAL: missing required environment variable(s): " + ", ".join(missing)
+            + ".\nThese are secrets: put them in the env file the deployment ships"
+              " (.env.prod -> .env on the box), NOT in docker-compose. Note that a"
+              " .env inside the image is no longer read — .dockerignore excludes it"
+              " on purpose.")
+
+
+def _audit_store_paths() -> None:
+    """Log where every persistent store resolved to, and shout if one landed inside
+    the app directory.
+
+    A store written next to the code is a store written INSIDE THE DOCKER IMAGE.
+    It looks like it works — the bot reads and writes it all session — but the
+    container is replaced on every deploy, so the file reverts to whatever was in
+    the build context on the developer's laptop. That is exactly how a sheet block
+    placed in dev turned up in production while production's own block vanished
+    (2026-08-20): BLOCK_STORE_PATH wasn't set in the compose files, so it fell back
+    to the bare default in the working directory instead of the /data volume.
+
+    Silent data loss found by a human noticing wrong numbers is the worst way to
+    find this, so it goes in the boot log where it can't hide."""
+    stores = (("BLOCK_STORE_PATH", BLOCK_STORE_PATH),
+              ("PRACTICE_STORE_PATH", PRACTICE_STORE_PATH),
+              ("SUBS_STORE_PATH", subs.STORE_PATH))
+    for label, path in stores:
+        resolved = os.path.abspath(path)
+        try:
+            inside_app = os.path.commonpath([resolved, APP_DIR]) == APP_DIR
+        except ValueError:            # different drives — can't be inside
+            inside_app = False
+        if inside_app:
+            log.warning(
+                "%s resolves to %s, inside the app directory — this file is part of "
+                "the image and WILL BE RESET on the next deploy. Point it at the "
+                "durable volume (e.g. /data/%s).",
+                label, resolved, os.path.basename(resolved))
+        else:
+            log.info("%s -> %s%s", label, resolved,
+                     "" if os.path.exists(resolved) else " (new)")
+
 # Debounce impatient double-taps of a practice signup button. ps.toggle is a
 # join↔leave toggle, so without this a quick double-click would join then
 # instantly leave. (user_id, session_key) -> monotonic time of last click.
@@ -404,6 +468,13 @@ bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents)
 
 
 async def setup_hook():
+    # First thing in the boot log: prove the config is complete, and say where the
+    # durable state actually lives. Called here rather than at import time because
+    # discord.py installs the log handlers inside run(), so anything logged
+    # earlier goes nowhere.
+    _check_required_env()
+    _audit_store_paths()
+
     # Register persistent per-request buttons so they keep working across
     # restarts, then load the subs cog (adds the /subs command + board logic).
     bot.add_dynamic_items(
@@ -621,7 +692,7 @@ async def build_sheets_payload(weeks: int, user) -> tuple[discord.Embed, discord
     used, dropped = 0, 0
     for o, key, n, mine in keyed:
         line = pi.format_opportunity(o, TOTAL_SHEETS)[1]
-        line += f"\n    🧹 **{n}** signed up to practice" + (" · you're in" if mine else "")
+        line += f"\n    **{n}** signed up to practice" + (" · you're in" if mine else "")
         # No free ice → nothing to practice on, so don't let people sign up. Someone
         # already signed up keeps a button (to withdraw); everyone else gets none.
         full = o.get("free", 0) <= 0
@@ -659,33 +730,64 @@ def _ordinal(n: int) -> str:
     return f"{n}{suffix}"
 
 
-def _streak_rows(rows: list[dict], key: str, n: int = 5) -> str:
-    """Format a leaderboard as a high-score list: 🥇/🥈/🥉 then numbered.
+# Embed fields die past 1024 characters, and a leaderboard line is unbounded (it
+# carries every name in a tied group). Leave room for the "…and N others" tail.
+STREAK_FIELD_BUDGET = 900
+# Names on one line before the rest are summarised, so one huge tie can't push the
+# groups below it off the board.
+MAX_NAMES_PER_GROUP = 10
 
-    Placing is by STREAK LENGTH, not by position in the list — everyone on the same
-    number of weeks shares a medal (three people tied on the club record all get 🥇).
-    Competition ranking, so the group after a 3-way tie for 1st is 4th — the same
-    rule ps.streak_rank uses for the "3rd longest in the club" line on a sign-up.
-    The cut-off never splits a tied group: if the 5th and 6th names are level, both
-    show — up to HARD_CAP, since early in a season the whole club can be tied on one
-    week and an embed field dies past 1024 characters."""
+
+def streak_groups(rows: list[dict], key: str) -> list[tuple]:
+    """Collapse a sorted leaderboard into [(weeks, [names…]), …], longest first.
+
+    One entry per distinct streak LENGTH, not per person — everyone level on three
+    weeks is one group. `rows` arrives sorted by (-streak, name), so a group is just
+    a run of equal values and the names inside it come out alphabetical."""
+    groups: list[tuple] = []
+    for r in rows:
+        weeks = r[key]
+        if groups and groups[-1][0] == weeks:
+            groups[-1][1].append(r["name"])
+        else:
+            groups.append((weeks, [r["name"]]))
+    return groups
+
+
+def _streak_rows(rows: list[dict], key: str, n: int = 5) -> str:
+    """Format a leaderboard as up to `n` lines — ONE PER STREAK LENGTH, with every
+    name on that line.
+
+    Grouping is the whole point. Listing one person per line repeated the same medal
+    down the board (three people tied on the club record each got their own 🥇 row)
+    and then jumped to a bare "4." for the next pair, which read as a numbering
+    glitch rather than as fourth place. A line per group says the same thing without
+    the repetition: place is the group's position, so the group after a three-way
+    tie for first is second, and gets 🥈.
+
+    That's dense ranking, and ps.streak_rank matches it — the "2nd longest in the
+    club" line on a sign-up has to agree with the board the member is looking at."""
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-    HARD_CAP = 12
     if not rows:
         return "—"
-    shown = list(rows[:n])
-    cutoff = shown[-1][key]
-    tied_rest = [r for r in rows[n:] if r[key] == cutoff]
-    shown += tied_rest[: HARD_CAP - len(shown)]
-    out = []
-    for r in shown:
-        w = r[key]
-        rank = 1 + sum(1 for x in rows if x[key] > w)   # ties share a rank
-        out.append(f"{medals.get(rank, f'`{rank}.`')}  **{r['name']}** — {w} wk{'s' if w != 1 else ''}")
-    hidden = len(tied_rest) - (len(shown) - min(len(rows), n))
-    if hidden > 0:
-        out.append(f"…and {hidden} more tied at {cutoff} wk{'s' if cutoff != 1 else ''}")
-    return "\n".join(out)
+    groups = streak_groups(rows, key)
+    out, used, shown_groups = [], 0, 0
+    for place, (weeks, names) in enumerate(groups[:n], start=1):
+        listed = names[:MAX_NAMES_PER_GROUP]
+        rest = len(names) - len(listed)
+        who = ", ".join(listed) + (f" +{rest} more" if rest else "")
+        line = (f"{medals.get(place, f'`{place}.`')}  **{weeks} wk"
+                f"{'s' if weeks != 1 else ''}** — {who}")
+        if used + len(line) + 1 > STREAK_FIELD_BUDGET:
+            break
+        out.append(line)
+        used += len(line) + 1
+        shown_groups += 1
+    # Never drop people silently: say how many are still on the board below the cut.
+    hidden = sum(len(names) for _w, names in groups[shown_groups:])
+    if hidden:
+        out.append(f"…and {hidden} more with shorter streaks")
+    return "\n".join(out) if out else "—"
 
 
 def build_streak_leaderboard_embed() -> discord.Embed:
@@ -717,7 +819,11 @@ def build_practice_board_embed() -> discord.Embed:
             sheets = s.get("sheets")
             free = f"{sheets} sheet{'s' if sheets != 1 else ''} free · " if sheets is not None else ""
             names = ", ".join(u["name"] for u in s["users"])
-            lines.append(f"🧹  **{s.get('label', s['key'])}** · {free}{len(s['users'])} in\n    {names}")
+            # No emoji per date. The broom lives in the board title only — repeated
+            # down every row (and on every sign-up message) it was pure noise. Row
+            # emoji are reserved for ones that carry meaning: the 🟢/🟡/🔴 free-sheet
+            # status on /sheets, ⛔ for a closed slot, 🚫 for a manual block.
+            lines.append(f"**{s.get('label', s['key'])}** · {free}{len(s['users'])} in\n    {names}")
         e.description = "\n\n".join(lines)
     # Current top-5 streaks on the public board (all-time records via /sheets stats:True).
     lb = ps.streak_leaderboard(_practice_state, now_club())
@@ -894,7 +1000,7 @@ class JoinPracticeButton(discord.ui.DynamicItem[discord.ui.Button],
         # …and, on a new sign-up, post a one-line note — with their practice streak
         # and club ranking if it's a real streak (> 1 week).
         if result == "joined" and interaction.channel is not None:
-            note = f"🧹  **{interaction.user.display_name}** is in for **{label}** — {n} signed up."
+            note = f"**{interaction.user.display_name}** is in for **{label}** — {n} signed up."
             streak = ps.current_streak(_practice_state, interaction.user.id, now_club())
             if streak > 1:
                 rank, _total, tied = ps.streak_rank(_practice_state, interaction.user.id, now_club())
@@ -907,7 +1013,7 @@ class JoinPracticeButton(discord.ui.DynamicItem[discord.ui.Button],
                 pass
 
         await interaction.followup.send(
-            (f"🧹  You're signed up for **{label}** — the channel board's updated." if result == "joined"
+            (f"You're signed up for **{label}** — the channel board's updated." if result == "joined"
              else f"👍  Removed you from practice on **{label}**."),
             ephemeral=True)
 
@@ -1432,7 +1538,7 @@ async def sheets_cmd(interaction: discord.Interaction, weeks: int = 1,
             return
         await interaction.response.defer(ephemeral=True)
         await bump_practice_board(interaction.channel)
-        await interaction.followup.send("🧹  Posted the practice sign-up board here.", ephemeral=True)
+        await interaction.followup.send("Posted the practice sign-up board here.", ephemeral=True)
         return
     weeks = max(1, min(weeks, 4))
     await interaction.response.defer(ephemeral=True)

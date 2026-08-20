@@ -27,6 +27,7 @@ os.environ.setdefault("DISCORD_TOKEN", "test-token")
 import block_store as bs
 import bot as botmod
 import practice_ice as pi
+import practice_store as ps
 import sub_store as store
 import subs
 
@@ -513,6 +514,63 @@ finally:
     subs.club_now = real_now
 check_true("subs/board hides an unexpired past date", "Aug 16" not in desc)
 check_true("subs/board still shows the upcoming one", "Aug 23" in desc)
+
+
+# ── 5b. The streak board groups by streak length ─────────────────────────────
+# One line per distinct streak, every tied name on it. Listing a person per line
+# repeated 🥇 three times for a three-way tie and then showed a bare "4." for the
+# next pair, which read as a numbering glitch rather than as a place.
+
+LB = [{"name": n, "streak": w, "user_id": i} for i, (n, w) in enumerate(
+    [("Ann", 3), ("Ben", 3), ("Cara", 3), ("Dave", 2), ("Eve", 2), ("Fay", 1)])]
+
+check("streak/groups by length",
+      [(w, names) for w, names in botmod.streak_groups(LB, "streak")],
+      [(3, ["Ann", "Ben", "Cara"]), (2, ["Dave", "Eve"]), (1, ["Fay"])])
+
+board = botmod._streak_rows(LB, "streak").split("\n")
+check("streak/one line per group", len(board), 3)
+check("streak/gold names the whole tied group", board[0], "🥇  **3 wks** — Ann, Ben, Cara")
+check("streak/next group is SILVER, not a bare 4.", board[1], "🥈  **2 wks** — Dave, Eve")
+check("streak/third group is bronze", board[2], "🥉  **1 wk** — Fay")
+check_true("streak/no bare number in a 3-group board", not any("`4.`" in ln for ln in board))
+check("streak/empty board", botmod._streak_rows([], "streak"), "—")
+check("streak/singular week", botmod._streak_rows(
+    [{"name": "Solo", "streak": 1, "user_id": 1}], "streak"), "🥇  **1 wk** — Solo")
+
+# Only five groups, and the tail accounts for everyone below them.
+deep = [{"name": f"P{i}", "streak": 9 - i, "user_id": i} for i in range(9)]
+deep_board = botmod._streak_rows(deep, "streak").split("\n")
+check("streak/caps at five groups plus a tail", len(deep_board), 6)
+check("streak/tail counts every dropped person", deep_board[-1],
+      "…and 4 more with shorter streaks")
+check("streak/fourth and fifth groups are numbered", [deep_board[3][:4], deep_board[4][:4]],
+      ["`4.`", "`5.`"])
+
+# One enormous tie must not push the groups below it off the board, or blow the
+# 1024-char embed-field limit.
+huge = ([{"name": f"Curler{i:02d}", "streak": 2, "user_id": i} for i in range(40)]
+        + [{"name": "Last", "streak": 1, "user_id": 99}])
+huge_board = botmod._streak_rows(huge, "streak")
+check_true("streak/huge tie is summarised", "+30 more" in huge_board)
+check_true("streak/group below a huge tie survives", "Last" in huge_board)
+check_true("streak/fits an embed field", len(huge_board) <= 1024)
+
+# The sign-up ping must agree with the board: Dave is in the SECOND group, so the
+# bot must tell him 2nd — not 4th, which is what counting people gave.
+rank_state = ps.empty_state()
+for uid, (name, weeks) in enumerate([("Ann", 3), ("Ben", 3), ("Cara", 3), ("Dave", 2)]):
+    rank_state["attendance"][str(uid)] = {
+        "name": name,
+        "weeks": [f"2026-W{34 - k:02d}" for k in range(weeks)][::-1]}
+rank, total, tied = ps.streak_rank(rank_state, 3, datetime(2026, 8, 20, 10, 0))
+check("streak/rank agrees with the board's grouping", rank, 2)
+check("streak/total still counts people", total, 4)
+check("streak/not flagged as tied when alone in a group", tied, False)
+check("streak/a member of the top tie ranks 1st",
+      ps.streak_rank(rank_state, 0, datetime(2026, 8, 20, 10, 0))[0], 1)
+check("streak/...and is flagged tied",
+      ps.streak_rank(rank_state, 0, datetime(2026, 8, 20, 10, 0))[2], True)
 
 
 # ── 6. Import hygiene (the class of bug that has actually shipped) ───────────
