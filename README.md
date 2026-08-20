@@ -31,6 +31,8 @@ four source types:
 - **Private events** — sheet usage derived from the booking fee.
 - **Leagues** — team count and draw schedule parsed from the public league pages.
 
+...and one thing that only ever *removes* ice: **blocks** (below).
+
 Free sheets during any session = `NUM_SHEETS` − sheets used by every overlapping
 session, so concurrent bookings stack correctly. Sessions with no available data
 are flagged rather than guessed. `NUM_SHEETS` (default 4) is configurable since
@@ -52,6 +54,43 @@ board** is kept current in the channel: it's posted/pinned the first time someon
 signs up (in whatever channel they used `/sheets`) and edited silently on every
 join or leave. When someone *newly joins* a slot, the bot also posts a short
 ping so others get notified and can join in.
+
+### Blocking sheets (ice booked off the calendar)
+
+Sometimes ice gets reserved outside every system the bot can see — someone
+schedules a Learn-to-Curl by hand, or a group books sheets at the rink directly.
+Money changes hands, but nothing lands on the club calendar or in Gravity Forms,
+so `/sheets` keeps advertising ice that's already taken.
+
+The **🚫 Block sheets** button on every `/sheets` report is the manual patch.
+Pick the slot the ice is coming out of (or **Other date/time…** for ice that
+isn't listed at all), choose how many sheets, and say what it's for. From then
+on every report subtracts those sheets and shows a line naming who blocked them:
+
+```
+🟡  Sun Aug 23 · 1:30 PM · Practice · 1 sheet free
+    Sunday Practice
+    🚫 2 sheets blocked by Darin — Learn-to-Curl (1:30–3:00 PM)
+```
+
+Notes on how it behaves:
+
+- **Anyone in the server can block or release.** There's no permission gate — at
+  a club, whoever's at the rink is usually the one who knows. Every block and
+  release is announced in the channel with the member's name, and the block
+  carries that name on the report, so the accountability is social rather than
+  technical.
+- **Blocks apply immediately.** They're stored locally and folded into the
+  arithmetic on each render, so they don't wait out the six-hour `/sheets` cache.
+- **They expire on their own** once the ice is past (`BLOCK_GRACE_HOURS`), and can
+  be released early from the same 🚫 menu — pick the block from "…or release a
+  block".
+- **A block that takes a slot to zero pings anyone signed up to practice then**,
+  since their plans just changed.
+- A block never gets a row of its own; it only reduces the free count on the rows
+  it overlaps. Its window shows on the note when it covers only part of a slot.
+
+State lives in `BLOCK_STORE_PATH` (default `sheet_blocks.json`).
 
 ## Subs board
 
@@ -157,6 +196,8 @@ All configuration is via environment variables (see `.env.example`):
 | `CLUB_NAME` | Name shown in the Discord embed |
 | `NUM_SHEETS` | Number of sheets at the facility (default 4) |
 | `PRACTICE_STORE_PATH` | Practice sign-up pool state file (default `practice_signups.json`) |
+| `BLOCK_STORE_PATH` | Ad-hoc sheet-block state file (default `sheet_blocks.json`) |
+| `BLOCK_GRACE_HOURS` | Hours after a block ends before it's swept (default 1) |
 | `GF_CONSUMER_KEY` / `GF_CONSUMER_SECRET` | Gravity Forms REST API v2 credentials |
 | `LEAGUE_CACHE_TTL` | League-page cache lifetime in seconds (default 21600 = 6h) |
 | `TIMEZONE_OFFSET` | Club UTC offset for subs date/time parsing (default -5) |

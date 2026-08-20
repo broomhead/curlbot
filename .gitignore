@@ -21,5 +21,11 @@ venv/
 # Local dev state dir (mounted into the container at /data; never commit)
 /data/
 
+# Runtime stores, for when they're left at their bare defaults instead of ./data
+practice_signups.json*
+subs_store.json*
+sheet_blocks.json*
+league_cache.json*
+
 # macOS
 .DS_Store

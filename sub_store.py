@@ -319,6 +319,23 @@ def availability_for_user(state: dict, user_id: int) -> list[dict]:
 
 # ── Expiry ──────────────────────────────────────────────────────────────────
 
+def day_floor(now: datetime) -> datetime:
+    """Midnight at the start of today. The board is today-and-forward, full stop —
+    nothing dated before this may survive expiry or be rendered, whatever it is."""
+    return now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def board_cutoff(now: datetime, grace_hours: float = DEFAULT_GRACE_HOURS) -> datetime:
+    """The oldest a dated item may be and still belong on the board.
+
+    Two rules, whichever bites harder: a game drops `grace_hours` after it starts
+    (so a draw underway is still visible to latecomers), and NOTHING from before
+    today survives regardless. The day floor is what stops a late game from
+    hanging around after midnight — with grace alone, an 11pm draw was still
+    "within 3 hours" at 1am the next morning and stayed on the board."""
+    return max(now - timedelta(hours=grace_hours), day_floor(now))
+
+
 def expire(
     state: dict,
     now: datetime,
@@ -332,7 +349,7 @@ def expire(
     A request with no game date ages out `undated_days` after it was posted; one
     whose timestamps can't be parsed at all is kept (never silently lost).
     """
-    cutoff = now - timedelta(hours=grace_hours)
+    cutoff = board_cutoff(now, grace_hours)
     undated_cutoff = now - timedelta(days=undated_days)
     kept_reqs, dropped_reqs = [], []
     for r in state["requests"]:
@@ -354,19 +371,34 @@ def expire(
         (dropped_reqs if game < cutoff else kept_reqs).append(r)
     state["requests"] = kept_reqs
 
-    # Availability: if it names specific games, drop it once the LAST game has
-    # passed (+grace). Otherwise (whole-league offer) age it out by created date.
+    # Availability: prune the entry's games ONE AT A TIME, then drop the entry once
+    # none are left. Expiring only on the LAST game (what this used to do) left every
+    # earlier game in the list live: someone free for both Aug 16 and Aug 23 kept
+    # putting Aug 16 on the board all the way through the 23rd, because the entry as
+    # a whole hadn't expired yet. Each game now stands or falls on its own date.
+    # Whole-league offers ("any time") carry no date, so they still age out by
+    # created date.
     acutoff = now - timedelta(days=avail_days)
-    kept_av, dropped_av = [], []
+    kept_av, dropped_av, dropped_games = [], [], []
     for a in state["availability"]:
         games = a.get("games") or []
         if games:
-            try:
-                last = max(datetime.fromisoformat(g) for g in games)
-            except (ValueError, TypeError):
+            live, stale, unparsed = [], [], []
+            for g in games:
+                try:
+                    dt = datetime.fromisoformat(g)
+                except (ValueError, TypeError):
+                    unparsed.append(g)   # keep — never silently lose a sign-up
+                    continue
+                (live if dt >= cutoff else stale).append(g)
+            if stale:
+                dropped_games.append({"user_id": a.get("user_id"), "name": a.get("name", ""),
+                                      "league_id": a.get("league_id", ""), "games": stale})
+                a["games"] = live + unparsed
+            if not (live or unparsed):
+                dropped_av.append(a)     # every game they offered has been played
+            else:
                 kept_av.append(a)
-                continue
-            (dropped_av if last < cutoff else kept_av).append(a)
         else:
             try:
                 created = datetime.fromisoformat(a["created_ts"])
@@ -376,4 +408,6 @@ def expire(
             (dropped_av if created < acutoff else kept_av).append(a)
     state["availability"] = kept_av
 
-    return {"requests": dropped_reqs, "availability": dropped_av}
+    # `games` lists games pruned from entries that SURVIVED — callers must treat a
+    # non-empty value as a change worth saving, or the prune is lost on restart.
+    return {"requests": dropped_reqs, "availability": dropped_av, "games": dropped_games}

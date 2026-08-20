@@ -461,6 +461,18 @@ def _game_key(iso: str) -> str:
         return iso or ""
 
 
+def _before(iso: str, floor: datetime) -> bool:
+    """True if `iso` is a real timestamp earlier than `floor`. An empty or
+    unparseable value is NOT "before" — undated items are handled on their own
+    terms and unreadable ones are never silently dropped."""
+    if not iso:
+        return False
+    try:
+        return datetime.fromisoformat(iso) < floor
+    except (ValueError, TypeError):
+        return False
+
+
 def _req_icon(req: dict) -> str:
     """Traffic light by urgency: 🔴 nobody yet, 🟡 partly covered, 🟢 fully covered."""
     needed = int(req["spots_needed"])
@@ -566,6 +578,14 @@ def build_embed(state: dict) -> discord.Embed:
     for a in state.get("availability", []):
         for iso in (a.get("games") or []):
             groups.setdefault(_game_key(iso), {"iso": iso, "label": fmt_when(iso), "reqs": []})
+
+    # Hard today-forward floor. store.expire() already prunes past dates, but it
+    # only runs every 15 minutes and only mutates what it can parse — this makes
+    # the board itself incapable of showing yesterday. Undated ("Date TBD") groups
+    # carry no date to be behind, so they're never floored out.
+    floor = store.day_floor(club_now())
+    for k in [k for k, g in groups.items() if _before(g.get("iso"), floor)]:
+        del groups[k]
 
     def _sort_key(k: str):
         try:
@@ -1805,7 +1825,7 @@ class Subs(commands.Cog):
         async with self._lock:
             dropped = store.expire(self.state, club_now(), GRACE_HOURS,
                                    undated_days=UNDATED_DAYS)
-            changed = bool(dropped["requests"] or dropped["availability"])
+            changed = bool(dropped["requests"] or dropped["availability"] or dropped["games"])
             if changed:
                 self._save()
         # Retire alert pages for played-out requests.

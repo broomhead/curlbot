@@ -33,6 +33,7 @@ from discord.ext import commands
 from gf_client import GFClient
 from ice import PEOPLE_PER_SHEET, TOTAL_SHEETS, sheets_for_people
 from league_client import get_cached_leagues, draw_to_datetime
+import block_store as bs
 import instructors
 import practice_ice as pi
 import practice_store as ps
@@ -69,26 +70,43 @@ POND_ICS_URLS = [u.strip() for u in os.environ.get("POND_ICS_URLS", "").split(",
 POND_MATCH    = os.environ.get("POND_MATCH", "curl")
 POND_CACHE_TTL = int(os.environ.get("POND_CACHE_TTL", "21600"))  # 6h
 # /sheets makes several network calls (calendar + Gravity Forms). That data changes
-# slowly, so cache the built opportunities and reuse them for SHEETS_CACHE_TTL —
+# slowly, so cache the fetched sessions and reuse them for SHEETS_CACHE_TTL —
 # same 6h cadence as the league cache. In-memory, so it also refetches once per app
-# launch. See fetch_opps_cached.
+# launch. See fetch_sessions_cached / current_opportunities.
 SHEETS_CACHE_TTL = int(os.environ.get("SHEETS_CACHE_TTL", "21600"))  # 6h
+# How soon to retry after a failed refetch (we keep serving the stale data until
+# then). Short enough to recover quickly, long enough that a down backend isn't
+# re-dialled once per button press.
+SHEETS_RETRY_SECONDS = int(os.environ.get("SHEETS_RETRY_SECONDS", "120"))
 
 # Practice sign-up pool (shared across members; interactions stay private).
 PRACTICE_STORE_PATH = os.environ.get("PRACTICE_STORE_PATH", "practice_signups.json")
 _practice_state = ps.load(PRACTICE_STORE_PATH)
 _practice_lock = asyncio.Lock()
 
+# Ad-hoc sheet blocks: ice reserved off the books, held by hand from /sheets so
+# the report stops advertising sheets that aren't actually there. Kept in its own
+# store (and its own lock) because it's written from the block flow while a
+# sign-up may be writing the practice pool. See block_store.
+BLOCK_STORE_PATH = os.environ.get("BLOCK_STORE_PATH", "sheet_blocks.json")
+BLOCK_GRACE_HOURS = float(os.environ.get("BLOCK_GRACE_HOURS", "1"))
+_block_state = bs.load(BLOCK_STORE_PATH)
+_block_lock = asyncio.Lock()
+
 # Debounce impatient double-taps of a practice signup button. ps.toggle is a
 # join↔leave toggle, so without this a quick double-click would join then
 # instantly leave. (user_id, session_key) -> monotonic time of last click.
 CLICK_DEBOUNCE_SECONDS = 3.0
 _practice_cooldown: dict[tuple[int, str], float] = {}
+# Same guard for placing a sheet block — see finish_block.
+_block_cooldown: dict[tuple, float] = {}
 
 
 def _is_repeat_click(cooldown: dict, key) -> bool:
     """Record this click and report whether it repeats `key` within the debounce
-    window; callers treat a repeat as a no-op. Call under _practice_lock."""
+    window; callers treat a repeat as a no-op. Call under whichever lock guards
+    the passed dict — _practice_lock for _practice_cooldown, _block_lock for
+    _block_cooldown."""
     now_m = time.monotonic()
     last = cooldown.get(key)
     cooldown[key] = now_m
@@ -395,6 +413,7 @@ async def setup_hook():
         subs.RemoveButton,
         subs.PageClaimButton,
         JoinPracticeButton,
+        BlockSheetsButton,
     )
     await bot.add_cog(subs.Subs(bot))
 
@@ -437,6 +456,9 @@ async def on_ready():
 # ── Practice ice: live report + open sign-up pool ───────────────────────────
 
 MAX_SIGNUP_BUTTONS = 20  # leave headroom under Discord's 25-component cap
+# Discord's embed-description limit is 4096; stop short so the trailing
+# "…and N more" line always fits.
+MAX_EMBED_DESCRIPTION = 3900
 
 def session_key(opp: dict) -> str:
     """Stable per-slot key from the session start minute (e.g. '20260616T1945')."""
@@ -447,8 +469,14 @@ class SheetsError(Exception):
     """Carries a user-facing message for a failed /sheets fetch."""
 
 
-async def fetch_opps(weeks: int) -> list[dict]:
-    """Fetch the practice-ice opportunities (raises SheetsError with a message)."""
+async def fetch_sessions(weeks: int) -> list[dict]:
+    """Fetch the raw ice sessions in the window (raises SheetsError with a message).
+
+    Stops short of practice_opportunities on purpose: what's cached below has to be
+    only the slow, network-derived half. Blocks live in a local file and change the
+    instant someone places one, so they're folded in per-render instead — caching
+    finished opportunities would have meant a block quietly not applying until the
+    6-hour TTL rolled over."""
     try:
         practices = await fetch_practices_within(weeks)
     except Exception:  # noqa: BLE001 — log detail server-side, show a safe message
@@ -469,46 +497,92 @@ async def fetch_opps(weeks: int) -> list[dict]:
     except Exception:  # noqa: BLE001 — never surface raw errors (they can carry the GF URL+creds)
         log.exception("Registration data fetch failed")
         raise SheetsError("❌  Couldn't load registration data right now — please try again shortly.")
-    return pi.practice_opportunities(sessions, TOTAL_SHEETS)
+    return sessions
 
 
-# Cache the fetched opportunities per `weeks` window so /sheets (and every sign-up
+# Cache the fetched sessions per `weeks` window so /sheets (and every sign-up
 # button re-render) doesn't hit the backend each time. Refetch only when the entry
 # is older than SHEETS_CACHE_TTL (or on first use after launch). On a refetch
 # failure, serve the stale entry rather than erroring.
-_opps_cache: dict[int, tuple[float, list[dict]]] = {}
-_opps_cache_lock = asyncio.Lock()
+_sessions_cache: dict[int, tuple[float, list[dict]]] = {}
+_sessions_cache_lock = asyncio.Lock()
 
 
-def _fresh_opps(opps: list[dict]) -> list[dict]:
-    """Drop opportunities that have already ended, so a long-lived cache never shows a
+def _fresh_sessions(sessions: list[dict]) -> list[dict]:
+    """Drop sessions that have already ended, so a long-lived cache never shows a
     clearly-past slot; everything still upcoming (within its window) is kept as-is."""
     cutoff = now_club() - timedelta(hours=SHEETS_GRACE_HOURS)
-    return [o for o in opps if o.get("end") is None or o["end"] > cutoff]
+    return [s for s in sessions if s.get("end") is None or s["end"] > cutoff]
 
 
-async def fetch_opps_cached(weeks: int) -> list[dict]:
+async def fetch_sessions_cached(weeks: int) -> list[dict]:
     now_m = time.monotonic()
-    entry = _opps_cache.get(weeks)
+    entry = _sessions_cache.get(weeks)
     if entry is None or now_m - entry[0] > SHEETS_CACHE_TTL:
-        async with _opps_cache_lock:
-            entry = _opps_cache.get(weeks)  # re-check: another task may have refetched
+        async with _sessions_cache_lock:
+            entry = _sessions_cache.get(weeks)  # re-check: another task may have refetched
             if entry is None or time.monotonic() - entry[0] > SHEETS_CACHE_TTL:
                 try:
-                    opps = await fetch_opps(weeks)
+                    sessions = await fetch_sessions(weeks)
                 except SheetsError:
                     if entry is not None:
-                        log.warning("Sheets refetch failed — serving cached opportunities.")
-                        return _fresh_opps(entry[1])
+                        # Re-stamp the stale entry to a short retry instead of
+                        # leaving it expired: otherwise every /sheets and every 🚫
+                        # press re-dials a dead host while holding this lock, and
+                        # the whole club queues behind one HTTP timeout.
+                        log.warning("Sheets refetch failed — serving cached sessions.")
+                        _sessions_cache[weeks] = (
+                            time.monotonic() - SHEETS_CACHE_TTL + SHEETS_RETRY_SECONDS,
+                            entry[1])
+                        return _fresh_sessions(entry[1])
                     raise
-                entry = (time.monotonic(), opps)
-                _opps_cache[weeks] = entry
-    return _fresh_opps(entry[1])
+                entry = (time.monotonic(), sessions)
+                _sessions_cache[weeks] = entry
+    return _fresh_sessions(entry[1])
+
+
+async def current_opportunities(weeks: int) -> list[dict]:
+    """The practice-ice rows as they stand right now: cached sessions from the
+    calendar/forms/leagues, plus every live manual block, run through the same
+    overlap arithmetic. Blocks are applied here (not inside the cache) so placing
+    one shows up on the very next render."""
+    return [o for o in await current_sessions_annotated(weeks) if pi.should_show(o)]
+
+
+async def current_sessions_annotated(weeks: int) -> list[dict]:
+    """Every session in the window with its free-sheet count attached, INCLUDING
+    the ones the display rules hide. current_opportunities is the subset members
+    see; this is the subset the bot has to reason about."""
+    sessions = await fetch_sessions_cached(weeks)
+    async with _block_lock:
+        if bs.expire(_block_state, now_club(), BLOCK_GRACE_HOURS):
+            bs.save(BLOCK_STORE_PATH, _block_state)
+        blocks = bs.as_sessions(_block_state)
+    return pi.annotate(sessions + blocks, TOTAL_SHEETS)
+
+
+async def current_sessions_annotated_safe(weeks: int) -> list[dict]:
+    try:
+        return await current_sessions_annotated(weeks)
+    except SheetsError:
+        log.warning("Couldn't recompute sessions after a block change.")
+        return []
+
+
+async def current_opportunities_safe(weeks: int) -> list[dict]:
+    """current_opportunities, but a fetch failure yields [] instead of raising —
+    for the paths (block announcements, board refreshes) where a hiccup upstream
+    must not take down the action the member just performed."""
+    try:
+        return await current_opportunities(weeks)
+    except SheetsError:
+        log.warning("Couldn't recompute opportunities after a block change.")
+        return []
 
 
 async def build_sheets_payload(weeks: int, user) -> tuple[discord.Embed, discord.ui.View | None]:
     """Build the (ephemeral) practice-ice embed + sign-up view for a member."""
-    opps = await fetch_opps_cached(weeks)
+    opps = await current_opportunities(weeks)
 
     # Register each session and snapshot sign-up counts under the lock. Sessions are
     # keyed by start minute, so two opportunities at the same time share ONE sign-up
@@ -516,7 +590,7 @@ async def build_sheets_payload(weeks: int, user) -> tuple[discord.Embed, discord
     # custom_id, which Discord rejects with 50035 "custom id cannot be duplicated").
     async with _practice_lock:
         ps.expire(_practice_state, now_club())
-        keyed, seen_keys = [], set()
+        keyed, seen_keys, capped = [], set(), 0
         for o in opps:
             key = session_key(o)
             if key in seen_keys:
@@ -528,6 +602,7 @@ async def build_sheets_payload(weeks: int, user) -> tuple[discord.Embed, discord
             keyed.append((o, key, ps.count(_practice_state, key),
                           ps.is_signed_up(_practice_state, key, user.id)))
             if len(keyed) >= MAX_SIGNUP_BUTTONS:
+                capped = len({session_key(x) for x in opps}) - len(keyed)
                 break
         ps.save(PRACTICE_STORE_PATH, _practice_state)
 
@@ -535,9 +610,15 @@ async def build_sheets_payload(weeks: int, user) -> tuple[discord.Embed, discord
     if not opps:
         embed.description = "🔴  No sheets free during the upcoming practice window."
         embed.set_footer(text="Only you can see this · source: calendar + Gravity Forms + leagues")
-        return embed, None
+        # Still offer the block menu: with nothing listed, the manual-entry path is
+        # the only way to record ice that got reserved off the calendar — and the
+        # release menu is how a block placed in error gets undone.
+        empty = discord.ui.View(timeout=None)
+        empty.add_item(BlockSheetsButton(weeks))
+        return embed, empty
 
     lines, view = [], discord.ui.View(timeout=None)
+    used, dropped = 0, 0
     for o, key, n, mine in keyed:
         line = pi.format_opportunity(o, TOTAL_SHEETS)[1]
         line += f"\n    🧹 **{n}** signed up to practice" + (" · you're in" if mine else "")
@@ -546,12 +627,31 @@ async def build_sheets_payload(weeks: int, user) -> tuple[discord.Embed, discord
         full = o.get("free", 0) <= 0
         if full and not mine:
             line += "\n    ⛔ no open ice — sign-up closed for this slot"
+        # Discord hard-rejects an embed description over 4096 characters, and
+        # discord.py doesn't check — it just 400s, leaving the member on a
+        # permanent "thinking…" with the 🚫 menu (the only way to UNDO a block)
+        # stuck behind the failed render. Blocks add lines per row, so the
+        # headroom that used to be comfortable no longer is. Drop whole slots
+        # rather than risk it, and say so.
+        if used + len(line) + 2 > MAX_EMBED_DESCRIPTION:
+            dropped += 1
+            continue
+        used += len(line) + 2
         lines.append(line)
         if mine or not full:
             view.add_item(JoinPracticeButton(key, weeks, o["start"], n, mine))
+    # Slots left out for either reason — the component cap or the description
+    # budget — are reported together; two separate tallies would each under-count.
+    dropped += capped
+    if dropped:
+        lines.append(f"…and {dropped} more slot{'s' if dropped != 1 else ''} — "
+                     "run `/sheets` with a smaller `weeks` to see them.")
     embed.description = "\n\n".join(lines)
-    embed.set_footer(text="Tap a slot to sign up · only you can see this report")
-    return embed, (view if view.children else None)
+    # Sits last, after the slot buttons (20 of those at most, so this stays inside
+    # Discord's 25-component cap).
+    view.add_item(BlockSheetsButton(weeks))
+    embed.set_footer(text="Tap a slot to sign up · 🚫 to hold ice that's booked off the calendar")
+    return embed, view
 
 
 def _ordinal(n: int) -> str:
@@ -663,8 +763,10 @@ async def bump_practice_board(channel):
 
 async def render_practice_board(target_channel=None):
     """Edit the existing board in place (no repost); if it's gone, or none exists and
-    a `target_channel` is given, (re)post one. Used on boot. Sign-ups use
-    bump_practice_board so the update surfaces at the bottom of the channel."""
+    a `target_channel` is given, (re)post one. Used on boot, and by the block flow
+    (which passes the board's OWN channel — see _board_channel — so a block never
+    relocates it). Sign-ups use bump_practice_board so the update surfaces at the
+    bottom of the channel."""
     async with _practice_lock:
         ps.expire(_practice_state, now_club())
         embed = build_practice_board_embed()
@@ -799,7 +901,8 @@ class JoinPracticeButton(discord.ui.DynamicItem[discord.ui.Button],
                 place = f"{'tied for ' if tied else ''}{_ordinal(rank)} longest in the club"
                 note += f" That's a **{streak}-week** practice streak — {place}! 🔥"
             try:
-                await interaction.channel.send(note)
+                await interaction.channel.send(
+                    note, allowed_mentions=discord.AllowedMentions.none())
             except discord.HTTPException:
                 pass
 
@@ -807,6 +910,506 @@ class JoinPracticeButton(discord.ui.DynamicItem[discord.ui.Button],
             (f"🧹  You're signed up for **{label}** — the channel board's updated." if result == "joined"
              else f"👍  Removed you from practice on **{label}**."),
             ephemeral=True)
+
+
+# ── Blocking sheets ───────────────────────────────────────────────────────────
+# Ice gets reserved off the books: a board member books a Learn-to-Curl by hand,
+# a group reserves sheets at the rink, money changes hands and nothing lands on
+# the club calendar or in Gravity Forms. /sheets keeps reporting that ice as free
+# and members turn up to sheets that are already taken.
+#
+# A block is the manual patch: "hold N sheets during this window, and here's who
+# did it and what for". Anyone in the server can place one — the club runs on
+# trust and whoever's at the rink is usually the one who knows — so every block
+# is announced in the channel with its owner's name, and any of them can be
+# released from the same menu. Blocks age out on their own once the ice is past.
+
+BLOCK_OTHER = "__other__"
+
+
+def _releasable_blocks() -> list[dict]:
+    """Blocks a member can still let go of. Deliberately matched to what
+    current_opportunities still SUBTRACTS — which is anything inside
+    BLOCK_GRACE_HOURS of ending, not merely anything still running. Using
+    `now` here instead left a window where a just-ended block was still eating
+    sheets on the report with nothing in the menu to release. Call under
+    _block_lock."""
+    return [b for b in bs.active(_block_state, now_club() - timedelta(hours=BLOCK_GRACE_HOURS))
+            if b.get("id")]   # no id, no select value — see block_store.load
+
+
+def _opt_text(text: str, limit: int = 100) -> str:
+    """Discord rejects a select option whose label or description runs past 100
+    characters, which would fail the whole message render."""
+    text = (text or "").strip()
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def slot_label(opp: dict) -> str:
+    """'Sun Aug 23 · 1:30 PM · Practice' — the row as the block menu names it."""
+    return (f"{opp['start'].strftime('%a %b %-d')} · "
+            f"{opp['start'].strftime('%-I:%M %p')} · {opp.get('type', 'Ice')}")
+
+
+class BlockSlotSelect(discord.ui.Select):
+    def __init__(self, opps: list[dict], selected, row: int = 0):
+        seen, opts = set(), []
+        for o in opps:
+            key = session_key(o)
+            if key in seen:   # two rows can share a start minute; one option each
+                continue
+            seen.add(key)
+            free = o.get("free", 0)
+            opts.append(discord.SelectOption(
+                label=_opt_text(slot_label(o)),
+                value=key,
+                description=_opt_text(f"{free} of {TOTAL_SHEETS} sheets free"
+                                      + (f" · {o['title']}" if o.get("title") else "")),
+                default=(key == selected),
+            ))
+            if len(opts) >= 24:   # leave room for the manual-entry option below
+                break
+        opts.append(discord.SelectOption(
+            label="Other date/time…", value=BLOCK_OTHER, emoji="🗓",
+            description="Ice that isn't listed above",
+            default=(selected == BLOCK_OTHER),
+        ))
+        super().__init__(placeholder="Which ice is being taken?…", min_values=1,
+                         max_values=1, options=opts, row=row)
+
+    async def callback(self, interaction: discord.Interaction):
+        flow: "BlockFlowView" = self.view
+        if self.values[0] == BLOCK_OTHER:
+            # Straight to the modal — a slot we don't know about has no free count
+            # to reason about, so there's nothing else to pick first.
+            # The picker is deliberately left LIVE: View.stop() deregisters it, so
+            # anyone who hits Cancel on the modal (common) would come back to a
+            # menu whose every control answers "This interaction failed".
+            await interaction.response.send_modal(ManualBlockModal(flow.weeks, flow))
+            return
+        flow.slot_key = self.values[0]
+        await flow.refresh(interaction)
+
+
+class BlockCountSelect(discord.ui.Select):
+    def __init__(self, selected: int, opp: dict | None, row: int = 1):
+        free = (opp or {}).get("free", TOTAL_SHEETS)
+        opts = []
+        for n in range(1, min(TOTAL_SHEETS, 25) + 1):   # 25 = Discord's option cap
+            left = max(0, free - n)
+            opts.append(discord.SelectOption(
+                label=f"Block {n} sheet{'s' if n > 1 else ''}",
+                value=str(n),
+                description=(f"leaves {left} free" if n <= free
+                             else "more than that slot has free"),
+                default=(n == selected),
+            ))
+        super().__init__(placeholder="How many sheets…", min_values=1, max_values=1,
+                         options=opts, row=row)
+
+    async def callback(self, interaction: discord.Interaction):
+        self.view.sheets = int(self.values[0])
+        await self.view.refresh(interaction)
+
+
+class BlockConfirmButton(discord.ui.Button):
+    def __init__(self, row: int = 2):
+        super().__init__(label="Block it", emoji="🚫",
+                         style=discord.ButtonStyle.danger, row=row)
+
+    async def callback(self, interaction: discord.Interaction):
+        flow: "BlockFlowView" = self.view
+        opp = flow.slot()
+        if opp is None:
+            await interaction.response.send_message(
+                "That slot isn't on the report any more — reopen 🚫 Block sheets.",
+                ephemeral=True)
+            return
+        await interaction.response.send_modal(
+            BlockReasonModal(flow.weeks, opp["start"], opp["end"], flow.sheets, flow))
+
+
+class ReleaseBlockSelect(discord.ui.Select):
+    def __init__(self, blocks: list[dict], row: int = 3):
+        opts = [
+            discord.SelectOption(
+                label=_opt_text(bs.describe(b, with_who=False)),
+                value=b["id"],
+                description=_opt_text(f"blocked by {b.get('name') or 'someone'}"),
+            )
+            for b in blocks[:25] if b.get("id")
+        ]
+        super().__init__(placeholder="…or release a block", min_values=1,
+                         max_values=1, options=opts, row=row)
+
+    async def callback(self, interaction: discord.Interaction):
+        flow: "BlockFlowView" = self.view
+        block_id = self.values[0]
+        async with _block_lock:
+            block = bs.release(_block_state, block_id)
+            if block is not None:
+                bs.save(BLOCK_STORE_PATH, _block_state)
+            flow.blocks = _releasable_blocks()
+        flow.status = ("That block was already gone." if block is None
+                       else f"♻️  Released: {bs.describe(block)}")
+        # Answer by editing the picker itself, so it stays live and its release
+        # list is immediately correct. Announcing afterwards is fine — the
+        # interaction is already acknowledged, and followups have 15 minutes.
+        await interaction.response.edit_message(content=flow.prompt(), view=flow.build())
+        if block is None:
+            return
+        who = (block.get("name") or "someone").strip()
+        mine = block.get("user_id") == interaction.user.id
+        whose = "their own block" if mine else f"**{who}**'s block"
+        n = int(block.get("sheets", 0))
+        note = (f"♻️  **{interaction.user.display_name}** released {whose} — "
+                f"**{n} sheet{'s' if n != 1 else ''}** back on "
+                f"**{bs.window_text(block)}**.")
+        await _publish_block_change(interaction, flow.weeks, note)
+
+
+class BlockFlowView(discord.ui.View):
+    """Ephemeral picker: which slot → how many sheets → why. Plus a release menu
+    when anything is currently blocked, so one 🚫 button covers both directions."""
+
+    def __init__(self, weeks: int, opps: list[dict], blocks: list[dict]):
+        # Long enough to open the modal, type a reason and submit. A modal itself
+        # is untimed, so retire()/on_timeout have to cope with it outlasting this.
+        super().__init__(timeout=300)
+        self.weeks = weeks
+        self.opps = opps
+        self.blocks = blocks
+        self.slot_key = None
+        self.sheets = 1
+        self.message = None
+        self.status = ""
+        self.build()
+
+    def slot(self) -> dict | None:
+        return next((o for o in self.opps if session_key(o) == self.slot_key), None)
+
+    def build(self) -> "BlockFlowView":
+        self.clear_items()
+        self.add_item(BlockSlotSelect(self.opps, self.slot_key, row=0))
+        if self.slot() is not None:
+            self.add_item(BlockCountSelect(self.sheets, self.slot(), row=1))
+            self.add_item(BlockConfirmButton(row=2))
+        if self.blocks:
+            self.add_item(ReleaseBlockSelect(self.blocks, row=3))
+        return self
+
+    def prompt(self) -> str:
+        lines = ["🚫  **Block out sheets** — hold ice that's booked outside the calendar."]
+        opp = self.slot()
+        if opp is None:
+            lines.append("Pick the session the ice comes out of, or **Other date/time…** "
+                         "if it isn't listed.")
+        else:
+            free = opp.get("free", 0)
+            left = max(0, free - self.sheets)
+            lines.append(f"Slot: **{slot_label(opp)}** — {free} free now")
+            lines.append(f"Blocking **{self.sheets}** → **{left}** sheet"
+                         f"{'s' if left != 1 else ''} left for practice.")
+            lines.append("Press **Block it** to say what it's for.")
+        if self.blocks:
+            lines.append("\nCurrently blocked:")
+            lines += [f"· {bs.describe(b)}" for b in self.blocks[:5]]
+        if self.status:
+            lines.append(f"\n{self.status}")
+        return "\n".join(lines)
+
+    async def refresh(self, interaction: discord.Interaction):
+        self.status = ""   # a one-shot note about the last action, not a fixture
+        await interaction.response.edit_message(content=self.prompt(), view=self.build())
+
+    async def retire(self, status: str) -> None:
+        """Re-render the picker after a block landed: clear the chosen slot (so the
+        confirm button goes away), refresh the release list, and say what happened.
+
+        A modal has no timeout of its own, so a member can sit on it past this
+        view's 300 seconds. By then on_timeout has greyed the controls out and the
+        view is deregistered — rebuilding here would put fresh, ENABLED controls on
+        a message Discord will no longer route, which is exactly the dead-but-
+        live-looking menu the timeout handler exists to prevent."""
+        if self.is_finished():
+            return
+        self.slot_key = None
+        self.status = status
+        async with _block_lock:
+            self.blocks = _releasable_blocks()
+        self.build()   # rebuild first: the view's own state must be right even if
+        if self.message is None:   # we never got a message handle to push it to
+            return
+        try:
+            await self.message.edit(content=self.prompt(), view=self)
+        except discord.HTTPException:
+            pass
+
+    async def on_timeout(self) -> None:
+        """Grey the controls out rather than leaving a menu that looks alive and
+        answers every click with "This interaction failed"."""
+        if self.message is None:
+            return
+        for child in self.children:
+            child.disabled = True
+        try:
+            await self.message.edit(content=self.prompt() +
+                                    "\n\n_Timed out — press 🚫 Block sheets again._",
+                                    view=self)
+        except discord.HTTPException:
+            pass
+
+
+class BlockReasonModal(discord.ui.Modal, title="Block out sheets"):
+    """Second half of the slot path: the when/how-many are already settled, so the
+    only thing left to ask is what the ice is for."""
+
+    reason = discord.ui.TextInput(
+        label="What's the ice for?", required=False, max_length=100,
+        placeholder="e.g. Learn-to-Curl (booked off the calendar)")
+
+    def __init__(self, weeks: int, start: datetime, end: datetime, sheets: int,
+                 flow: "BlockFlowView | None" = None):
+        super().__init__()
+        self.weeks, self.start, self.end, self.sheets = weeks, start, end, sheets
+        self.flow = flow
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        await finish_block(interaction, weeks=self.weeks, start=self.start,
+                           end=self.end, sheets=self.sheets, reason=str(self.reason),
+                           flow=self.flow)
+
+
+class ManualBlockModal(discord.ui.Modal, title="Block out sheets"):
+    """The off-calendar path: ice that no /sheets row covers. Five fields is
+    Discord's hard cap on a modal, which is exactly what this needs."""
+
+    date = discord.ui.TextInput(label="Date", max_length=30, placeholder="Aug 23 · 8/23 · tomorrow")
+    start = discord.ui.TextInput(label="Start time", max_length=20, placeholder="1:30 PM")
+    length = discord.ui.TextInput(label="How long?", max_length=20, placeholder="2h · 2.5 · 90m")
+    count = discord.ui.TextInput(label="How many sheets?", max_length=4, placeholder="2")
+    reason = discord.ui.TextInput(label="What's the ice for?", required=False,
+                                  max_length=100, placeholder="e.g. Learn-to-Curl")
+
+    def __init__(self, weeks: int, flow: "BlockFlowView | None" = None):
+        super().__init__()
+        self.weeks = weeks
+        self.flow = flow
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        try:
+            start, end, sheets = bs.parse_manual(
+                str(self.date), str(self.start), str(self.length), str(self.count),
+                now=now_club(), total=TOTAL_SHEETS)
+        except ValueError as ex:
+            # Self-authored message about their own typing — safe to echo.
+            await interaction.edit_original_response(content=f"⚠️  {ex}")
+            return
+        await finish_block(interaction, weeks=self.weeks, start=start, end=end,
+                           sheets=sheets, reason=str(self.reason), flow=self.flow)
+
+
+async def finish_block(interaction: discord.Interaction, *, weeks: int, start: datetime,
+                       end: datetime, sheets: int, reason: str,
+                       flow: "BlockFlowView | None" = None) -> None:
+    """Commit a block, tell the channel, and refresh what everyone else is looking at.
+    Both entry paths (slot picker and manual entry) land here."""
+    now = now_club()
+    block, error, repeat = None, None, False
+    # Placing a block isn't idempotent — two presses take two lots of ice. The
+    # picker is retired below once a block lands, but a member can open a second
+    # modal before the first submits, so debounce the identical block the way
+    # sign-ups debounce a double-tap. Keyed on the whole window, not just the
+    # start, so two same-start blocks of different lengths don't collide.
+    key = (interaction.user.id, start.isoformat(), end.isoformat(), sheets)
+    async with _block_lock:
+        repeat = _is_repeat_click(_block_cooldown, key)
+        if not repeat:
+            bs.expire(_block_state, now, BLOCK_GRACE_HOURS)
+            try:
+                block = bs.add(_block_state, start=start, end=end, sheets=sheets,
+                               user_id=interaction.user.id,
+                               name=interaction.user.display_name,
+                               reason=reason, now=now)
+            except ValueError as ex:
+                error = str(ex)
+                # The cooldown is a guard against duplicate WORK, not against
+                # retrying: a member who fixes a rejected block and resubmits
+                # within three seconds must not be told it already exists.
+                _block_cooldown.pop(key, None)
+            # Saved either way: the expire() above mutated the store, and dropping
+            # that because the new block was rejected would resurrect stale holds.
+            bs.save(BLOCK_STORE_PATH, _block_state)
+
+    # Every reply below is an HTTP round trip, so all of them happen OUTSIDE the
+    # lock. Holding it across one would stall the next member's release — whose
+    # callback answers without deferring and so has only three seconds to ack.
+    if repeat:
+        await interaction.edit_original_response(
+            content="👍  Already blocked that — nothing else to do.")
+        return
+    if error is not None:
+        await interaction.edit_original_response(content=f"⚠️  {error}")
+        return
+
+    reason_txt = (reason or "").strip()
+    note = (f"🚫  **{interaction.user.display_name}** blocked "
+            f"**{sheets} sheet{'s' if sheets != 1 else ''}** — "
+            f"**{bs.fmt_window(start, end)}**"
+            + (f" · {reason_txt}" if reason_txt else "") + ".")
+    tail, mentions = await _block_impact(weeks, start, end, sheets)
+    note += tail
+    if mentions:
+        note += ("\n" + " ".join(f"<@{uid}>" for uid in mentions)
+                 + " — heads up, you're signed up to practice then.")
+    await _publish_block_change(interaction, weeks, note)
+    await interaction.edit_original_response(
+        content=f"🚫  Blocked {sheets} sheet{'s' if sheets != 1 else ''} for "
+                f"{bs.fmt_window(start, end)}. Everyone's /sheets report updates right "
+                "away — reopen 🚫 Block sheets to release it.")
+    # Retiring the picker is cosmetic — without it the "Block it" button sits
+    # there live, showing pre-block numbers — so it goes AFTER the confirmation
+    # the member is actually waiting on, and can't strand them if it fails.
+    if flow is not None:
+        await flow.retire(f"🚫  Blocked: {bs.describe(block, with_who=False)}")
+
+
+async def _block_impact(weeks: int, start: datetime, end: datetime,
+                        sheets: int) -> tuple[str, list[int]]:
+    """What the block did to the sessions it landed on: a sentence about the ice
+    left, plus the ids of anyone signed up to a session the block took to zero (the
+    one case where someone's plans just changed and they deserve a ping).
+
+    Measured over pi.annotate, NOT the displayed rows: a league draw that a block
+    pushes to 0 free used to drop out of the display entirely, so the block looked
+    like it had hit nothing and the people it stranded were never told."""
+    rows = await current_sessions_annotated_safe(weeks)
+    # Only sessions a block actually took ice from. Overlap alone isn't enough:
+    # a league already booked solid is at 0 free with or without the block, and
+    # counting it here made the bot announce "no free ice" (and ping that slot's
+    # sign-ups) for a slot the member's block never touched.
+    hit = [o for o in rows
+           if pi.overlaps(start, end, o["start"], o["end"])
+           and o.get("free", 0) < o.get("free_if_unblocked", 0)]
+    if not hit:
+        return "", []
+    free = min(o.get("free", 0) for o in hit)
+    # Ping only the people on sessions THIS block pushed to zero. Two filters:
+    # a long block can span a full slot and a half-empty one (the half-empty
+    # one's sign-ups don't need a "no free ice" alarm), and a slot someone else
+    # had already blocked solid was at zero before this block arrived — its
+    # sign-ups were told the first time and don't need telling again.
+    zeroed = [o for o in hit
+              if o.get("free", 0) <= 0 and o.get("free", 0) + sheets >= 1]
+    mentions: list[int] = []
+    if zeroed:
+        async with _practice_lock:
+            for o in zeroed:
+                for u in ps.signups(_practice_state, session_key(o)):
+                    if u["user_id"] not in mentions:
+                        mentions.append(u["user_id"])
+    if free > 0:
+        return f" {free} sheet{'s' if free != 1 else ''} still free there.", mentions
+    if not zeroed:
+        return " That slot had no free ice left anyway.", mentions
+    return " That leaves **no free ice** in that slot.", mentions
+
+
+async def _publish_block_change(interaction: discord.Interaction, weeks: int, note: str) -> None:
+    """Announce a block/release in the channel and resync the shared practice board.
+    A block silently changing everyone's numbers is the failure mode to avoid — the
+    whole point is that off-calendar ice becomes visible."""
+    await _resync_practice_sheets(weeks)
+    if interaction.channel is not None:
+        try:
+            # users=True and nothing else: the note deliberately @-mentions the
+            # people a block stranded, but the reason field is member-typed free
+            # text and must never be able to fire @everyone or a role ping.
+            await interaction.channel.send(
+                note, allowed_mentions=discord.AllowedMentions(
+                    everyone=False, roles=False, users=True))
+        except discord.HTTPException:
+            log.warning("Couldn't announce a block change in the channel.")
+    # Edit the board where it already lives rather than bump_practice_board, which
+    # REPOSTS it into whatever channel this interaction came from. Blocking is
+    # pitched as "do it from wherever you are", so moving the club's board to
+    # #general because someone blocked ice from their phone is the normal case,
+    # not an edge one. Passing the board's OWN channel (not this interaction's)
+    # lets it repost there if the message was deleted, instead of silently
+    # no-op-ing on every block from then on.
+    await render_practice_board(await _board_channel())
+
+
+async def _board_channel():
+    """The channel the practice board already lives in, or None if there's no board
+    yet. Used so a board refresh can heal a deleted message without relocating it."""
+    board = _practice_state.get("board")
+    if not board:
+        return None
+    try:
+        return bot.get_channel(board["channel_id"]) or await bot.fetch_channel(board["channel_id"])
+    except (discord.HTTPException, KeyError, TypeError):
+        return None
+
+
+async def _resync_practice_sheets(weeks: int) -> None:
+    """Refresh each pooled session's cached free-sheet count. The shared board reads
+    those numbers straight from the store, so without this it would keep advertising
+    sheets a block just took until someone happened to run /sheets."""
+    rows = await current_sessions_annotated_safe(weeks)
+    if not rows:
+        return
+    # Annotated sessions, not displayed rows: a slot the display rules now hide
+    # (a league blocked down to 0) still has a sign-up pool whose cached count
+    # would otherwise keep advertising ice that's gone.
+    # Two sessions can share a start minute and therefore a sign-up pool.
+    # build_sheets_payload registers the pool from the FIRST DISPLAYED row, so
+    # resolve the collision the same way here — last-wins would let a hidden
+    # 0-free row overwrite the shown row's real count on the public board.
+    by_key: dict[str, tuple] = {}
+    for o in rows:
+        key = session_key(o)
+        shown = pi.should_show(o)
+        prev = by_key.get(key)
+        if prev is None or (shown and not prev[1]):
+            by_key[key] = (o.get("free"), shown)
+    async with _practice_lock:
+        for key, (free, _shown) in by_key.items():
+            session = _practice_state["sessions"].get(key)
+            if session is not None:
+                session["sheets"] = free
+        ps.save(PRACTICE_STORE_PATH, _practice_state)
+
+
+class BlockSheetsButton(discord.ui.DynamicItem[discord.ui.Button],
+                        template=r"sheet:block:(?P<weeks>\d+)"):
+    """The 🚫 entry point on every /sheets report. Persistent, so it keeps working
+    on a report someone left open across a restart."""
+
+    def __init__(self, weeks: int):
+        self.weeks = int(weeks)
+        super().__init__(discord.ui.Button(
+            label="Block sheets", emoji="🚫",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"sheet:block:{int(weeks)}",
+        ))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["weeks"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        # New ephemeral message rather than editing the report in place — the report
+        # is the thing they're reading while they decide what to block.
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        opps = await current_opportunities_safe(self.weeks)
+        async with _block_lock:
+            blocks = _releasable_blocks()
+        flow = BlockFlowView(self.weeks, opps, blocks)
+        flow.message = await interaction.edit_original_response(
+            content=flow.prompt(), view=flow)
 
 
 # One bare command with optional flags (so bare `/sheets` still works): default is
