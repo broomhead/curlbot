@@ -179,21 +179,36 @@ check("games/select marks projected nights",
       {"not on the schedule yet"})
 
 # ── 2. Sub requests without teams ────────────────────────────────────────────
-# TeamSelect is usable even when the chair hasn't set teams.
+# Posting without a team is the answer to "the chair hasn't drafted yet", NOT a
+# general opt-out. So the option exists ONLY while the league lists no teams: once
+# it has them, a teamless record could never be matched against anything, and the
+# same spot posted twice would read as two asks and pull in two subs.
 ts_empty = subs.TeamSelect([], None)
 check("teamselect/no-teams enabled", ts_empty.disabled, False)
 check("teamselect/no-teams values", [o.value for o in ts_empty.options], [subs.NO_TEAM])
 ts_full = subs.TeamSelect(["Smith", "Alvarez"], None)
-check("teamselect/values", [o.value for o in ts_full.options],
-      ["Alvarez", "Smith", subs.NO_TEAM])
+check("teamselect/values", [o.value for o in ts_full.options], ["Alvarez", "Smith"])
+check("teamselect/no opt-out once teams exist", subs.NO_TEAM in [o.value for o in ts_full.options], False)
+check("teamselect/placeholder is not optional once teams exist",
+      "optional" in (ts_full.placeholder or "").casefold(), False)
 
-# The flow can post with a game but no team (and with neither — see 2b below).
+# A league with no teams posted: the flow is ready without one.
 flow = subs.NeedSubFlowView([THURS])
 check("flow/no league not ready", flow.ready(), False)
 flow.league_id = "26410"
 flow.game_isos = ["2026-08-20T19:45:00"]
 check("flow/teamless IS ready", flow.ready(), True)
-check("flow/prompt says not set", "Team: **not set**" in flow.prompt(), True)
+check("flow/prompt says not posted", "Team: **not posted yet**" in flow.prompt(), True)
+
+# The same league once its teams are up: the team is now required.
+THURS_TEAMED = dict(THURS, team_names=["Smith", "Alvarez"])
+tflow = subs.NeedSubFlowView([THURS_TEAMED])
+tflow.league_id = "26410"
+tflow.game_isos = ["2026-08-20T19:45:00"]
+check("flow/teamed not ready without a team", tflow.ready(), False)
+check("flow/teamed prompt asks for the team", "Pick your team" in tflow.prompt(), True)
+tflow.team = "Smith"
+check("flow/teamed ready with a team", tflow.ready(), True)
 flow.team = "Smith"
 check("flow/with team ready", flow.ready(), True)
 # A team select still renders when the league lists no teams.

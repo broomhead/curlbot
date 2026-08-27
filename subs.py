@@ -102,6 +102,11 @@ UNDATED_DAYS    = int(os.environ.get("SUBS_UNDATED_DAYS", str(store.DEFAULT_UNDA
 REMINDER_HOURS  = int(os.environ.get("SUBS_REMINDER_HOURS", "24"))
 # Sub rosters freeze this many minutes before tip-off — no more adds/removes/claims.
 LOCK_MINUTES    = int(os.environ.get("SUBS_LOCK_MINUTES", "30"))
+# How close to game time an AUTO-ASSIGNED go-to sub who still hasn't confirmed gets
+# chased (once). Longer than REMINDER_HOURS on purpose: an unconfirmed assignment
+# is the one case where the board looks covered and might not be, so it needs to
+# surface while there is still time to find someone else.
+ACK_HOURS       = int(os.environ.get("SUBS_ACK_HOURS", "48"))
 # Discord caps a message at 25 components: row 0 holds the four verbs, leaving 20
 # slots for the game buttons below. A RUN spends only one of them (see open_units),
 # so these two caps are no longer the same number — the embed can list far more
@@ -131,6 +136,12 @@ CID_TAKE_PREFIX = "sub:take:"
 CID_TAKE_RUN_PREFIX = "sub:takerun:"
 # A run's button that opens the night picker (board + alert page): "sub:pickrun:<sid>".
 CID_PICK_RUN_PREFIX = "sub:pickrun:"
+# A go-to sub acknowledging or dropping the dates they were auto-assigned, keyed by
+# the assignment batch: "sub:autook:<assign_id>" / "sub:autodrop:<assign_id>".
+CID_AUTO_OK_PREFIX   = "sub:autook:"
+CID_AUTO_DROP_PREFIX = "sub:autodrop:"
+# "Your league has teams now — which one is your spot on?", keyed by league id.
+CID_SET_TEAM_PREFIX  = "sub:setteam:"
 
 
 def club_now() -> datetime:
@@ -593,7 +604,11 @@ def _req_for(req: dict) -> str:
 def _req_status_line(req: dict) -> str:
     needed = int(req["spots_needed"])
     covered = needed - store.open_spots(req)
-    names = [f["name"] for f in req.get("filled", [])]
+    # An auto-assigned go-to sub who hasn't acknowledged yet is shown as such: the
+    # spot IS covered, but nobody has heard from them, and a board that hides that
+    # is how a team turns up three-handed.
+    names = [f["name"] + (" (unconfirmed)" if f.get("auto") and not f.get("confirmed") else "")
+             for f in req.get("filled", [])]
     names += [f"{p['name']} (pending)" for p in req.get("pending", [])]
     who = ", ".join(names) if names else "nobody yet"
     return f"{INDENT}{_req_icon(req)} {_req_for(req)} — {covered}/{needed} · {who}"
@@ -998,7 +1013,8 @@ class FillForView(discord.ui.View):
         u = self.unit()
         if u:
             if u["kind"] == "run":
-                self.add_item(NightSelect(u["reqs"], self.rids, row=1))
+                self.add_item(NightSelect(u["reqs"], self.rids, row=1,
+                                          placeholder="Dates they're covering…"))
             self.add_item(FillForMemberSelect(self.member, row=2))
             self.add_item(FillForSubmitButton(self.member, len(self.rids), row=3))
         return self
@@ -1343,9 +1359,16 @@ NO_TEAM = "__noteam__"
 
 
 class TeamSelect(discord.ui.Select):
-    """Team is OPTIONAL. Chairs often don't lock in teams until a day or two before
-    the first draw, but people need to line up subs before that — so a request can
-    always be posted as "this person needs a sub" with no team attached."""
+    """The team whose spot needs filling.
+
+    Required WHENEVER the league has teams, and optional only while it doesn't. A
+    chair often hasn't drafted teams a week before the first draw, and people line up
+    week-1 subs before that — so a teamless request stays possible, but strictly as
+    the answer to "there is nothing to pick yet". Once the teams are up, offering
+    "no team" would just keep minting records that can't be matched against anything:
+    two requests for the same team on the same draw look like two different asks, and
+    two subs turn up. (Teamless ones already posted are reconciled by the nudge in
+    Subs.team_reconcile_loop.)"""
 
     def __init__(self, names: list[str], selected, row: int = 1):
         # Only teams the system knows about — no free-typing. Alphabetized.
@@ -1354,14 +1377,15 @@ class TeamSelect(discord.ui.Select):
             for n in sorted(names, key=str.casefold)[:24]
         ])
         no_teams_yet = not opts
-        opts.append(discord.SelectOption(
-            label=("Teams aren't set yet — post without one" if no_teams_yet else "No team / not sure"),
-            value=NO_TEAM,
-            description="Posts as “needs a sub”, no team named",
-            default=(selected == ""),
-        ))
+        if no_teams_yet:
+            opts.append(discord.SelectOption(
+                label="Teams aren't set yet — post without one",
+                value=NO_TEAM,
+                description="Posts as “needs a sub”, no team named",
+                default=(selected == ""),
+            ))
         super().__init__(
-            placeholder=("Teams aren't set yet — optional" if no_teams_yet else "Your team… (optional)"),
+            placeholder=("Teams aren't set yet — optional" if no_teams_yet else "Which team…"),
             min_values=1, max_values=1, options=opts, row=row)
 
     async def callback(self, interaction: discord.Interaction):
@@ -1496,13 +1520,23 @@ class NeedSubFlowView(discord.ui.View):
         return _find_open_duplicate(self.state, self.league_id, d[0], self.team or "",
                                     requester_id=self.requester_id)
 
+    def league_has_teams(self) -> bool:
+        lg = self.league()
+        return bool(lg and (lg.get("team_names") or []))
+
     def ready(self) -> bool:
         # League + at least one date. WHEN you need a sub is the point of the request,
         # so a date is never optional — for an unscheduled league the picker projects
         # real league dates off the title's start date rather than letting the request
-        # go out dateless (see projected_games). Only the TEAM is optional, since
-        # chairs set teams late.
-        return self.league() is not None and bool(self.dates())
+        # go out dateless (see projected_games).
+        #
+        # The team is required too, EXCEPT while the league has no teams to pick from
+        # (see TeamSelect). That exception is what keeps week-1 subbing possible; it is
+        # not a general "team optional" rule.
+        lg = self.league()
+        if lg is None or not self.dates():
+            return False
+        return bool(self.team) or not self.league_has_teams()
 
     # -- rendering ----------------------------------------------------------
     def build(self) -> "NeedSubFlowView":
@@ -1534,7 +1568,11 @@ class NeedSubFlowView(discord.ui.View):
         d = self.dates()
         ex = self.existing()
         parts = [f"League: **{league_label(lg)}**"]
-        parts.append(f"Team: **{self.team}**" if self.team else "Team: **not set**")
+        if self.team:
+            parts.append(f"Team: **{self.team}**")
+        else:
+            parts.append("Team: **not posted yet**" if not self.league_has_teams()
+                         else "Team: **not set**")
         parts.append(f"When: **{fmt_run(d)}**" if d else "When: **not set**")
         parts.append(f"Spots: **{self.spots}**" + (" a date" if len(d) > 1 else ""))
         head = "**Need a sub** — " + " · ".join(parts)
@@ -1546,8 +1584,10 @@ class NeedSubFlowView(discord.ui.View):
                            f"of spots you need and press **Update spots**; whoever's already "
                            f"on it keeps their place.")
         if not self.ready():
-            return (head + "\nPick the date — tick as many as you need. The team is optional "
-                           "if it isn't set yet.")
+            if self.league_has_teams() and not self.team:
+                return head + "\nPick your team and the date — tick as many dates as you need."
+            return (head + "\nPick the date — tick as many as you need. This league's teams "
+                           "aren't posted yet, so the team can wait.")
         if len(d) > 1:
             return head + f"\nPress **Post {len(d)} dates** — each one goes up as its own request."
         return head + "\nPress **Post request**."
@@ -1640,11 +1680,19 @@ class PostNeedButton(discord.ui.Button):
         if skipped:
             bits.append(f"({skipped} date{'s' if skipped != 1 else ''} already had an open "
                         f"request — left alone.)")
-        bits.append("Anyone available has been tagged. If you already know who's covering "
-                    "them, hit **Fill for someone** on the alert."
-                    if len(dates) > 1 else
-                    "It's on the board — anyone available has been tagged and can hit "
-                    "**I'll take it**.")
+        if filled:
+            # The team has a go-to sub, so nothing was asked of the room.
+            goto = store.standing_for(cog.state, f.league_id or "", f.team or "")
+            who = first_name(goto[0]["name"]) if goto else "your team's go-to sub"
+            bits.append(f"**{who}** is the go-to for {f.team} and has been put on "
+                        f"{filled} of {'them' if len(dates) > 1 else 'it'} — "
+                        f"they've been asked to confirm.")
+        if filled < len(dates):
+            bits.append("Anyone available has been tagged. If you already know who's covering "
+                        "them, hit **Fill for someone** on the alert."
+                        if len(dates) > 1 else
+                        "It's on the board — anyone available has been tagged and can hit "
+                        "**I'll take it**.")
         await interaction.edit_original_response(content=" ".join(bits), view=None)
 
 
@@ -1784,6 +1832,22 @@ def _availability_for_request(state: dict, req: dict | None) -> list[dict]:
     return out
 
 
+def _standing_for_request(state: dict, req: dict | None) -> list[dict]:
+    """The go-to subs for THIS request's league + team, first up first — the people an
+    alert should tag ahead of the general availability list.
+
+    Excludes anyone already on it (the top go-to is normally auto-assigned, so an
+    alert usually only exists because they dropped it or the team needs more than
+    one), the requester, and anyone who has already declined this particular date."""
+    if not req:
+        return []
+    declined = set(req.get("auto_declined") or [])
+    return [g for g in store.standing_for(state, req.get("league_id", ""), req.get("team", ""))
+            if g["user_id"] not in declined
+            and g["user_id"] != req.get("requester_id")
+            and not store.is_involved(req, g["user_id"])]
+
+
 def _my_requests(state: dict, uid: int) -> list[dict]:
     return [r for r in store.requests_sorted(state) if r.get("requester_id") == uid]
 
@@ -1921,17 +1985,22 @@ class NightSelect(discord.ui.Select):
     mutation downstream takes a request id, so resolving it here means nothing has to
     match dates back to records later. Only open, unlocked nights are ever offered."""
 
-    def __init__(self, reqs: list[dict], selected_rids, row: int = 0):
+    def __init__(self, reqs: list[dict], selected_rids, row: int = 0, *,
+                 placeholder: str, description_of=None):
+        # `placeholder` and `description_of` are the CALLER's: this select now serves
+        # someone taking dates, someone dropping dates they were assigned, and someone
+        # attaching a team to dates they posted. "3 open" is only true of the first.
+        describe = description_of or (lambda r: f"{store.open_spots(r)} open")
         opts = _unique_options([
             discord.SelectOption(
                 label=_truncate(fmt_when(r["game_ts"]), 100),
                 value=r["id"],
-                description=_truncate(f"{store.open_spots(r)} open", 100),
+                description=_truncate(describe(r) or "", 100) or None,
                 default=(r["id"] in (selected_rids or [])),
             )
             for r in reqs[:25]
         ])
-        super().__init__(placeholder="Which dates…", min_values=1,
+        super().__init__(placeholder=placeholder, min_values=1,
                          max_values=len(opts), options=opts, row=row)
 
     async def callback(self, interaction: discord.Interaction):
@@ -1984,7 +2053,8 @@ class NightPickView(discord.ui.View):
         self.clear_items()
         ns = self.nights()
         if ns:
-            self.add_item(NightSelect(ns, self.rids, row=0))
+            self.add_item(NightSelect(ns, self.rids, row=0,
+                                      placeholder="Which dates…"))
             self.add_item(TakeNightsButton(len(self.rids), row=1))
         return self
 
@@ -2069,6 +2139,503 @@ class SeriesClaimButton(discord.ui.DynamicItem[discord.ui.Button],
 
 # ── The cog ─────────────────────────────────────────────────────────────────
 
+# ── Go-to subs: the auto-assignment handshake ───────────────────────────────
+# A go-to sub doesn't claim a spot, they're put on it. That's the point — the team
+# gets coverage the moment they ask, without waiting for anyone to notice an alert.
+# The cost is that a name lands on a game its owner hasn't seen, so every assignment
+# is followed by a DM they can answer in one tap: Confirm, or drop the dates they
+# can't make. Dropping reopens exactly those dates and alerts the room, and is
+# remembered per date so nothing quietly puts them back on.
+
+
+class AutoAssignView(discord.ui.View):
+    """What a freshly auto-assigned go-to sub gets in their DM."""
+
+    def __init__(self, assign_id: str, count: int):
+        super().__init__(timeout=None)
+        self.add_item(ConfirmAutoButton(assign_id, count=count))
+        self.add_item(DropAutoButton(assign_id, count=count))
+
+
+class ConfirmAutoButton(discord.ui.DynamicItem[discord.ui.Button],
+                        template=r"sub:autook:(?P<aid>[0-9a-f]+)"):
+    """Acknowledge an auto-assignment. Confirming doesn't change who's on the spot —
+    they're already on it — it only stops the T-minus chase, which is the whole
+    difference between "covered" and "we think it's covered"."""
+
+    def __init__(self, aid: str, *, count: int = 1):
+        self.aid = aid
+        super().__init__(discord.ui.Button(
+            label=("Confirm" if count <= 1 else f"Confirm all {count}"),
+            emoji="\u2705", style=discord.ButtonStyle.success,
+            custom_id=f"{CID_AUTO_OK_PREFIX}{aid}"))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match["aid"])
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        cog: "Subs" = interaction.client.get_cog("Subs")
+        confirmed = await cog.confirm_auto(interaction.user, self.aid)
+        if not confirmed:
+            await interaction.followup.send(
+                "Nothing left to confirm there — those dates have already been "
+                "confirmed, dropped or played.", ephemeral=True)
+            return
+        await interaction.followup.send(
+            f"\u2705  Confirmed \u2014 you're down for **{fmt_run(confirmed)}**. "
+            "If something changes, hit **I can't make some** or use **\u2716\ufe0f Remove** "
+            "on the board.", ephemeral=True)
+
+
+class DropAutoButton(discord.ui.DynamicItem[discord.ui.Button],
+                     template=r"sub:autodrop:(?P<aid>[0-9a-f]+)"):
+    """Opens the picker for dropping assigned dates. Never drops on the tap itself:
+    an arrangement is many dates and "I can't make one of them" is the common case."""
+
+    def __init__(self, aid: str, *, count: int = 1):
+        self.aid = aid
+        super().__init__(discord.ui.Button(
+            label=("I can't make it" if count <= 1 else "I can't make some\u2026"),
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"{CID_AUTO_DROP_PREFIX}{aid}"))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match["aid"])
+
+    async def callback(self, interaction: discord.Interaction):
+        cog: "Subs" = interaction.client.get_cog("Subs")
+        view = AutoDropView(cog.state, self.aid, interaction.user.id)
+        await interaction.response.send_message(
+            content=view.prompt(), view=view if view.dates() else None, ephemeral=True)
+
+
+class AutoDropView(discord.ui.View):
+    """Which of the dates you were assigned you can't make. Nothing starts ticked —
+    the default answer to "can you still do these" is yes."""
+
+    def __init__(self, state: dict, aid: str, user_id: int):
+        super().__init__(timeout=300)
+        self.state = state
+        self.aid = aid
+        self.user_id = user_id
+        self.rids: list[str] = []
+        self.build()
+
+    def dates(self) -> list[dict]:
+        return [r for r in store.requests_sorted(self.state)
+                if not is_locked(r)
+                and (store.auto_entry(r, self.user_id) or {}).get("auto") == self.aid]
+
+    def build(self) -> "AutoDropView":
+        self.clear_items()
+        ds = self.dates()
+        if ds:
+            self.add_item(NightSelect(ds, self.rids, row=0,
+                                      placeholder="Dates you can't make\u2026",
+                                      description_of=lambda r: _req_for(r)))
+            self.add_item(AutoDropSubmit(len(self.rids), row=1))
+        return self
+
+    def prompt(self) -> str:
+        ds = self.dates()
+        if not ds:
+            return ("Nothing there to drop \u2014 those dates have already been dropped, "
+                    "played, or are too close to game time to change.")
+        head = f"**{_req_for(ds[0])}** \u00b7 you're assigned to {fmt_run([r['game_ts'] for r in ds])}\n"
+        return head + ("Tick the ones you can't make, then press the button. Each one "
+                       "reopens on its own \u2014 the rest stay yours.")
+
+    async def refresh(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(content=self.prompt(), view=self.build())
+
+
+class AutoDropSubmit(discord.ui.Button):
+    def __init__(self, count: int, row: int = 1):
+        super().__init__(label=(f"Drop {count} date{'s' if count != 1 else ''}"
+                                if count else "Drop"),
+                         emoji="\u21a9\ufe0f", style=discord.ButtonStyle.danger,
+                         row=row, disabled=not count)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        view: "AutoDropView" = self.view
+        cog: "Subs" = interaction.client.get_cog("Subs")
+        if cog._is_repeat_click(cog._click_cooldown,
+                                ("autodrop", interaction.user.id, tuple(sorted(view.rids)))):
+            return
+        dropped = await cog.drop_auto(interaction.user, view.rids)
+        if not dropped:
+            await interaction.edit_original_response(
+                content="Nothing changed \u2014 those dates were already off your plate.",
+                view=None)
+            return
+        await interaction.edit_original_response(
+            content=(f"\u21a9\ufe0f  Dropped **{fmt_run(dropped)}**. Those dates are back on "
+                     "the board and the room has been alerted \u2014 you won't be put on them "
+                     "again. Everything else is still yours."),
+            view=None)
+
+
+# ── "Your league has teams now" \u2014 attaching a team after the fact ────────────
+
+
+class SetTeamButton(discord.ui.DynamicItem[discord.ui.Button],
+                    template=r"sub:setteam:(?P<lid>[0-9]+)"):
+    """From the nudge DM. Resolves the caller's teamless requests in that league at
+    CLICK time rather than from the id, so anything they posted since the nudge went
+    out is included and anything since covered or played is not."""
+
+    def __init__(self, lid: str, *, count: int = 0):
+        self.lid = lid
+        super().__init__(discord.ui.Button(
+            label=("Set my team" if count <= 1 else f"Set my team on {count} dates"),
+            emoji="\U0001f3f7\ufe0f", style=discord.ButtonStyle.primary,
+            custom_id=f"{CID_SET_TEAM_PREFIX}{lid}"))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match["lid"])
+
+    async def callback(self, interaction: discord.Interaction):
+        cog: "Subs" = interaction.client.get_cog("Subs")
+        league = next((l for l in await cog.get_leagues()
+                       if str(l["id"]) == str(self.lid)), None)
+        view = SetTeamView(cog.state, league, interaction.user.id)
+        await interaction.response.send_message(
+            content=view.prompt(), view=view if view.pending() else None, ephemeral=True)
+
+
+class SetTeamView(discord.ui.View):
+    """Attach a team to requests posted before the chair set the teams. All of the
+    caller's teamless dates in that league start ticked \u2014 they're nearly always the
+    same spot on the same team \u2014 and any that aren't can be unticked and done after."""
+
+    def __init__(self, state: dict, league: dict | None, user_id: int):
+        super().__init__(timeout=300)
+        self.state = state
+        self.league = league
+        self.user_id = user_id
+        self.team = None
+        self.rids = [r["id"] for r in self.pending()]
+        self.build()
+
+    def pending(self) -> list[dict]:
+        lid = str((self.league or {}).get("id") or "")
+        if not lid:
+            return []
+        return [r for r in store.requests_sorted(self.state)
+                if r.get("requester_id") == self.user_id
+                and not (r.get("team") or "").strip()
+                and str(r.get("league_id") or "") == lid
+                and not is_locked(r)]
+
+    def teams(self) -> list[str]:
+        return (self.league or {}).get("team_names") or []
+
+    def build(self) -> "SetTeamView":
+        self.clear_items()
+        ps = self.pending()
+        if ps and self.teams():
+            self.add_item(TeamSelect(self.teams(), self.team, row=0))
+            self.add_item(NightSelect(ps, self.rids, row=1,
+                                      placeholder="Which of your dates\u2026",
+                                      description_of=lambda r: f"{store.open_spots(r)} open"))
+            self.add_item(SetTeamSubmit(self.team, len(self.rids), row=2))
+        return self
+
+    def prompt(self) -> str:
+        ps = self.pending()
+        if not ps:
+            return "Those requests are already sorted \u2014 nothing here needs a team."
+        if not self.teams():
+            return "That league still has no teams posted, so there's nothing to pick yet."
+        head = (f"**{league_label(self.league)}** \u2014 the teams are up now. You have "
+                f"**{len(ps)}** request{'s' if len(ps) != 1 else ''} with no team on "
+                f"{fmt_run([r['game_ts'] for r in ps])}.\n")
+        if not self.team:
+            return head + "Pick the team the spot is on. All your dates are ticked \u2014 untick any that are a different team and do those after."
+        return head + f"Press the button to put **{self.team}** on the ticked dates."
+
+    async def refresh(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(content=self.prompt(), view=self.build())
+
+
+class SetTeamSubmit(discord.ui.Button):
+    def __init__(self, team, count: int, row: int = 2):
+        label = (f"Set {team} on {count} date{'s' if count != 1 else ''}"
+                 if team else "Pick a team first")
+        super().__init__(label=_truncate(label, 80), emoji="\u2705",
+                         style=discord.ButtonStyle.success, row=row,
+                         disabled=not (team and count))
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        view: "SetTeamView" = self.view
+        cog: "Subs" = interaction.client.get_cog("Subs")
+        if cog._is_repeat_click(cog._click_cooldown,
+                                ("setteam", interaction.user.id, tuple(sorted(view.rids)))):
+            return
+        done, clashes, assigned = await cog.set_team_for(
+            interaction.user, view.rids, view.team, channel=interaction.channel)
+        if not done:
+            await interaction.edit_original_response(
+                content="Nothing changed \u2014 those requests already have a team, or have "
+                        "gone off the board.", view=None)
+            return
+        bits = [f"\u2705  **{view.team}** is now on **{fmt_run(done)}**."]
+        if assigned:
+            bits.append(f"{assigned} of them went straight to your team's go-to sub.")
+        if clashes:
+            bits.append(f"\u26a0\ufe0f  Heads up \u2014 **{view.team}** already had a sub request on "
+                        f"**{fmt_run(clashes)}** from someone else. If that's the same spot, "
+                        f"one of you should drop it with **\u2716\ufe0f Remove**, or two subs will "
+                        f"turn up.")
+        await interaction.edit_original_response(content=" ".join(bits), view=None)
+
+
+# ── Managing go-to subs ─────────────────────────────────────────────────────
+
+
+def leagues_with_teams(leagues: list[dict]) -> list[dict]:
+    """The only leagues a go-to arrangement can be made on. A standing arrangement is
+    per TEAM, and a team you can't name is a team nothing can be matched to \u2014 so
+    unlike an ordinary request, this has no "teams aren't up yet" escape hatch."""
+    return [l for l in leagues if (l.get("team_names") or [])]
+
+
+def standing_summary(state: dict) -> str:
+    """Every go-to arrangement, grouped by league and team, in priority order."""
+    groups: dict[tuple, list[dict]] = {}
+    for g in store.standing_sorted(state):
+        groups.setdefault((str(g.get("league_id") or ""), g.get("team", "")), []).append(g)
+    if not groups:
+        return "_No go-to subs set up yet._"
+    lines = []
+    for (_lid, team), members in groups.items():
+        league = stored_league(members[0].get("league", "")) or "League"
+        who = " \u00b7 ".join(f"{i}. {m['name']}" for i, m in enumerate(members, 1))
+        lines.append(f"\u2022 **{league}** \u00b7 {team} \u2014 {who}")
+    return "\n".join(lines)
+
+
+class StandingHomeView(discord.ui.View):
+    def __init__(self, state: dict, leagues: list[dict]):
+        super().__init__(timeout=300)
+        self.state = state
+        self.leagues = leagues
+        self.add_item(StandingAddButton(disabled=not leagues_with_teams(leagues)))
+        if store.standing_sorted(state):
+            self.add_item(StandingRemoveButton())
+
+
+class StandingAddButton(discord.ui.Button):
+    def __init__(self, *, disabled: bool = False):
+        super().__init__(label="Add a go-to sub", emoji="\u2795",
+                         style=discord.ButtonStyle.success, disabled=disabled)
+
+    async def callback(self, interaction: discord.Interaction):
+        home: "StandingHomeView" = self.view
+        view = StandingAddView(leagues_with_teams(home.leagues), home.state)
+        await interaction.response.edit_message(content=view.prompt(), view=view)
+
+
+class StandingRemoveButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Remove one", emoji="\u2716\ufe0f",
+                         style=discord.ButtonStyle.secondary)
+
+    async def callback(self, interaction: discord.Interaction):
+        home: "StandingHomeView" = self.view
+        entries = store.standing_sorted(home.state)
+        if not entries:
+            await interaction.response.edit_message(
+                content="Nothing to remove \u2014 there are no go-to subs set up.", view=None)
+            return
+        view = discord.ui.View(timeout=300)
+        view.add_item(StandingRemoveSelect(entries))
+        await interaction.response.edit_message(
+            content="Which arrangement should end?", view=view)
+
+
+class StandingAddView(discord.ui.View):
+    """league \u2192 team \u2192 person, ending on an explicit button. The order matters: the
+    team list comes from the league, and naming someone the go-to for a team is a
+    commitment made on their behalf, so it never fires off a select."""
+
+    def __init__(self, leagues: list[dict], state: dict):
+        super().__init__(timeout=300)
+        self.leagues = leagues
+        self.state = state
+        self.league_id = None
+        self.team = None
+        self.member = None
+        self.submitted = False
+        self.build()
+
+    def league(self) -> dict | None:
+        return next((l for l in self.leagues if str(l["id"]) == str(self.league_id)), None)
+
+    def on_league_change(self):
+        self.team = None
+
+    def ready(self) -> bool:
+        return bool(self.league() and self.team and self.member)
+
+    def build(self) -> "StandingAddView":
+        self.clear_items()
+        self.add_item(LeagueSelect(self.leagues, self.league_id, row=0))
+        lg = self.league()
+        if lg:
+            self.add_item(TeamSelect(lg.get("team_names") or [], self.team, row=1))
+            self.add_item(StandingMemberSelect(self.member, row=2))
+            self.add_item(StandingSubmitButton(self.member, self.team,
+                                               disabled=not self.ready(), row=3))
+        return self
+
+    def prompt(self) -> str:
+        lg = self.league()
+        if not lg:
+            return ("**Go-to sub** \u2014 pick the league. Only leagues with teams posted "
+                    "can have one: the arrangement is per team.")
+        parts = [f"League: **{league_label(lg)}**",
+                 f"Team: **{self.team}**" if self.team else "Team: **not set**",
+                 f"Sub: **{self.member.display_name}**" if self.member else "Sub: **not set**"]
+        head = "**Go-to sub** \u2014 " + " \u00b7 ".join(parts)
+        if not self.ready():
+            return head + "\nPick the team and the person."
+        current = store.standing_for(self.state, self.league_id, self.team)
+        rank = len(current) + 1
+        if rank == 1:
+            return (head + f"\n{self.member.display_name} will be **auto-assigned** whenever "
+                           f"{self.team} needs a sub in this league, and DM'd to confirm.")
+        return (head + f"\n{self.member.display_name} would be **#{rank}** for {self.team} \u2014 "
+                       f"{current[0]['name']} is auto-assigned first; the rest get tagged "
+                       f"ahead of everyone else on the alert.")
+
+    async def refresh(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(content=self.prompt(), view=self.build())
+
+
+class StandingMemberSelect(discord.ui.UserSelect):
+    """Records the pick only \u2014 the button commits (see the cog's UI invariants)."""
+
+    def __init__(self, selected=None, row: int = 2):
+        defaults = ([discord.SelectDefaultValue.from_user(selected)]
+                    if selected is not None else [])
+        super().__init__(
+            placeholder=("Change who the go-to is\u2026" if selected is not None
+                         else "Who's the go-to sub\u2026"),
+            min_values=1, max_values=1, row=row, default_values=defaults)
+
+    async def callback(self, interaction: discord.Interaction):
+        self.view.member = self.values[0]
+        await self.view.refresh(interaction)
+
+
+class StandingSubmitButton(discord.ui.Button):
+    def __init__(self, member=None, team=None, *, disabled: bool, row: int = 3):
+        label = (f"Make {first_name(member.display_name)} the go-to for {team}"
+                 if member is not None and team else "Make them the go-to")
+        super().__init__(label=_truncate(label, 80), emoji="\u2b50",
+                         style=discord.ButtonStyle.success, row=row, disabled=disabled)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: "StandingAddView" = self.view
+        if view.submitted:
+            try:
+                await interaction.response.defer()
+            except discord.HTTPException:
+                pass
+            return
+        view.submitted = True
+        await interaction.response.defer()
+        cog: "Subs" = interaction.client.get_cog("Subs")
+        lg = view.league()
+        result, assigned = await cog.add_standing(
+            actor=interaction.user, member=view.member, league_id=view.league_id or "",
+            league=league_label(lg) if lg else "", team=view.team or "",
+            channel=interaction.channel)
+        if result == "already":
+            view.submitted = False
+            await interaction.edit_original_response(
+                content=(f"{view.member.display_name} is already a go-to sub for "
+                         f"**{view.team}** in that league.\n\n" + view.prompt()),
+                view=view.build())
+            return
+        bits = [f"\u2b50  **{view.member.display_name}** is the go-to sub for **{view.team}** "
+                f"in **{league_label(lg) if lg else 'that league'}**."]
+        bits.append("They've been DM'd." if result == "added" else "")
+        if assigned:
+            bits.append(f"**{len(assigned)}** open request{'s' if len(assigned) != 1 else ''} "
+                        f"for that team ({fmt_run(assigned)}) went to them right away.")
+        await interaction.edit_original_response(
+            content=" ".join(b for b in bits if b), view=None)
+
+
+class StandingRemoveSelect(discord.ui.Select):
+    """Picking only OPENS a confirm \u2014 ending someone's arrangement is not a select."""
+
+    def __init__(self, entries: list[dict], row: int = 0):
+        self.entries = entries
+        opts = _unique_options([
+            discord.SelectOption(
+                label=_truncate(f"{g['name']} \u2014 {g.get('team','')}", 100),
+                value=f"{g['user_id']}|{g.get('league_id','')}|{g.get('team','')}"[:100],
+                description=_truncate(stored_league(g.get("league", "")), 100) or None,
+            )
+            for g in entries[:25]
+        ])
+        super().__init__(placeholder="Which go-to arrangement\u2026", min_values=1,
+                         max_values=1, options=opts, row=row)
+
+    async def callback(self, interaction: discord.Interaction):
+        uid, lid, team = self.values[0].split("|", 2)
+        entry = next((g for g in self.entries
+                      if str(g["user_id"]) == uid
+                      and str(g.get("league_id", "")) == lid
+                      and g.get("team", "") == team), None)
+        if entry is None:
+            await interaction.response.edit_message(
+                content="That arrangement is already gone.", view=None)
+            return
+        await interaction.response.edit_message(
+            content=(f"End **{entry['name']}**'s go-to arrangement for **{team}** in "
+                     f"**{stored_league(entry.get('league',''))}**? Dates they're already "
+                     f"on stay theirs \u2014 this only stops future ones."),
+            view=ConfirmRemoveStandingView(int(uid), lid, team, entry["name"]))
+
+
+class ConfirmRemoveStandingView(discord.ui.View):
+    def __init__(self, user_id: int, league_id: str, team: str, name: str):
+        super().__init__(timeout=120)
+        self.user_id = user_id
+        self.league_id = league_id
+        self.team = team
+        self.name = name
+
+    @discord.ui.button(label="End it", emoji="\U0001f5d1\ufe0f", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        cog: "Subs" = interaction.client.get_cog("Subs")
+        if cog._is_repeat_click(cog._click_cooldown,
+                                ("rmstanding", interaction.user.id, self.user_id,
+                                 self.league_id, self.team)):
+            return
+        removed = await cog.remove_standing(self.user_id, self.league_id, self.team,
+                                            actor=interaction.user)
+        msg = (f"\U0001f5d1\ufe0f  **{self.name}** is no longer the go-to for **{self.team}**."
+               if removed else "That arrangement was already gone.")
+        await interaction.edit_original_response(content=msg, view=None)
+
+    @discord.ui.button(label="Keep", style=discord.ButtonStyle.secondary)
+    async def keep(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content="Okay \u2014 nothing changed.", view=None)
+
+
 class Subs(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -2083,10 +2650,12 @@ class Subs(commands.Cog):
     async def cog_load(self):
         self.expiry_loop.start()
         self.reminder_loop.start()
+        self.team_reconcile_loop.start()
 
     async def cog_unload(self):
         self.expiry_loop.cancel()
         self.reminder_loop.cancel()
+        self.team_reconcile_loop.cancel()
 
     async def startup(self):
         """Prune expired requests and re-render every server's board after a (re)connect."""
@@ -2232,11 +2801,23 @@ class Subs(commands.Cog):
             opn = store.open_spots(req)
             spots_txt = f"{opn} spot{'s' if opn != 1 else ''} open"
         detail = " · ".join(x for x in [league or None, _req_for(req), when, spots_txt] if x)
-        subs = _availability_for_request(self.state, req)
-        mentions = " ".join(f"<@{a['user_id']}>" for a in subs)
+        # Go-to subs are tagged FIRST and named as such — that ordering is the whole
+        # of "priority" as far as an alert is concerned. Anyone who is both a go-to
+        # and listed as available is only tagged once, on the go-to line.
+        goto = _standing_for_request(self.state, req)
+        goto_ids = {g["user_id"] for g in goto}
+        subs = [a for a in _availability_for_request(self.state, req)
+                if a["user_id"] not in goto_ids]
         verb = "take any or all of them" if run else "grab it"
-        if mentions:
-            tail = f"{mentions} — you're listed as available. Tap to {verb}:"
+        lines = []
+        if goto:
+            lines.append(" ".join(f"<@{g['user_id']}>" for g in goto)
+                         + " — you're the go-to sub for this team.")
+        if subs:
+            lines.append(" ".join(f"<@{a['user_id']}>" for a in subs)
+                         + " — you're listed as available.")
+        if lines:
+            tail = "\n".join(lines) + f"\nTap to {verb}:"
         else:
             tail = ("_No one's listed as available yet — first to tap takes "
                     f"{'them' if run else 'it'}:_")
@@ -2381,8 +2962,11 @@ class Subs(commands.Cog):
         how a useful board becomes a muted one. Naming who covers them is a separate
         step (Fill for someone, offered on that alert).
 
-        Returns (created, skipped, filled) — `filled` is always 0 now and kept only so
-        callers don't have to change shape."""
+        A team with a go-to sub never reaches the room at all: the arrangement fills
+        the spot as the posting is made, and the alert is simply not posted. `filled`
+        is how many dates went that way (it was dead weight before this).
+
+        Returns (created, skipped, filled)."""
         isos = list(dict.fromkeys(game_isos))          # dedupe, keep order
         sid = uuid.uuid4().hex[:8] if len(isos) > 1 else ""
         created, skipped, filled = [], 0, 0
@@ -2410,11 +2994,17 @@ class Subs(commands.Cog):
                 created.append(req)
             if created or filled:
                 self._save()
-        if not (created or filled):
+        if not created:
             return (0, skipped, 0)
+        # Before anyone is asked: whoever the team has arranged as its go-to sub is put
+        # on these dates. Whatever they cover is never alerted — asking the room to
+        # cover a spot that is already covered is how a board gets muted.
+        assigned = await self._auto_assign(created, actor_id=requester.id, channel=channel)
+        filled = sum(len(b["isos"]) for b in assigned.values())
         await self.render_board(self._guild_id(channel), fallback_channel=channel)
         # One alert for the whole run, anchored on its soonest still-open night.
-        anchor = next((r for r in created if store.open_spots(r) > 0), None)
+        anchor = next((r for r in created
+                       if store.open_spots(r) > 0 and not is_locked(r)), None)
         if anchor is not None:
             await self.post_page(anchor, reason="new", channel=channel)
         return (len(created), skipped, filled)
@@ -2615,15 +3205,27 @@ class Subs(commands.Cog):
         return removed
 
 
-    async def _dm_requester(self, user_id: int, text: str):
-        """Best-effort DM to a request's owner — the only DM the bot still sends, to
-        tell them their game just gained or lost a sub. No channel fallback: if their
-        DMs are closed, the reposted board still shows the change."""
+    async def _dm(self, user_id: int, text: str, view: discord.ui.View | None = None) -> bool:
+        """Best-effort DM. No channel fallback: if their DMs are closed, the reposted
+        board still shows the change. Returns whether it landed.
+
+        A DM may carry buttons — an auto-assignment is the one thing that happens to
+        someone without them tapping anything, so the answer has to be one tap away in
+        the same message. Those buttons are DynamicItems, so they keep working after a
+        restart even though the DM is long gone from the bot's memory."""
         try:
             user = self.bot.get_user(user_id) or await self.bot.fetch_user(user_id)
-            await user.send(text)
+            if view is not None:
+                await user.send(text, view=view)
+            else:
+                await user.send(text)
+            return True
         except (discord.Forbidden, discord.HTTPException, discord.NotFound):
-            pass
+            return False
+
+    async def _dm_requester(self, user_id: int, text: str):
+        """Tell a request's owner their game just gained or lost a sub."""
+        await self._dm(user_id, text)
 
     async def fill_request_spot(self, user, rid: str, channel=None) -> tuple[str, dict | None]:
         """A sub self-fills an open request (hand-raise / alert-page claim). Adds them
@@ -2663,6 +3265,197 @@ class Subs(commands.Cog):
                     await ch.get_partial_message(alert["message_id"]).delete()
                 except discord.HTTPException:
                     pass
+
+    # -- go-to subs ---------------------------------------------------------
+    async def _auto_assign(self, reqs: list[dict], *, actor_id=None, channel=None) -> dict:
+        """Put each request's go-to sub(s) on it, then tell them.
+
+        Called from every path that can create an unfilled spot on a team that has an
+        arrangement: a fresh posting, a team being attached after the fact, and the
+        moment an arrangement is made. Assignment is the ONLY thing that happens here
+        without the sub having tapped anything, which is why every batch ends in a DM
+        they can answer in one tap.
+
+        A whole batch shares one assign_id so eight Thursdays are one DM, not eight —
+        but the assignment itself is still per date (see the no-runs rule): dropping
+        one leaves the others alone.
+
+        Returns {user_id: {"name", "isos"}}. Never holds the lock across a DM."""
+        if not reqs:
+            return {}
+        aid = uuid.uuid4().hex[:8]
+        batches: dict[int, dict] = {}
+        told: dict[int, list] = {}       # requester_id -> dates covered for them
+        async with self._lock:
+            for r in reqs:
+                live = store.find_request(self.state, r["id"])
+                if live is None or is_locked(live) or store.open_spots(live) <= 0:
+                    continue
+                for g in store.standing_for(self.state, live.get("league_id", ""),
+                                            live.get("team", "")):
+                    # Priority order, and as many as the request has spots for: the
+                    # #2 go-to isn't a spare, they're the second spot's answer.
+                    if store.assign_auto(live, g["user_id"], g["name"], aid,
+                                         now=club_now()) != "assigned":
+                        continue
+                    b = batches.setdefault(g["user_id"], {
+                        "name": g["name"], "isos": [],
+                        "team": live.get("team", ""), "league": live.get("league", "")})
+                    b["isos"].append(live["game_ts"])
+                    rid_owner = live.get("requester_id")
+                    if rid_owner != g["user_id"]:
+                        told.setdefault(rid_owner, []).append(live["game_ts"])
+            if batches:
+                self._save()
+        for uid, b in batches.items():
+            n = len(b["isos"])
+            count = f" \u2014 {n} dates" if n > 1 else ""
+            await self._dm(
+                uid,
+                f"\u2b50  You're the go-to sub for **{b['team']}** in "
+                f"**{stored_league(b['league'])}**.\n"
+                f"You've been put down for **{fmt_run(b['isos'])}**{count}.\n"
+                "Confirm so the team knows it's sorted, or tell me which you can't make "
+                "\u2014 those go straight back on the board.",
+                view=AutoAssignView(aid, n))
+        for requester_id, isos in told.items():
+            if requester_id == actor_id or requester_id is None:
+                continue
+            names = ", ".join(sorted({b["name"] for b in batches.values()}))
+            await self._dm(
+                requester_id,
+                f"\u2b50  {names} is your team's go-to sub and has been assigned to your "
+                f"{fmt_run(isos)} game{'s' if len(isos) != 1 else ''}. "
+                "You'll see it on the board \u2014 they've been asked to confirm.")
+        return {uid: {"name": b["name"], "isos": b["isos"]} for uid, b in batches.items()}
+
+    async def add_standing(self, *, actor, member, league_id, league, team,
+                           channel=None) -> tuple[str, list[str]]:
+        """Make someone the go-to sub for a league + team. Returns (result, isos) where
+        isos are open dates for that team they were assigned on the spot \u2014 an
+        arrangement made mid-season should cover what's already asking."""
+        async with self._lock:
+            result = store.add_standing(
+                self.state, user_id=member.id, name=member.display_name,
+                league_id=league_id, league=league, team=team,
+                created_by=actor.id, now=club_now())
+            if result == "added":
+                self._save()
+        if result != "added":
+            return (result, [])
+        # The arrangement is made ON someone's behalf, so they hear it from the bot
+        # rather than finding their name on a game.
+        await self._dm(
+            member.id,
+            f"\u2b50  {actor.display_name} made you the **go-to sub** for **{team}** in "
+            f"**{stored_league(league)}**.\n"
+            "Whenever that team needs a sub, you'll be put on it automatically and DM'd "
+            "to confirm \u2014 you can drop any date you can't make, and it goes back on the "
+            "board. Ask an organiser to end the arrangement any time.")
+        tk = (team or "").strip().casefold()
+        targets = [r for r in store.requests_sorted(self.state)
+                   if str(r.get("league_id") or "") == str(league_id or "")
+                   and (r.get("team") or "").strip().casefold() == tk
+                   and store.open_spots(r) > 0 and not is_locked(r)]
+        assigned = await self._auto_assign(targets, actor_id=actor.id, channel=channel)
+        if assigned:
+            await self.render_board(self._guild_id(channel), fallback_channel=channel)
+            for r in targets:
+                await self.refresh_page(r)
+        return (result, assigned.get(member.id, {}).get("isos", []))
+
+    async def remove_standing(self, user_id: int, league_id, team: str, *, actor=None) -> bool:
+        """End an arrangement. Dates already assigned STAY assigned — someone is
+        expecting those to be covered, and un-assigning silently is how a team ends up
+        short without anyone noticing. Take them off individually if that's the intent."""
+        async with self._lock:
+            removed = store.remove_standing(self.state, user_id, league_id, team)
+            if removed:
+                self._save()
+        if removed and actor is not None and actor.id != user_id:
+            await self._dm(
+                user_id,
+                f"\u2139\ufe0f  {actor.display_name} ended your go-to sub arrangement for "
+                f"**{team}**. Any dates you're already on are still yours.")
+        return removed
+
+    async def confirm_auto(self, user, aid: str) -> list[str]:
+        """Acknowledge every date in one assignment batch. Returns the dates confirmed."""
+        done = []
+        async with self._lock:
+            for r in store.requests_sorted(self.state):
+                entry = store.auto_entry(r, user.id)
+                if entry is None or entry.get("auto") != aid:
+                    continue
+                if store.confirm_auto(r, user.id) == "confirmed":
+                    done.append(r["game_ts"])
+            if done:
+                self._save()
+        if done:
+            await self.render_all_boards()
+        return done
+
+    async def drop_auto(self, user, rids, channel=None) -> list[str]:
+        """A go-to sub drops dates they were assigned. Each one reopens as an ordinary
+        request and re-alerts its own channel — the arrangement itself stands."""
+        dropped, reopened = [], []
+        async with self._lock:
+            for rid in rids:
+                req = store.find_request(self.state, rid)
+                if req is None or is_locked(req):
+                    continue
+                if store.decline_auto(req, user.id) == "removed":
+                    dropped.append(req["game_ts"])
+                    reopened.append(req)
+            if dropped:
+                self._save()
+        if not dropped:
+            return []
+        await self.render_all_boards()
+        for req in reopened:
+            await self._dm_requester(
+                req["requester_id"],
+                f"\u21a9\ufe0f  {user.display_name} can't make your {fmt_when(req['game_ts'])} "
+                f"game after all \u2014 it's back on the board and the room has been alerted.")
+            await self.post_page(req, reason="bump")
+        return dropped
+
+    async def set_team_for(self, user, rids, team: str,
+                           channel=None) -> tuple[list[str], list[str], int]:
+        """Attach a team to the caller's own teamless requests. Returns
+        (dates set, dates that now collide with someone else's request for the same
+        team, how many went to a go-to sub).
+
+        The collision check runs BEFORE the team is written, so it finds other
+        people's requests rather than this one. It warns and never merges: two open
+        requests for one team on one draw might be two genuinely missing players."""
+        team = (team or "").strip()
+        if not team:
+            return ([], [], 0)
+        done, clashes, changed = [], [], []
+        async with self._lock:
+            for rid in rids:
+                req = store.find_request(self.state, rid)
+                if req is None or is_locked(req):
+                    continue
+                if req.get("requester_id") != user.id or (req.get("team") or "").strip():
+                    continue
+                clash = _find_open_duplicate(self.state, req.get("league_id", ""),
+                                             req.get("game_ts", ""), team)
+                req["team"] = team
+                done.append(req["game_ts"])
+                changed.append(req)
+                if clash is not None and clash["id"] != req["id"]:
+                    clashes.append(req["game_ts"])
+            if done:
+                self._save()
+        if not done:
+            return ([], [], 0)
+        assigned = await self._auto_assign(changed, actor_id=user.id, channel=channel)
+        await self.render_all_boards()
+        for req in changed:
+            await self.refresh_page(req)
+        return (done, clashes, sum(len(b["isos"]) for b in assigned.values()))
 
     # -- background expiry --------------------------------------------------
     @tasks.loop(minutes=15)
@@ -2723,6 +3516,110 @@ class Subs(commands.Cog):
             req = store.find_request(self.state, rid)
             if req and store.open_spots(req) > 0:
                 await self.post_page(req, reason="reminder")
+        await self._chase_unconfirmed(now)
+
+    async def _chase_unconfirmed(self, now: datetime):
+        """Once per request: a go-to sub was put on this date and has never answered,
+        and the game is now inside ACK_HOURS.
+
+        This is the one hole auto-assignment opens. Every other unfilled game is
+        visibly unfilled; this one reads as covered on the board and might not be. So
+        it gets said out loud, in the channel the request came from, while there is
+        still time to find somebody else. The spot is NOT reopened — they are still
+        the sub until they say otherwise."""
+        window = timedelta(hours=ACK_HOURS)
+        due = []
+        async with self._lock:
+            for r in self.state["requests"]:
+                if r.get("ack_nudged") or not store.unconfirmed_auto(r):
+                    continue
+                try:
+                    game = datetime.fromisoformat(r["game_ts"])
+                except (ValueError, KeyError, TypeError):
+                    continue
+                if now <= game <= now + window:
+                    r["ack_nudged"] = True
+                    due.append(r["id"])
+            if due:
+                self._save()
+        for rid in due:
+            req = store.find_request(self.state, rid)
+            if req is None:
+                continue
+            waiting = store.unconfirmed_auto(req)
+            if not waiting:
+                continue
+            aid = waiting[0].get("auto") or ""
+            mentions = " ".join(f"<@{f['user_id']}>" for f in waiting)
+            body = (f"\u23f0  **Not confirmed yet** \u2014 {stored_league(req.get('league',''))} "
+                    f"\u00b7 {_req_for(req)} \u00b7 {fmt_when(req['game_ts'])}\n"
+                    f"{mentions} you're the go-to sub for this one but haven't confirmed. "
+                    f"Tap **Confirm**, or drop it so someone else can pick it up:")
+            for f in waiting:
+                await self._dm(
+                    f["user_id"],
+                    f"\u23f0  Quick check \u2014 you're down as the sub for "
+                    f"**{_req_for(req)}** on **{fmt_when(req['game_ts'])}** and haven't "
+                    f"confirmed. Confirm below, or drop it if you can't make it.",
+                    view=AutoAssignView(aid, 1))
+            ch = await self._resolve_channel(req.get("channel_id"))
+            if ch is None:
+                continue
+            try:
+                await ch.send(body, view=AutoAssignView(aid, len(waiting)),
+                              allowed_mentions=discord.AllowedMentions(users=True))
+            except discord.HTTPException as e:
+                log.warning("Could not post unconfirmed-assignment nudge: %s", e)
+
+    # -- teams posted after the fact ----------------------------------------
+    @tasks.loop(hours=1)
+    async def team_reconcile_loop(self):
+        """Ask people to attach a team to requests they posted before the chair set
+        the teams.
+
+        A teamless request can't be matched against anything: the duplicate guard has
+        no team to compare, so the same spot posted twice reads as two different asks
+        and two subs turn up. The picker stops offering "no team" the moment a league
+        has teams — this is what closes the ones already out there. Runs off the league
+        cache, so it catches up within the hour of a refresh."""
+        try:
+            leagues = await self.get_leagues()
+        except Exception as e:  # noqa: BLE001 — a cache miss must not kill the loop
+            log.warning("Team reconcile: league fetch failed: %s", e)
+            return
+        teams = {str(l["id"]): (l.get("team_names") or []) for l in leagues}
+        groups: dict[tuple, list[str]] = {}
+        async with self._lock:
+            for r in self.state["requests"]:
+                if (r.get("team") or "").strip() or r.get("team_prompted"):
+                    continue
+                lid = str(r.get("league_id") or "")
+                if not teams.get(lid) or is_locked(r):
+                    continue
+                # Marked whether or not the DM lands: someone with DMs closed can't be
+                # reached by retrying every hour for a season, and their request is
+                # still visible on the board either way.
+                r["team_prompted"] = True
+                groups.setdefault((r["requester_id"], lid), []).append(r["id"])
+            if groups:
+                self._save()
+        for (uid, lid), rids in groups.items():
+            league = next((l for l in leagues if str(l["id"]) == lid), None)
+            view = discord.ui.View(timeout=None)
+            view.add_item(SetTeamButton(lid, count=len(rids)))
+            n = len(rids)
+            await self._dm(
+                uid,
+                f"\U0001f3f7\ufe0f  **{league_label(league) if league else 'Your league'}** has "
+                f"its teams posted now.\n"
+                f"You have **{n}** sub request{'s' if n != 1 else ''} on it with no team "
+                f"named. Naming the team means nobody can post a second request for the "
+                f"same spot \u2014 and your team's go-to sub, if it has one, can pick it up.",
+                view=view)
+
+    @team_reconcile_loop.before_loop
+    async def _before_team_reconcile(self):
+        await self.bot.wait_until_ready()
 
     @reminder_loop.before_loop
     async def _before_reminder(self):
@@ -2755,6 +3652,23 @@ class Subs(commands.Cog):
         await interaction.followup.send(
             "🥌  Posted the subs board here. It refreshes in place, and hops to the "
             "bottom whenever something changes on this server.", ephemeral=True)
+
+    @app_commands.command(
+        name="gotosub",
+        description="See or set the go-to subs — who gets auto-assigned when a team needs one")
+    async def gotosub_cmd(self, interaction: discord.Interaction):
+        """Private by design: an arrangement is club information, but changing one is
+        a quiet administrative act, not a channel event. The person being made a go-to
+        sub always hears about it by DM, which is the notification that matters."""
+        leagues = await self.get_leagues()
+        body = ("\u2b50  **Go-to subs** \u2014 when a team needs a sub, its go-to is put on it "
+                "straight away and DM'd to confirm.\n\n" + standing_summary(self.state))
+        if leagues and not leagues_with_teams(leagues):
+            body += ("\n\n_No league has its teams posted yet, so there's nothing to attach "
+                     "an arrangement to. It's per team \u2014 come back once the chair sets "
+                     "them._")
+        await interaction.response.send_message(
+            content=body, view=StandingHomeView(self.state, leagues), ephemeral=True)
 
 
 async def setup(bot: commands.Bot):

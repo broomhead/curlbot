@@ -486,6 +486,12 @@ async def setup_hook():
         subs.PageClaimButton,
         subs.SeriesClaimButton,
         subs.RunPickButton,
+        # Buttons that live in a DM: the assignment handshake and the "your league has
+        # teams now" nudge. These outlive the message they were sent on, so they must
+        # be registered like any board button or they go dead on the next restart.
+        subs.ConfirmAutoButton,
+        subs.DropAutoButton,
+        subs.SetTeamButton,
         JoinPracticeButton,
         BlockSheetsButton,
     )

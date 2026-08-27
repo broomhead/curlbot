@@ -67,7 +67,9 @@ def empty_state() -> dict:
     # {"channel_id", "message_id"}. Requests and availability are GLOBAL (shared by
     # every server the bot is in); each server just renders its own board of the
     # same shared data. See new_request for the per-request origin guild/channel.
-    return {"boards": {}, "requests": [], "availability": []}
+    # `standing` holds go-to subs (see the Go-to subs section below): arrangements,
+    # not sign-ups, so they live apart from `availability` and never expire.
+    return {"boards": {}, "requests": [], "availability": [], "standing": []}
 
 
 def load(path: str) -> dict:
@@ -86,6 +88,7 @@ def load(path: str) -> dict:
     state.pop("board", None)
     state.setdefault("requests", [])
     state.setdefault("availability", [])
+    state.setdefault("standing", [])
     for r in state["requests"]:  # tolerate stores written before these fields existed
         r.setdefault("filled", [])
         r.setdefault("pending", [])
@@ -94,6 +97,9 @@ def load(path: str) -> dict:
         r.setdefault("series_id", "")     # "" = standalone (pre-series stores)
         r.setdefault("guild_id", None)    # server the request was posted from
         r.setdefault("channel_id", None)  # channel it was posted in (for alerts)
+        r.setdefault("auto_declined", [])  # go-to subs who dropped THIS date
+        r.setdefault("ack_nudged", False)  # unconfirmed-assignment chase has fired
+        r.setdefault("team_prompted", False)  # asked to attach a team once teams existed
     return state
 
 
@@ -182,6 +188,12 @@ def new_request(
         # edit/replace/retire it), and whether the pre-game reminder has fired.
         "alert": {"channel_id": None, "message_id": None},
         "reminded": False,
+        # A go-to sub who was auto-assigned to this date and dropped it. Recorded so
+        # nothing puts them back on it: the arrangement stands for the OTHER dates,
+        # but this one they have said no to.
+        "auto_declined": [],
+        "ack_nudged": False,
+        "team_prompted": False,
         "created_ts": _now_iso(now),
     }
     state["requests"].append(req)
@@ -364,6 +376,152 @@ def availability_for_user(state: dict, user_id: int) -> list[dict]:
 
 
 # ── Expiry ──────────────────────────────────────────────────────────────────
+
+# ── Auto-assignment (a go-to sub landing on a spot) ─────────────────────────
+# An auto-assigned sub is an ORDINARY filled entry carrying two extra keys, not a
+# parallel structure: `auto` (the batch id the assignment was made under) and
+# `confirmed`. Keeping it inside `filled` means every existing path — open_spots,
+# covered, remove_sub, the board, expiry — already handles it, and taking the
+# person off the spot cannot leave a stale assignment record behind.
+
+
+def auto_entries(req: dict) -> list[dict]:
+    """The auto-assigned people on this request (usually none or one)."""
+    return [f for f in req.get("filled", []) if f.get("auto")]
+
+
+def auto_entry(req: dict, user_id: int) -> Optional[dict]:
+    return next((f for f in auto_entries(req) if f["user_id"] == user_id), None)
+
+
+def unconfirmed_auto(req: dict) -> list[dict]:
+    """Assigned but not yet acknowledged — what the T-minus chase is about."""
+    return [f for f in auto_entries(req) if not f.get("confirmed")]
+
+
+def assign_auto(req: dict, user_id: int, name: str, assign_id: str,
+                now: Optional[datetime] = None) -> str:
+    """Put a go-to sub on this request's open spot. Returns
+    "assigned" | "already" | "requester" | "declined" | "full"."""
+    if is_involved(req, user_id):
+        return "already"
+    if user_id == req.get("requester_id"):
+        return "requester"          # you can't sub the game you're asking off
+    if user_id in (req.get("auto_declined") or []):
+        return "declined"           # they already said no to THIS date
+    if open_spots(req) <= 0:
+        return "full"
+    req.setdefault("filled", []).append({
+        "user_id": user_id,
+        "name": name,
+        "ts": _now_iso(now or datetime.now()),
+        "auto": str(assign_id),
+        "confirmed": False,
+    })
+    return "assigned"
+
+
+def confirm_auto(req: dict, user_id: int) -> str:
+    """Returns "confirmed" | "already" | "absent"."""
+    entry = auto_entry(req, user_id)
+    if entry is None:
+        return "absent"
+    if entry.get("confirmed"):
+        return "already"
+    entry["confirmed"] = True
+    return "confirmed"
+
+
+def decline_auto(req: dict, user_id: int) -> str:
+    """A go-to sub drops a date they were auto-assigned. Takes them off the spot AND
+    remembers it, so nothing (a later re-post, a team being attached, a new go-to
+    arrangement) can put them back on this same date. Returns "removed" | "absent"."""
+    if auto_entry(req, user_id) is None:
+        return "absent"
+    req["filled"] = [f for f in req["filled"] if f["user_id"] != user_id]
+    declined = req.setdefault("auto_declined", [])
+    if user_id not in declined:
+        declined.append(user_id)
+    return "removed"
+
+
+# ── Go-to subs (standing arrangements) ──────────────────────────────────────
+# "Will is our go-to sub for Team 4 in the Thursday Fall league." Bound to a
+# LEAGUE + TEAM, deliberately never to a weekday: whoever sets it up picks both
+# from the same pickers everyone else uses, so the bot never has to work out what
+# "next Thursday league" means. Binding to a league also dates the arrangement for
+# free — a Fall-league entry cannot touch a Summer game, and it stops mattering
+# once that league's last draw has played.
+#
+# These do NOT live in `availability` and are NOT touched by expire(): availability
+# is a sign-up that goes stale, an arrangement is not. Removing one is explicit.
+
+
+def _team_key(team: str) -> str:
+    return (team or "").strip().casefold()
+
+
+def find_standing(state: dict, user_id: int, league_id, team: str) -> Optional[dict]:
+    lid = str(league_id or "")
+    tk = _team_key(team)
+    return next((g for g in state.get("standing", [])
+                 if g["user_id"] == user_id
+                 and str(g.get("league_id") or "") == lid
+                 and _team_key(g.get("team", "")) == tk), None)
+
+
+def standing_sorted(state: dict) -> list[dict]:
+    return sorted(state.get("standing", []),
+                  key=lambda g: (int(g.get("priority", 1)), g.get("created_ts", "")))
+
+
+def standing_for(state: dict, league_id, team: str) -> list[dict]:
+    """Go-to subs for this league + team, first up first. A team with no team named
+    has none: an arrangement always names the team it covers."""
+    lid = str(league_id or "")
+    tk = _team_key(team)
+    if not tk:
+        return []
+    return [g for g in standing_sorted(state)
+            if str(g.get("league_id") or "") == lid and _team_key(g.get("team", "")) == tk]
+
+
+def standing_for_user(state: dict, user_id: int) -> list[dict]:
+    return [g for g in standing_sorted(state) if g["user_id"] == user_id]
+
+
+def add_standing(state: dict, *, user_id: int, name: str, league_id, league: str,
+                 team: str, created_by=None, now: Optional[datetime] = None) -> str:
+    """Make someone a go-to sub for a league + team. Returns "added" | "already".
+    Priority is order of arrangement: the first person added is the one who gets
+    auto-assigned, the rest are the queue behind them."""
+    if not _team_key(team):
+        return "no_team"
+    existing = find_standing(state, user_id, league_id, team)
+    if existing is not None:
+        return "already"
+    rank = len(standing_for(state, league_id, team)) + 1
+    state.setdefault("standing", []).append({
+        "user_id": user_id,
+        "name": name,
+        "league_id": str(league_id) if league_id not in (None, "") else "",
+        "league": (league or "").strip(),
+        "team": (team or "").strip(),
+        "priority": rank,
+        "created_by": int(created_by) if created_by is not None else None,
+        "created_ts": _now_iso(now or datetime.now()),
+    })
+    return "added"
+
+
+def remove_standing(state: dict, user_id: int, league_id, team: str) -> bool:
+    before = len(state.get("standing", []))
+    state["standing"] = [g for g in state.get("standing", [])
+                         if not (g["user_id"] == user_id
+                                 and str(g.get("league_id") or "") == str(league_id or "")
+                                 and _team_key(g.get("team", "")) == _team_key(team))]
+    return len(state["standing"]) < before
+
 
 def day_floor(now: datetime) -> datetime:
     """Midnight at the start of today. The board is today-and-forward, full stop —

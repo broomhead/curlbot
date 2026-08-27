@@ -158,6 +158,10 @@ check("flow/nothing picked is not ready", flow.ready(), False)
 flow.game_isos = [TUE[0], TUE[2]]
 check("flow/the ticked dates are the posting", flow.dates(), [TUE[0], TUE[2]])
 check("flow/nothing is inferred beyond them", len(flow.dates()), 2)
+# This league has its teams posted, so naming one is part of being ready — a
+# teamless record can't be matched against anything (see test_fixes §2).
+check("flow/teamed league needs the team too", flow.ready(), False)
+flow.team = "Smith"
 check("flow/ticked is ready", flow.ready(), True)
 
 items = [type(i).__name__ for i in flow.build().children]

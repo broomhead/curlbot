@@ -109,10 +109,15 @@ board refreshes it in place. The buttons:
 - **➕ Need a sub** walks you through league → your team → which game → how many
   spots. Leagues, teams, and games are pulled live from the club's league pages
   (the same source as `/sheets`), so you pick from real data instead of typing
-  it. **The team is optional** — chairs often don't set teams until a day or two
-  before the first draw, so a request can go up as "*<name>* needs a sub" and
-  gain a team later. **The date never is:** when you need a sub is the point of
-  the request.
+  it. **The date is never optional** — when you need a sub is the point of the
+  request. **The team is required too, unless the league has no teams posted yet.**
+  Chairs often don't draft until a day or two before the first draw and people line
+  up week-1 subs before that, so a request for a league with an empty team list can
+  still go up as "*<name>* needs a sub" — but the moment that league lists teams,
+  "no team" disappears from the picker. A teamless record can't be matched against
+  anything: the duplicate guard has nothing to compare, so the same spot posted twice
+  reads as two different asks and two subs turn up. Requests posted before the teams
+  went up are chased down by DM (see **Go-to subs** below).
   Leagues are shown by name and run dates ("Thursday League 8/6 – 8/27") rather
   than the admin's "Summer 2026 League 3", and are listed by night of the week
   (Sunday → Saturday) then by start date, so the leagues on one night sit
@@ -194,6 +199,43 @@ State is kept in a small JSON file (`SUBS_STORE_PATH`, default `subs_store.json`
 and the buttons survive bot restarts. The board is generic by design (each
 request has a `kind` field), so the same machinery can later back pickup games,
 team-building, etc.
+
+### Go-to subs (auto-assignment)
+
+**`/gotosub`** shows who the club's go-to subs are and lets you set one up: pick the
+league, the team, and the person. From then on, whenever that team posts a sub
+request, the go-to is **put on the spot as the request is made** and the room is
+never asked — no alert goes up at all for a date they cover.
+
+- An arrangement is bound to a **league and a team**, never to a weekday. Whoever
+  sets it up picks both from the same pickers everyone else uses, so nothing has to
+  guess what "the Thursday league" means — and binding it to a league dates it for
+  free: a Fall-league arrangement can't touch a Summer game, and it stops mattering
+  when that league's last draw plays out. Only leagues that have their teams posted
+  can carry one.
+- They're **told, not surprised**: the person gets a DM naming the team and the dates
+  they've been put on, with **Confirm** and **I can't make some…** on it. Confirming
+  doesn't change who's on the spot — they're already on it — it stops the chase.
+  Dropping reopens exactly those dates, alerts the room, and is remembered per date,
+  so nothing puts them back on that one. The arrangement itself stands.
+- Eight dates posted at once are **one DM**, not eight — but still eight separate
+  assignments underneath, per the no-runs rule above.
+- Until they confirm, the board shows them as **"(unconfirmed)"**, and if the game
+  gets within `SUBS_ACK_HOURS` (default 48) with no answer, the bot says so once in
+  the channel the request came from. This is the one case where the board can read as
+  covered and not be, so it surfaces while there's still time to find someone else.
+  The spot is never reopened by the chase — they're the sub until they say otherwise.
+- A team can have **more than one**. The first is the one who gets auto-assigned; the
+  rest fill any extra spots, and are tagged ahead of everyone else on the alert if a
+  date does reach the room. That's the whole of "priority".
+- Setting one up mid-season sweeps up whatever that team already has open. Ending one
+  leaves the dates they're already on alone — someone is counting on those.
+
+**Teams posted after the fact.** Once a league that had no teams gets them, anyone
+with teamless requests still open on it gets a DM with a **Set my team** button:
+pick the team, untick any dates that are a different one, press the button. Naming
+the team closes the double-book hole, warns you if someone else already has a
+request for that team on the same draw, and lets that team's go-to sub pick it up.
 
 > Requires `discord.py >= 2.4` (persistent per-request buttons). For pinning,
 > invite the bot with the **Manage Messages** permission; without it the board
