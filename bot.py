@@ -482,7 +482,10 @@ async def setup_hook():
         subs.AvailableButton,
         subs.FillForButton,
         subs.RemoveButton,
+        subs.ShowAllButton,
         subs.PageClaimButton,
+        subs.SeriesClaimButton,
+        subs.RunPickButton,
         JoinPracticeButton,
         BlockSheetsButton,
     )

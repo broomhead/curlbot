@@ -125,11 +125,52 @@ board refreshes it in place. The buttons:
   hasn't announced the start time either, the option reads "Sun Sep 6 · time
   TBC" rather than guessing one: the date is what matters, and a neighbouring
   league's time would be wrong (Sunday morning is 9am, Sunday night isn't).
-  After posting you can invite an available sub right away.
-- A numbered **Sub for …** button appears per open request. Click to take an
-  open spot, click again to drop it. The requester is notified of every change.
+
+  **Several dates at once.** Tick more than one date in the picker and each one is
+  posted as its own request; the button reads **Post 4 dates**. A date that already
+  has an open request is left alone rather than double-booked.
+  **This is a bulk input convenience, not a standing arrangement.** Underneath it's
+  just N ordinary requests sharing a tag: each date keeps its own status, roster,
+  lock and expiry, so the moment someone can't make week 3, that date simply reopens
+  as an ordinary sub opportunity and the others carry on untouched. There is
+  deliberately no "cancel them all" — dates are dropped one at a time, on purpose.
+  So the board lists **dates**, one one-tap button each. Bulk lives where the bulk
+  decision is actually made: the posting form, the alert for a fresh post, and
+  **Fill for someone**.
+
+  **Need more subs than you asked for?** Run **Need a sub** again for the same
+  league, team and night. Instead of refusing it as a duplicate, the flow switches
+  to editing that request: pick the new **total** and press **Update spots**. The
+  sub you already found keeps their place, the board and the alert update, and the
+  room is re-pinged about the spots that just opened. Anyone can raise the count
+  (the team lost the players, not the person who happened to post); only whoever
+  posted it can lower it, and never below the people already on it.
+- One **🙋 button per open night** appears below the verbs, matching the board text
+  line for line. One tap takes the spot; the requester is notified of every change.
+- **📋 Show all** appears whenever there are games the board isn't listing. The board
+  shows only the next **`SUBS_BOARD_DAYS`** (default 14) days — a Discord embed can't
+  scroll, and a 16-night league season would bury the games people can still act on.
+  Everything past the horizon condenses to one line that says how many games there
+  are, how far out they run, and **how many still need a sub**, so a far-off unfilled
+  game can't go unnoticed. Show all sends the whole board privately, buttons and all —
+  nothing is ever hidden, only moved out of the channel's way.
+- The **🆘 Sub needed** alert that goes up when a request is posted (and again ~24h
+  before an unfilled game) carries the buttons for that ask. One date: **I'll take
+  it**. Several: **Take 4 dates** or **I'll take some…**, which opens a picker with
+  every open date ticked. Either way it also carries **➕ Fill for someone**,
+  pre-aimed at that posting — since posting no longer asks who's covering the dates,
+  this is where "Ben's got Tuesdays" gets recorded, one tap from the ask.
 - **🙋 I can sub** lets you pick a league and the upcoming games you can cover
   (or none, for "any game"), listing you on the board's available-subs section.
+- **➕ Fill for someone** records that a member is covering a spot (they told you
+  offline). Pick the game, then — for a multi-date posting — untick any dates they
+  can't make, then the person, then press the green **Mark <name> in** button.
+  Choosing a name does *nothing* on its own: every form in this cog ends on an
+  explicit button, because a mis-tap here would put the wrong person on someone
+  else's game with no undo short of ➖ Remove.
+- **➖ Remove** is the one place things come off the board: take a sub off a game,
+  cancel a request you opened, or clear your own availability. All three ask before
+  they act — nothing in this cog is destroyed by touching a dropdown.
 - **🛠 Manage** (requester only) lets you add/remove a member directly, **invite
   an available sub** (they get a DM to confirm), or close a request early.
 

@@ -6,7 +6,7 @@ game picker (real draws vs projected league nights, finished seasons),
 team- and game-optional sub requests, tied streak medals, and
 recovering league JSON from a site that injects markup into its API.
 """
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import os
 
@@ -191,7 +191,7 @@ check("teamselect/values", [o.value for o in ts_full.options],
 flow = subs.NeedSubFlowView([THURS])
 check("flow/no league not ready", flow.ready(), False)
 flow.league_id = "26410"
-flow.game_iso = "2026-08-20T19:45:00"
+flow.game_isos = ["2026-08-20T19:45:00"]
 check("flow/teamless IS ready", flow.ready(), True)
 check("flow/prompt says not set", "Team: **not set**" in flow.prompt(), True)
 flow.team = "Smith"
@@ -203,24 +203,33 @@ kinds = [type(i).__name__ for i in flow2.build().children]
 check("flow/teamselect always present", "TeamSelect" in kinds, True)
 
 # Duplicate guard: same team = dup; teamless dups only against the SAME requester.
+# The board is today-forward, so the two render checks below need a game that is
+# still in the future WHENEVER the suite runs — a hardcoded 2026 date quietly
+# turned these green-then-red as the calendar caught up with it.
+# Inside the board's 14-day horizon as well as in the future — the render checks
+# below go through build_embed, which now lists only the near term.
+GAME = (datetime.now().replace(hour=19, minute=45, second=0, microsecond=0)
+        + timedelta(days=7)).isoformat()
+LATER = (datetime.now().replace(hour=19, minute=45, second=0, microsecond=0)
+         + timedelta(days=21)).isoformat()
 st = {"requests": []}
 now = datetime(2026, 8, 10, 12, 0)
-store.new_request(st, requester_id=1, requester_name="Ann Lee", game_ts="2026-08-20T19:45:00",
+store.new_request(st, requester_id=1, requester_name="Ann Lee", game_ts=GAME,
                   spots_needed=1, league_id="26410", league="Thursday League 8/6 – 8/27",
                   team="", now=now)
 check("dup/other person teamless is not a dup",
-      subs._find_open_duplicate(st, "26410", "2026-08-20T19:45:00", "", requester_id=2), None)
+      subs._find_open_duplicate(st, "26410", GAME, "", requester_id=2), None)
 check("dup/same person teamless is a dup",
-      subs._find_open_duplicate(st, "26410", "2026-08-20T19:45:00", "", requester_id=1) is not None,
+      subs._find_open_duplicate(st, "26410", GAME, "", requester_id=1) is not None,
       True)
-store.new_request(st, requester_id=2, requester_name="Bob Ray", game_ts="2026-08-20T19:45:00",
+store.new_request(st, requester_id=2, requester_name="Bob Ray", game_ts=GAME,
                   spots_needed=1, league_id="26410", league="Thursday League 8/6 – 8/27",
                   team="Smith", now=now)
 check("dup/same team any person is a dup",
-      subs._find_open_duplicate(st, "26410", "2026-08-20T19:45:00", "Smith", requester_id=9) is not None,
+      subs._find_open_duplicate(st, "26410", GAME, "Smith", requester_id=9) is not None,
       True)
 check("dup/different game is not a dup",
-      subs._find_open_duplicate(st, "26410", "2026-08-27T19:45:00", "Smith", requester_id=2), None)
+      subs._find_open_duplicate(st, "26410", LATER, "Smith", requester_id=2), None)
 
 # Rendering a teamless request names the person instead of a team.
 teamless, teamed = st["requests"][0], st["requests"][1]
@@ -230,7 +239,8 @@ check("render/status line", subs._req_status_line(teamless),
       f"{subs.INDENT}🔴 Ann's spot — 0/1 · nobody yet")
 labels = [c.item.label for c in subs.build_view(st).children
           if isinstance(c, subs.PageClaimButton)]
-check("render/button labels", labels, ["Thu 8/20 7:45pm Ann", "Thu 8/20 7:45pm Smith"])
+short = subs.fmt_when_short(GAME)
+check("render/button labels", labels, [f"{short} Ann", f"{short} Smith"])
 check("render/board embed has both",
       all(x in subs.build_embed(st).description for x in ("Ann's spot", "Team Smith")), True)
 
@@ -243,7 +253,7 @@ flow = subs.NeedSubFlowView([THURS])
 check("date/needs a league", flow.ready(), False)
 flow.league_id = "26410"
 check("date/league alone is not enough", flow.ready(), False)
-flow.game_iso = "2026-08-20T19:45:00"
+flow.game_isos = ["2026-08-20T19:45:00"]
 check("date/league + game is enough", flow.ready(), True)
 check("date/team still optional", flow.team, None)
 check("date/no opt-out in the picker",

@@ -12,17 +12,46 @@ reposts fresh at the bottom on each change. It groups open games by date with a
 🔴/🟡/🟢 status per spot and lists who's available for each. Interaction is on the
 board:
 
-  ➕ Need a sub      — league → team → game → spots (picked from the system). The
-                       TEAM is optional — chairs often don't set teams until a day
-                       or two before the first draw. The GAME never is: when you
+  ➕ Need a sub      — league → team → date(s) → spots (picked from the system).
+                       The TEAM is optional — chairs often don't set teams until a
+                       day or two before the first draw. The DATE never is: when you
                        need a sub is the point. A league with no schedule posted
                        still offers real dates, projected weekly from its title's
                        start date onto its own night.
+                       Tick SEVERAL dates and each is posted as its own ordinary
+                       request, sharing a series_id. That id is a BULK-INPUT TAG and
+                       nothing more: from the moment they're posted the dates are
+                       independent sub opportunities — separately claimable,
+                       droppable, lockable and expiring — so one person pulling out
+                       of one date changes that date and nothing else. There is
+                       deliberately no "cancel them all".
+                       Re-running the flow for a date you already have open is not
+                       a dead end any more — it becomes an EDIT of that request's
+                       spot count ("we found one, now we need three"), so nobody
+                       already on it gets bumped.
   🙋 I'm free        — list your availability so you get tagged for matching games.
-  ➕ Fill for someone — mark another member into an open spot (offline sync).
-  ➖ Remove          — cancel a sub (click a name → confirm), cancel a request you
-                       opened, or clear your availability.
-  🙋 <game>          — one hand-raise button per open game; one tap takes the spot.
+  ➕ Fill for someone — mark another member into an open spot (offline sync). Covers
+                       several dates of one posting at once, with the same picker,
+                       and ends on an explicit submit button — picking a name records
+                       nothing, because a mis-tap would otherwise put the wrong person
+                       on someone else's game with no undo.
+                       Also sits on every alert, pre-aimed at that posting: since
+                       posting no longer asks who's covering the dates, this is where
+                       "Ben's got Tuesdays" gets recorded, one tap from the ask.
+  ➖ Remove          — take a sub off a game, cancel a request you opened, or clear
+                       your own availability. All three CONFIRM first: in this cog a
+                       select never mutates shared state, only a button does.
+  🙋 <game>          — one one-tap button per open date, matching the text line for
+                       line. NOT one per multi-date posting: posting several dates at
+                       once is a bulk input convenience, not a standing arrangement —
+                       the moment someone can't make week 3, "their run" is a fiction
+                       and the other dates carry on. Bulk lives where it belongs: the
+                       posting form, the alert for a fresh post, and Fill for someone.
+  📋 Show all        — the board lists only the next SUBS_BOARD_DAYS (14) days; a
+                       Discord embed can't scroll, and a 16-date season would bury the
+                       games people can still act on. Everything past that condenses to
+                       one line, and this button sends the whole board privately,
+                       buttons and all. Nothing is hidden, only moved out of the way.
 
 When a request is posted (and again ~24h before an unfilled game), the bot posts a
 public alert that @-mentions the members available for that game, each carrying an
@@ -44,6 +73,7 @@ import os
 import re
 import html
 import time
+import uuid
 import logging
 # NB: `time` (the stdlib module, imported above) is used for monotonic clocks in
 # the click debounce. Import datetime's time CLASS under another name — plain
@@ -72,7 +102,18 @@ UNDATED_DAYS    = int(os.environ.get("SUBS_UNDATED_DAYS", str(store.DEFAULT_UNDA
 REMINDER_HOURS  = int(os.environ.get("SUBS_REMINDER_HOURS", "24"))
 # Sub rosters freeze this many minutes before tip-off — no more adds/removes/claims.
 LOCK_MINUTES    = int(os.environ.get("SUBS_LOCK_MINUTES", "30"))
-MAX_BUTTON_REQUESTS = 20  # Discord caps a message at 25 components; reserve a row for controls.
+# Discord caps a message at 25 components: row 0 holds the four verbs, leaving 20
+# slots for the game buttons below. A RUN spends only one of them (see open_units),
+# so these two caps are no longer the same number — the embed can list far more
+# nights than there are buttons, which is exactly what a multi-week run needs.
+MAX_BOARD_BUTTONS = 20
+MAX_BOARD_GROUPS  = 40   # embed date groups; DESC_BUDGET is the real limit
+# How far ahead the board shows in full. A Discord message cannot scroll — an embed is
+# a fixed block of text — so the only lever on a season-long run is showing less of it.
+# Two weeks is the window in which a sub is actually arranged; everything past it is
+# summarised into one line and reachable through "Show all", which sends the whole
+# board privately (nothing is hidden, only moved out of the channel's way).
+BOARD_HORIZON_DAYS = int(os.environ.get("SUBS_BOARD_DAYS", "14"))
 # Several buttons act on shared state and can be impatiently double-tapped before
 # the first click visibly resolves. We ignore a repeat click (same user, same
 # target) within this window so a double-tap is idempotent: a "Take a spot" toggle
@@ -83,8 +124,13 @@ CID_NEW     = "sub:new"
 CID_AVAIL   = "sub:avail"
 CID_FILLFOR = "sub:fillfor"
 CID_REMOVE  = "sub:remove"
+CID_SHOWALL = "sub:showall"
 # Per-request one-tap claim/hand-raise button (alert page + board): "sub:take:<rid>".
 CID_TAKE_PREFIX = "sub:take:"
+# One-tap "I'll cover the whole run" on a multi-week series: "sub:takerun:<series_id>".
+CID_TAKE_RUN_PREFIX = "sub:takerun:"
+# A run's button that opens the night picker (board + alert page): "sub:pickrun:<sid>".
+CID_PICK_RUN_PREFIX = "sub:pickrun:"
 
 
 def club_now() -> datetime:
@@ -448,9 +494,45 @@ def game_options(league: dict, now: datetime, *, cap: int = 25) -> list[dict]:
     return projected_games(league, now)[:cap]
 
 
+# ── Long-term ("Ben has Tuesdays for 8 weeks") sub runs ─────────────────────
+# A run is NOT a new kind of record. It is N ordinary requests, one per league
+# night, sharing a series_id — so each night keeps its own status, claim button,
+# roster, lock and expiry, and week 3 can fall through without disturbing the
+# other seven. The series_id buys exactly two things: one alert for the whole run
+# instead of one per night, and a single tap that covers all of it.
+
+def fmt_run(isos: list[str]) -> str:
+    """Several dates in one line. One reads as itself. Several read as a span, a count
+    and ONE start time — a multi-date posting is usually the same slot each week, so
+    repeating "7:45 pm" at both ends is noise, and the count ("8 dates") is the part
+    someone actually needs to check before agreeing to it.
+
+    "dates", never "nights": plenty of league draws are daytime hours."""
+    if not isos:
+        return "no dates"
+    if len(isos) == 1:
+        return fmt_when(isos[0])
+    try:
+        a = datetime.fromisoformat(isos[0])
+        b = datetime.fromisoformat(isos[-1])
+    except (ValueError, TypeError):
+        return f"{fmt_when(isos[0])} → {fmt_when(isos[-1])} · {len(isos)} dates"
+    span = f"{a.strftime('%a %-m/%-d')} → {b.strftime('%a %-m/%-d')} · {len(isos)} dates"
+    # Nights can carry different times (a run laid over a rescheduled draw), so only
+    # claim a single start time when every night really shares one.
+    times = {i[11:] for i in isos}
+    if len(times) > 1:
+        return span
+    if a.time() == TIME_TBC:
+        return f"{span} · time TBC"
+    return f"{span} · {a.strftime('%-I:%M %p')}"
+
+
 # ── Board rendering ─────────────────────────────────────────────────────────
 
 BOARD_TITLE = f"Subs Board — {CLUB_NAME}"
+# Discord's embed-description cap is 4096; leave headroom for the overflow line.
+DESC_BUDGET = 3800
 
 
 def _game_key(iso: str) -> str:
@@ -551,12 +633,37 @@ def _available_for_group(state: dict, grp: dict, key: str) -> list[str]:
     return sorted(set(names))
 
 
-def build_embed(state: dict) -> discord.Embed:
+def board_horizon(horizon_days: int | None) -> datetime | None:
+    """The last moment the board shows in full, or None for "show everything"."""
+    if horizon_days is None:
+        return None
+    return store.day_floor(club_now()) + timedelta(days=horizon_days)
+
+
+def _beyond(iso: str, horizon: datetime | None) -> bool:
+    """True if this dated item falls past the board's horizon. Undated and
+    unparseable items are never "beyond" — they're handled on their own terms and
+    must never be silently dropped."""
+    if horizon is None or not iso:
+        return False
+    try:
+        return datetime.fromisoformat(iso) > horizon
+    except (ValueError, TypeError):
+        return False
+
+
+def build_embed(state: dict, *, horizon_days: int | None = BOARD_HORIZON_DAYS) -> discord.Embed:
     """One combined, date-ordered board. A game appears if it has a request OR if
     anyone is available for it. Under each date: the sub spots (traffic-light status,
     with the names of whoever is in), then the available subs not yet assigned.
-    General (any-time) availability is summarized at the bottom."""
+    General (any-time) availability is summarized at the bottom.
+
+    Only the next `horizon_days` are listed. A season-long run is 16 nights, and a
+    Discord embed cannot scroll — so the channel copy stays the size of a decision
+    people can act on this fortnight, and everything past it condenses to one line
+    pointing at **Show all** (`horizon_days=None`, sent privately)."""
     reqs = store.requests_sorted(state)
+    horizon = board_horizon(horizon_days)
     e = discord.Embed(title=BOARD_TITLE, color=_embed_color(reqs))
 
     # Date groups come from requests AND from game-specific availability, so a game
@@ -594,9 +701,12 @@ def build_embed(state: dict) -> discord.Embed:
             return (1, datetime.max, k)   # undated sinks below every real date
 
     order = sorted(groups, key=_sort_key)
+    # Past the horizon isn't dropped, it's deferred: counted, dated, and one tap away.
+    later = [k for k in order if _beyond(groups[k].get("iso"), horizon)]
+    order = [k for k in order if k not in set(later)]
 
-    blocks = []
-    for k in order[:MAX_BUTTON_REQUESTS]:
+    blocks, used, hidden = [], 0, max(0, len(order) - MAX_BOARD_GROUPS)
+    for k in order[:MAX_BOARD_GROUPS]:
         grp = groups[k]
         lines = [f"**{grp['label']}**"]
         for r in grp["reqs"]:
@@ -604,9 +714,25 @@ def build_embed(state: dict) -> discord.Embed:
         free = _available_for_group(state, grp, k)
         if free:
             lines.append(f"{INDENT}available: {', '.join(free)}")
-        blocks.append("\n".join(lines))
-    if len(order) > MAX_BUTTON_REQUESTS:
-        blocks.append(f"…and {len(order) - MAX_BUTTON_REQUESTS} more game(s).")
+        block = "\n".join(lines)
+        # Discord hard-rejects an embed description over 4096 chars, and a single
+        # 8-week run can carry the board to twenty date groups. Trim from the
+        # BOTTOM (the furthest-out nights) and say so, rather than letting the whole
+        # board fail to render — the soonest games are the ones people need.
+        if used + len(block) + 2 > DESC_BUDGET:
+            hidden += 1
+            continue
+        blocks.append(block)
+        used += len(block) + 2
+
+    # One tail line covers both reasons something isn't listed — past the horizon, or
+    # past what Discord will render — so the count is always the true remainder.
+    rest = hidden + len(later)
+    if rest:
+        last = groups[(later or order)[-1]].get("iso")
+        through = f" through {fmt_when_short(last)}" if last else ""
+        tail = f"…and **{rest}** more game{'s' if rest != 1 else ''}{through}"
+        blocks.append(f"{tail} — tap **Show all**." if later else f"{tail}.")
 
     if blocks:
         e.description = "\n\n".join(blocks)
@@ -631,28 +757,97 @@ def build_embed(state: dict) -> discord.Embed:
                 for l in aorder]
         e.add_field(name="Available any time", value="\n".join(rows)[:1024], inline=False)
 
-    e.set_footer(text="🔴 none · 🟡 partial · 🟢 filled — tap a game button below to take a spot")
+    foot = "🔴 none · 🟡 partial · 🟢 filled — tap a game button below to take a spot"
+    if horizon_days is None:
+        foot += " · showing everything"
+    elif later:
+        foot += f" · showing the next {horizon_days} days"
+    e.set_footer(text=foot)
     return e
 
 
-def build_view(state: dict) -> discord.ui.View:
-    """Row 0 = the four verbs; below that, one 🙋 hand-raise button per open game so
-    claiming a spot is a single tap (no form)."""
+def open_units(state: dict, *, now: datetime | None = None) -> list[dict]:
+    """Open nights grouped by the posting they came from — ONLY for the BULK pickers
+    (Fill-for, and the alert page for a fresh post), never for the board.
+
+    A group here is a convenience for doing one thing to several nights at once
+    ("Ben said he'd cover the rest of Tuesdays"), NOT a standing arrangement: nothing
+    is stored per-group, and the group is recomputed from whatever is still open every
+    single time. Drop a sub from one night and it simply rejoins the group as open;
+    fill the rest and the group shrinks to a single game (kind flips to "one").
+    Each unit is {kind: "run"|"one", sid, reqs}, ordered by its soonest open night.
+    Locked and filled nights are already excluded, so a unit is always actionable."""
+    open_reqs = [r for r in store.requests_sorted(state)
+                 if store.open_spots(r) > 0 and not is_locked(r, now=now)]
+    units, seen = [], set()
+    for r in open_reqs:
+        sid = str(r.get("series_id") or "")
+        if not sid:
+            units.append({"kind": "one", "sid": "", "reqs": [r]})
+            continue
+        if sid in seen:
+            continue
+        seen.add(sid)
+        run = [x for x in open_reqs if str(x.get("series_id") or "") == sid]
+        # A run whose other nights have all filled or locked is just a single game now.
+        units.append({"kind": "run" if len(run) > 1 else "one", "sid": sid, "reqs": run})
+    return units
+
+
+def unit_label(u: dict) -> str:
+    """Button/option text for a unit. A run leads with WHO, since its nights are the
+    same slot every week and the dates are right there in the board text above."""
+    r = u["reqs"][0]
+    who = r["team"] if r.get("team") else first_name(r.get("requester_name", ""))
+    if u["kind"] == "run":
+        return _truncate(f"{who} · {len(u['reqs'])} dates", 80)
+    when = fmt_when_short(r["game_ts"]) if r.get("game_ts") else "TBD"
+    return _truncate(f"{when} {who}", 80)
+
+
+def build_view(state: dict, *, horizon_days: int | None = BOARD_HORIZON_DAYS) -> discord.ui.View:
+    """Row 0 = the verbs; below that, ONE ONE-TAP BUTTON PER OPEN NIGHT, matching the
+    text above it line for line.
+
+    Deliberately not per-run. A multi-night post is a bulk INPUT convenience, not a
+    standing arrangement: the moment Bruce can't make week 3, "his run" is a fiction and
+    the other four nights carry on unchanged. Nothing downstream — dropping a sub,
+    cancelling a night, expiry — works on runs, so the board shouldn't either. The
+    horizon, not grouping, is what keeps this list short.
+
+    Buttons obey the same horizon as the text: a game the board isn't listing must not
+    have a button, or people would be claiming a night they can't see."""
     view = discord.ui.View(timeout=None)
+    horizon = board_horizon(horizon_days)
+    open_reqs = [r for r in store.requests_sorted(state)
+                 if store.open_spots(r) > 0 and not is_locked(r)]
+    shown = [r for r in open_reqs if not _beyond(r.get("game_ts", ""), horizon)]
     view.add_item(NewRequestButton())   # ➕ Need a sub
     view.add_item(AvailableButton())    # 🙋 I'm free
     view.add_item(FillForButton())      # ✍️ Fill for someone
     view.add_item(RemoveButton())       # ✖️ Remove
-    # A game within LOCK_MINUTES of tip-off is frozen — no hand-raise button for it.
-    open_reqs = [r for r in store.requests_sorted(state)
-                 if store.open_spots(r) > 0 and not is_locked(r)]
-    for i, r in enumerate(open_reqs[:20]):   # rows 1–4, 5 buttons each
+    # Only offered when something is actually out of sight — a button that reveals
+    # nothing new is worse than no button.
+    if len(shown) < len(open_reqs) or _has_later(state, horizon):
+        view.add_item(ShowAllButton())
+    for i, r in enumerate(shown[:MAX_BOARD_BUTTONS]):   # rows 1–4, 5 each
         who = r["team"] if r.get("team") else first_name(r.get("requester_name", ""))
         when = fmt_when_short(r["game_ts"]) if r.get("game_ts") else "TBD"
-        label = _truncate(f"{when} {who}", 80)
-        view.add_item(PageClaimButton(r["id"], label=label,
+        view.add_item(PageClaimButton(r["id"], label=_truncate(f"{when} {who}", 80),
                                       style=discord.ButtonStyle.success, row=1 + i // 5))
     return view
+
+
+def _has_later(state: dict, horizon: datetime | None) -> bool:
+    """Anything dated past the horizon — a request OR a game someone has listed
+    availability for. Availability counts: a night with willing subs and no request yet
+    is a real row of the full board."""
+    if horizon is None:
+        return False
+    if any(_beyond(r.get("game_ts", ""), horizon) for r in state.get("requests", [])):
+        return True
+    return any(_beyond(g, horizon)
+               for a in state.get("availability", []) for g in (a.get("games") or []))
 
 
 # ── Persistent buttons (DynamicItem — survive restarts) ─────────────────────
@@ -678,7 +873,7 @@ class NewRequestButton(discord.ui.DynamicItem[discord.ui.Button], template=r"sub
             await interaction.edit_original_response(
                 content="Couldn't load the league list just now — try again in a moment.")
             return
-        view = NeedSubFlowView(leagues)
+        view = NeedSubFlowView(leagues, cog.state, interaction.user.id)
         view.message = await interaction.edit_original_response(content=view.prompt(), view=view)
 
 
@@ -707,13 +902,16 @@ class AvailableButton(discord.ui.DynamicItem[discord.ui.Button], template=r"sub:
         view.message = await interaction.edit_original_response(content=view.prompt(), view=view)
 
 
-class FillForButton(discord.ui.DynamicItem[discord.ui.Button], template=r"sub:fillfor"):
-    """Mark someone ELSE into an open spot (offline sync) — they told you they'd cover
-    it, so you record it for them."""
+class ShowAllButton(discord.ui.DynamicItem[discord.ui.Button], template=r"sub:showall"):
+    """The channel board lists only the next couple of weeks — a Discord embed cannot
+    scroll, and a season of league nights would bury the games people can still do
+    something about. This sends the WHOLE board privately, buttons and all, so nothing
+    is ever out of reach, only out of the channel's way."""
+
     def __init__(self):
         super().__init__(discord.ui.Button(
-            label="Fill for someone", emoji="➕",
-            style=discord.ButtonStyle.success, custom_id=CID_FILLFOR, row=0))
+            label="Show all", emoji="📋",
+            style=discord.ButtonStyle.secondary, custom_id=CID_SHOWALL, row=0))
 
     @classmethod
     async def from_custom_id(cls, interaction, item, match):
@@ -721,85 +919,226 @@ class FillForButton(discord.ui.DynamicItem[discord.ui.Button], template=r"sub:fi
 
     async def callback(self, interaction: discord.Interaction):
         cog: "Subs" = interaction.client.get_cog("Subs")
-        open_reqs = [r for r in store.requests_sorted(cog.state)
-                     if store.open_spots(r) > 0 and not is_locked(r)]
-        if not open_reqs:
+        await interaction.response.send_message(
+            content="The whole board, every date (only you can see this):",
+            embed=build_embed(cog.state, horizon_days=None),
+            view=build_view(cog.state, horizon_days=None),
+            ephemeral=True)
+
+
+class FillForButton(discord.ui.DynamicItem[discord.ui.Button],
+                    template=r"sub:fillfor(?::(?P<kind>run|one):(?P<ident>[0-9a-f]+))?"):
+    """Mark someone ELSE into an open spot (offline sync) — they told you they'd cover
+    it, so you record it for them. Covers several dates of one posting in a single go:
+    "Ben said he'll do the rest of Tuesdays" is one thing that happened.
+
+    Two placements, one class. On the BOARD it's bare and you pick the game. On an
+    ALERT it carries that posting's id in its custom_id and opens pre-aimed at it —
+    the alert is already about one specific ask, so making someone re-find it in a
+    dropdown is a step for nothing. This is the only way to name a sub up front now
+    that posting no longer asks: post the dates, then say who's covering them."""
+
+    def __init__(self, key: str = "", *, style: discord.ButtonStyle = discord.ButtonStyle.success):
+        self.key = key or ""
+        suffix = f":{self.key}" if self.key else ""
+        super().__init__(discord.ui.Button(
+            label="Fill for someone", emoji="➕",
+            style=style, custom_id=f"{CID_FILLFOR}{suffix}", row=0))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        kind, ident = match["kind"], match["ident"]
+        return cls(f"{kind}:{ident}" if kind and ident else "")
+
+    async def callback(self, interaction: discord.Interaction):
+        cog: "Subs" = interaction.client.get_cog("Subs")
+        view = FillForView(cog.state, key=self.key)
+        if not view.units():
             await interaction.response.send_message("No open spots to fill right now.", ephemeral=True)
             return
-        await interaction.response.send_message(
-            "**Fill for someone** — pick the game, then choose the teammate to mark in:",
-            view=FillForView(cog.state), ephemeral=True)
+        await interaction.response.send_message(view.prompt(), view=view, ephemeral=True)
+
+
+def unit_key(u: dict) -> str:
+    """Stable select-option value for a unit — the series for a run, the request for a
+    single game. Prefixed so the two id spaces can never collide."""
+    return f"run:{u['sid']}" if u["kind"] == "run" else f"one:{u['reqs'][0]['id']}"
 
 
 class FillForView(discord.ui.View):
-    def __init__(self, state: dict):
+    """Pick the game (or run) → for a run, which nights → who's covering it."""
+
+    def __init__(self, state: dict, key: str = ""):
         super().__init__(timeout=300)
         self.state = state
-        self.rid: str | None = None
+        # Pre-aimed when opened from an alert; a key that no longer matches anything
+        # open (the spot filled while the alert sat there) just falls back to the picker.
+        self.key: str | None = key or None
+        self.rids: list[str] = []         # dates to fill (all of the posting, by default)
+        self.member = None                # who's covering them; committed by the button
+        self.submitted = False            # one-shot guard on the submit button
+        self.on_unit_change()
         self.build()
+
+    def units(self) -> list[dict]:
+        return open_units(self.state)
+
+    def unit(self) -> dict | None:
+        return next((u for u in self.units() if unit_key(u) == self.key), None)
+
+    def on_unit_change(self):
+        u = self.unit()
+        # Default to EVERY date of the posting — the same "all ticked" default the
+        # self-serve picker uses, so both paths behave identically.
+        self.rids = [r["id"] for r in u["reqs"]] if u else []
 
     def build(self) -> "FillForView":
         self.clear_items()
-        open_reqs = [r for r in store.requests_sorted(self.state)
-                     if store.open_spots(r) > 0 and not is_locked(r)]
-        self.add_item(FillForPick(open_reqs, self.rid, row=0))
-        if self.rid and store.find_request(self.state, self.rid):
-            self.add_item(FillForMemberSelect(self.rid, row=1))
+        self.add_item(FillForPick(self.units(), self.key, row=0))
+        u = self.unit()
+        if u:
+            if u["kind"] == "run":
+                self.add_item(NightSelect(u["reqs"], self.rids, row=1))
+            self.add_item(FillForMemberSelect(self.member, row=2))
+            self.add_item(FillForSubmitButton(self.member, len(self.rids), row=3))
         return self
 
     def prompt(self) -> str:
-        if not self.rid:
+        u = self.unit()
+        if not u:
             return "**Fill for someone** — pick the game, then choose the teammate to mark in:"
-        req = store.find_request(self.state, self.rid)
-        when = fmt_when(req["game_ts"]) if req else "that game"
-        return f"**Fill for someone** · {when} — choose the teammate to mark in:"
+        who = f"**{self.member.display_name}**" if self.member is not None else "them"
+        if u["kind"] == "run":
+            total, picked = len(u["reqs"]), len(self.rids)
+            # Track the actual selection — claiming "all 4 are ticked" after two were
+            # unticked is the kind of small lie that makes people distrust the form.
+            which = (f"All {total} dates are ticked — untick any they can't make"
+                     if picked == total else
+                     f"**{picked} of {total}** dates ticked")
+            head = (f"**Fill for someone** · {_req_for(u['reqs'][0])} · "
+                    f"{fmt_run([r['game_ts'] for r in u['reqs']])}\n"
+                    f"{which}, then choose who's covering them.")
+        else:
+            head = (f"**Fill for someone** · {fmt_when(u['reqs'][0]['game_ts'])} — "
+                    "choose the teammate to mark in.")
+        # Nothing happens until the button: picking a name by mistake used to BE the
+        # action, and there is no undo for it beyond ➖ Remove.
+        if self.member is None:
+            return head + "\nNothing is recorded until you press the green button."
+        n = len(self.rids)
+        return head + (f"\nReady: {who} on **{n} date{'s' if n != 1 else ''}**. "
+                       "Press the green button to record it.")
+
+    async def refresh(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(content=self.prompt(), view=self.build())
 
 
 class FillForPick(discord.ui.Select):
-    def __init__(self, reqs: list[dict], selected, row: int = 0):
+    """One option per open UNIT, so an eight-week run is one line here rather than
+    eight near-identical ones burying every other game."""
+
+    def __init__(self, units: list[dict], selected, row: int = 0):
         opts = _unique_options([
             discord.SelectOption(
-                label=_truncate(f"{fmt_when_short(r['game_ts'])} · {_req_for(r)}", 100),
-                value=r["id"],
-                description=_truncate(f"{store.open_spots(r)} open", 100),
-                default=(r["id"] == selected),
+                label=_truncate(unit_label(u), 100),
+                value=unit_key(u),
+                description=_truncate(
+                    (f"{fmt_run([r['game_ts'] for r in u['reqs']])} · "
+                     f"{sum(store.open_spots(r) for r in u['reqs'])} open")
+                    if u["kind"] == "run"
+                    else f"{store.open_spots(u['reqs'][0])} open", 100),
+                default=(unit_key(u) == selected),
             )
-            for r in reqs[:25]
+            for u in units[:25]
         ])
         if not opts:
             opts = [discord.SelectOption(label="No open spots right now", value="__none__")]
-        super().__init__(placeholder="Which game…", min_values=1, max_values=1, options=opts, row=row)
+        super().__init__(placeholder="Which game…", min_values=1, max_values=1,
+                         options=opts, row=row)
 
     async def callback(self, interaction: discord.Interaction):
         if self.values[0] == "__none__":
             await interaction.response.defer()
             return
-        self.view.rid = self.values[0]
-        await interaction.response.edit_message(content=self.view.prompt(), view=self.view.build())
+        self.view.key = self.values[0]
+        self.view.on_unit_change()
+        await self.view.refresh(interaction)
 
 
 class FillForMemberSelect(discord.ui.UserSelect):
-    def __init__(self, rid: str, row: int = 1):
-        self.rid = rid
-        super().__init__(placeholder="Choose the teammate to mark in…", min_values=1, max_values=1, row=row)
+    """Picks WHO — and only records the choice. Committing is the button below.
+
+    This select used to fire the fill the instant a name was touched, so a mis-tap
+    put the wrong person on someone else's game with no undo short of ➖ Remove. Every
+    other flow in this cog ends on an explicit button; this one now matches."""
+
+    def __init__(self, selected=None, row: int = 2):
+        # Show who's currently picked, so a rebuilt view doesn't look empty and invite
+        # a second, accidental pick. (discord.py >= 2.4.)
+        defaults = ([discord.SelectDefaultValue.from_user(selected)]
+                    if selected is not None else [])
+        super().__init__(
+            placeholder=("Change who's covering it…" if selected is not None
+                         else "Choose the teammate to mark in…"),
+            min_values=1, max_values=1, row=row, default_values=defaults)
 
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        cog: "Subs" = interaction.client.get_cog("Subs")
-        member = self.values[0]
-        if cog._is_repeat_click(cog._click_cooldown, ("fillfor", interaction.user.id, self.rid, member.id)):
+        self.view.member = self.values[0]
+        await self.view.refresh(interaction)
+
+
+class FillForSubmitButton(discord.ui.Button):
+    def __init__(self, member=None, count: int = 0, row: int = 3):
+        if member is None:
+            label = "Mark them in"
+        else:
+            who = first_name(member.display_name) or member.display_name
+            label = (f"Mark {who} in for {count} dates" if count > 1
+                     else f"Mark {who} in")
+        super().__init__(label=_truncate(label, 80), emoji="✅",
+                         style=discord.ButtonStyle.success, row=row,
+                         disabled=member is None)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: "FillForView" = self.view
+        # One-shot guard, same as PostNeedButton: filling isn't idempotent and an
+        # impatient double-tap must not run twice. Set it before the first await.
+        if view.submitted:
+            try:
+                await interaction.response.defer()
+            except discord.HTTPException:
+                pass
             return
-        result, req = await cog.fill_spot_for(interaction.user, self.rid, member, interaction.channel)
-        when = fmt_when(req["game_ts"]) if req else "that game"
-        msgs = {
-            "added": f"✅  Marked **{member.display_name}** in for **{when}** — they and the requester were notified.",
-            "already": f"**{member.display_name}** is already on that request.",
-            "requester": "That's the requester — they can't sub their own request.",
-            "full": "No open spots left on that request.",
-            "locked": f"**{when}** starts too soon — the roster's locked.",
-            "closed": "That request is no longer on the board.",
-        }
-        await interaction.edit_original_response(content=msgs.get(result, "Done."), view=None)
+        view.submitted = True
+        await interaction.response.defer()
+
+        cog: "Subs" = interaction.client.get_cog("Subs")
+        member, rids = view.member, list(view.rids)
+        if member is None or not rids:
+            view.submitted = False
+            await interaction.edit_original_response(
+                content=("Pick a date and a person first.\n\n" + view.prompt()),
+                view=view.build())
+            return
+        if cog._is_repeat_click(cog._click_cooldown,
+                                ("fillfor", interaction.user.id, tuple(sorted(rids)), member.id)):
+            return
+        filled, skipped, why = await cog.fill_nights_for(
+            interaction.user, rids, member, interaction.channel)
+        if filled:
+            tail = (f" ({skipped} skipped — already covered, locked, or their own request.)"
+                    if skipped else "")
+            msg = (f"✅  Marked **{member.display_name}** in for **{fmt_run(filled)}** — "
+                   f"they and the requester were notified.{tail}")
+        else:
+            msg = {
+                "already": f"**{member.display_name}** is already on all of that.",
+                "requester": "That's the requester — they can't sub their own request.",
+                "full": "No open spots left there.",
+                "locked": "That starts too soon — the roster's locked.",
+                "closed": "That's no longer on the board.",
+            }.get(why, "Nothing there to fill.")
+        await interaction.edit_original_response(content=msg, view=None)
 
 
 # ── Remove (click a name → confirm; cancel a request; clear availability) ─────
@@ -1031,7 +1370,13 @@ class TeamSelect(discord.ui.Select):
 
 
 class GameSelect(discord.ui.Select):
-    def __init__(self, games: list[dict], selected_isos, *, multi: bool, row: int = 2):
+    """The night picker. `placeholder` is the CALLER's to set: this select serves two
+    opposite people — someone saying when they NEED a sub and someone saying when they
+    can BE one — and keying the wording off `multi` instead put "Games you can cover…"
+    in front of a requester the moment the need-a-sub flow went multi-select."""
+
+    def __init__(self, games: list[dict], selected_isos, *, multi: bool, row: int = 2,
+                 placeholder: str | None = None):
         self.multi = multi
         # Real draws, plus the league's own upcoming nights where the schedule
         # doesn't reach yet (flagged in the description so nobody mistakes a
@@ -1053,7 +1398,7 @@ class GameSelect(discord.ui.Select):
                 label="No dates available for this league", value="__none__",
                 description="No schedule and no start date posted yet")]
         super().__init__(
-            placeholder=("Games you can cover…" if multi else "Which game…"),
+            placeholder=(placeholder or ("Which dates…" if multi else "Which game…")),
             min_values=1, max_values=(len(opts) if multi else 1), options=opts, row=row,
         )
 
@@ -1070,92 +1415,164 @@ class GameSelect(discord.ui.Select):
 
 
 class SpotsSelect(discord.ui.Select):
-    def __init__(self, selected: int, row: int = 3):
+    """How many subs this game needs.
+
+    In EDIT mode — an open request already exists for this league + team + night —
+    the number is the new TOTAL, not an increment. "We had one, we need three now"
+    is answered by picking 3, and the sub already on it keeps their spot."""
+
+    def __init__(self, selected: int, row: int = 3, *, editing: bool = False, covered: int = 0):
         opts = [
-            discord.SelectOption(label=f"{n} spot{'s' if n > 1 else ''} needed", value=str(n), default=(n == selected))
+            discord.SelectOption(
+                label=f"{n} spot{'s' if n > 1 else ''} needed"
+                      + (" — current" if editing and n == selected else ""),
+                value=str(n),
+                description=("fewer than the subs already on it" if n < covered else None),
+                default=(n == selected))
             for n in range(1, 5)
         ]
-        super().__init__(placeholder="How many subs needed…", min_values=1, max_values=1, options=opts, row=row)
+        super().__init__(placeholder=("Total spots needed…" if editing else "How many subs needed…"),
+                         min_values=1, max_values=1, options=opts, row=row)
 
     async def callback(self, interaction: discord.Interaction):
         self.view.spots = int(self.values[0])
+        self.view.spots_touched = True
         await self.view.refresh(interaction)
 
 
-# ── Need-a-sub flow (ephemeral, league → team → game → spots → details) ──────
+# ── Need-a-sub flow (ephemeral, league → team → date(s) → spots) ────────────
+# One flow, three outcomes:
+#   • one date, nothing open for it   → post a request
+#   • one date, a request ALREADY open for that league+team+date → EDIT its spot
+#     count. This used to be a dead end ("already open, change something and
+#     re-post"), which left a team that found one sub and then needed two more with
+#     no move but cancelling — losing the sub they had.
+#   • several dates ticked → one request PER DATE sharing a series_id. That id is a
+#     bulk-input tag and nothing more: each date is an ordinary, independent sub
+#     opportunity from the moment it's posted. Naming who'll cover them is a separate
+#     step (Fill for someone, offered right on the alert), not part of posting.
+
 
 class NeedSubFlowView(discord.ui.View):
-    def __init__(self, leagues: list[dict]):
+    def __init__(self, leagues: list[dict], state: dict | None = None, requester_id=None):
         super().__init__(timeout=300)
         self.leagues = leagues
+        # The live store, for spotting a request that already covers the chosen date.
+        self.state = state if state is not None else {"requests": []}
+        self.requester_id = requester_id
         self.league_id = None
         self.team = None
-        self.game_iso = None
+        self.game_isos: list[str] = []
         self.spots = 1
+        self.spots_touched = False   # once they pick a number, stop defaulting it
         self.message = None
         self.posted = False  # one-shot guard: a posted flow can't post again
         self.build()
 
+    # -- selection state ----------------------------------------------------
     def league(self) -> dict | None:
         return next((l for l in self.leagues if str(l["id"]) == str(self.league_id)), None)
 
     def on_league_change(self):
         self.team = None
-        self.game_iso = None
+        self.game_isos = []
 
+    def games(self) -> list[dict]:
+        lg = self.league()
+        return game_options(lg, club_now()) if lg else []
+
+    def dates(self) -> list[str]:
+        """Exactly the dates ticked — nothing is inferred or extended. Whoever posts
+        chooses each date on purpose."""
+        return sorted(set(self.game_isos))
+
+    def existing(self) -> dict | None:
+        """The open request this post would collide with. Only meaningful for a single
+        date — a multi-date post lays over whatever is already there rather than
+        editing it."""
+        d = self.dates()
+        if len(d) != 1:
+            return None
+        return _find_open_duplicate(self.state, self.league_id, d[0], self.team or "",
+                                    requester_id=self.requester_id)
+
+    def ready(self) -> bool:
+        # League + at least one date. WHEN you need a sub is the point of the request,
+        # so a date is never optional — for an unscheduled league the picker projects
+        # real league dates off the title's start date rather than letting the request
+        # go out dateless (see projected_games). Only the TEAM is optional, since
+        # chairs set teams late.
+        return self.league() is not None and bool(self.dates())
+
+    # -- rendering ----------------------------------------------------------
     def build(self) -> "NeedSubFlowView":
         self.clear_items()
         self.add_item(LeagueSelect(self.leagues, self.league_id, row=0))
         lg = self.league()
         if lg:
-            names = lg.get("team_names") or []
             # Team is picked from the league's roster only (no free-typing).
-            self.add_item(TeamSelect(names, self.team, row=1))
+            self.add_item(TeamSelect(lg.get("team_names") or [], self.team, row=1))
+            # Multi-select: ticking several dates posts each one as its own request.
             self.add_item(GameSelect(
-                game_options(lg, club_now()),
-                [self.game_iso] if self.game_iso else [],
-                multi=False, row=2,
-            ))
-            self.add_item(SpotsSelect(self.spots, row=3))
-            self.add_item(PostNeedButton(disabled=not self.ready(), row=4))
+                self.games(), self.game_isos, multi=True, row=2,
+                placeholder="Which date — tick as many as you need…"))
+            ex = self.existing()
+            shown = self.spots
+            if ex is not None and not self.spots_touched:
+                shown = int(ex["spots_needed"])   # start from what the request asks now
+                self.spots = shown
+            self.add_item(SpotsSelect(shown, row=3, editing=ex is not None,
+                                      covered=store.covered(ex) if ex else 0))
+            self.add_item(PostNeedButton(disabled=not self.ready(), editing=ex is not None,
+                                         count=len(self.dates()), row=4))
         return self
-
-    def ready(self) -> bool:
-        # League + game. WHEN you need a sub is the point of the request, so a
-        # date is never optional — for an unscheduled league the picker projects
-        # real league nights off the title's start date rather than letting the
-        # request go out dateless (see projected_games). Only the TEAM is
-        # optional, since chairs set teams late.
-        return self.league() is not None and bool(self.game_iso)
 
     def prompt(self) -> str:
         lg = self.league()
         if not lg:
             return "**Need a sub** — pick the league:"
+        d = self.dates()
+        ex = self.existing()
         parts = [f"League: **{league_label(lg)}**"]
         parts.append(f"Team: **{self.team}**" if self.team else "Team: **not set**")
-        parts.append(f"Game: **{fmt_when(self.game_iso)}**" if self.game_iso
-                     else "Game: **not set**")
-        parts.append(f"Spots: **{self.spots}**")
-        tail = ("Press **Post request**." if self.ready()
-                else "Pick which game — the team is optional if it isn't set yet.")
-        return "**Need a sub** — " + " · ".join(parts) + f"\n{tail}"
+        parts.append(f"When: **{fmt_run(d)}**" if d else "When: **not set**")
+        parts.append(f"Spots: **{self.spots}**" + (" a date" if len(d) > 1 else ""))
+        head = "**Need a sub** — " + " · ".join(parts)
+
+        if ex is not None:
+            cov = store.covered(ex)
+            return (head + f"\n⚠️  There's already an open request for that date — "
+                           f"**{cov}/{ex['spots_needed']}** covered. Set the **total** number "
+                           f"of spots you need and press **Update spots**; whoever's already "
+                           f"on it keeps their place.")
+        if not self.ready():
+            return (head + "\nPick the date — tick as many as you need. The team is optional "
+                           "if it isn't set yet.")
+        if len(d) > 1:
+            return head + f"\nPress **Post {len(d)} dates** — each one goes up as its own request."
+        return head + "\nPress **Post request**."
 
     async def refresh(self, interaction: discord.Interaction):
         await interaction.response.edit_message(content=self.prompt(), view=self.build())
 
 
 class PostNeedButton(discord.ui.Button):
-    def __init__(self, *, disabled: bool, row: int = 4):
-        super().__init__(label="Post request", emoji="✅", style=discord.ButtonStyle.success, row=row, disabled=disabled)
+    def __init__(self, *, disabled: bool, editing: bool = False, count: int = 1, row: int = 4):
+        if editing:
+            label, emoji = "Update spots", "✏️"
+        elif count > 1:
+            label, emoji = f"Post {count} dates", "✅"
+        else:
+            label, emoji = "Post request", "✅"
+        super().__init__(label=label, emoji=emoji, style=discord.ButtonStyle.success,
+                         row=row, disabled=disabled)
 
     async def callback(self, interaction: discord.Interaction):
         f: NeedSubFlowView = self.view
-        # One-shot guard: posting isn't idempotent (each call appends a new
-        # request), so an impatient double-tap would post twice. Set the flag
-        # synchronously — before any await — so a second callback (which can only
-        # run once this one yields) sees it and bails. Belt-and-braces with the
-        # button being removed from the view on success below.
+        # One-shot guard: posting isn't idempotent (each call appends requests), so an
+        # impatient double-tap would post twice. Set the flag synchronously — before
+        # any await — so a second callback (which can only run once this one yields)
+        # sees it and bails. Belt-and-braces with the button being removed on success.
         if f.posted:
             try:
                 await interaction.response.defer()
@@ -1172,34 +1589,63 @@ class PostNeedButton(discord.ui.Button):
         lg = f.league()
         title = league_label(lg) if lg else ""
         cog: "Subs" = interaction.client.get_cog("Subs")
-        status, req = await cog.add_request(
-            requester=interaction.user,
-            league_id=f.league_id or "",
-            league=title,
-            team=f.team or "",
-            game_ts=f.game_iso,
-            spots=f.spots,
-            channel=interaction.channel,
-        )
-        if status == "duplicate":
-            # Don't stack an identical request on the board. Keep the flow open so
-            # they can tweak the team/game and re-post if it really is different.
+        dates = f.dates()
+        ex = f.existing()
+
+        # ── Edit: change the spot count on the request that's already up ──────
+        if ex is not None:
+            result, req = await cog.set_request_spots(
+                interaction.user, ex["id"], f.spots, channel=interaction.channel)
+            if result == "ok":
+                opn = store.open_spots(req) if req else 0
+                await interaction.edit_original_response(
+                    content=(f"✏️  **{fmt_when(dates[0])}** now needs **{f.spots}** — "
+                             f"{opn} still open. The board and the alert are updated, and "
+                             "anyone available has been re-tagged."),
+                    view=None)
+                return
+            msgs = {
+                "unchanged": f"That request already asks for **{f.spots}**.",
+                "too_low": ("Can't drop below the people already on it — take someone off "
+                            "with **➖ Remove** first. (Only the person who posted it can "
+                            "lower the count.)"),
+                "locked": "That game starts too soon — its roster is locked.",
+                "closed": "That request is no longer on the board.",
+            }
+            f.posted = False
+            await interaction.edit_original_response(
+                content=msgs.get(result, "Nothing changed.") + "\n\n" + f.prompt(),
+                view=f.build())
+            return
+
+        # ── Post: one request per date, sharing a series_id when there's more ──
+        made, skipped, filled = await cog.add_series(
+            requester=interaction.user, league_id=f.league_id or "", league=title,
+            team=f.team or "", game_isos=dates, spots=f.spots,
+            channel=interaction.channel)
+
+        if not made:
             f.posted = False
             who = f"**{f.team}**" if f.team else "**you**"
             await interaction.edit_original_response(
-                content=(f"⚠️  There's already an open request for {who} · "
-                         f"{fmt_when(f.game_iso)}. Claim or **Remove** that one instead — "
-                         "or change the team/game below and re-post.\n\n" + f.prompt()),
-                view=f.build(),
-            )
+                content=(f"⚠️  There's already an open request for {who} on every date you "
+                         f"picked. Pick a single date to raise its spot count, or use "
+                         f"**➖ Remove** on the existing one.\n\n" + f.prompt()),
+                view=f.build())
             return
-        # No invites/DMs — anyone available is tagged on the board's alert and can
-        # just hit "I'll take it".
-        await interaction.edit_original_response(
-            content=(f"✅  Posted: **{title}** · {f.team or 'no team named'} · "
-                     f"{fmt_when(f.game_iso)} · needs {f.spots}.\n"
-                     "It's on the board — anyone available has been tagged and can hit **I'll take it**."),
-            view=None)
+
+        bits = [f"✅  Posted **{title}** · {f.team or 'no team named'} · {fmt_run(dates)} · "
+                f"{f.spots} spot{'s' if f.spots != 1 else ''}"
+                f"{' a date' if len(dates) > 1 else ''}."]
+        if skipped:
+            bits.append(f"({skipped} date{'s' if skipped != 1 else ''} already had an open "
+                        f"request — left alone.)")
+        bits.append("Anyone available has been tagged. If you already know who's covering "
+                    "them, hit **Fill for someone** on the alert."
+                    if len(dates) > 1 else
+                    "It's on the board — anyone available has been tagged and can hit "
+                    "**I'll take it**.")
+        await interaction.edit_original_response(content=" ".join(bits), view=None)
 
 
 # ── Available-to-sub flow (ephemeral, league → games) ───────────────────────
@@ -1233,7 +1679,8 @@ class AvailFlowView(discord.ui.View):
         if lg:
             games = game_options(lg, club_now())
             if games:
-                self.add_item(GameSelect(games, self.game_isos, multi=True, row=row))
+                self.add_item(GameSelect(games, self.game_isos, multi=True, row=row,
+                                         placeholder="Games you can cover…"))
                 row += 1
             self.add_item(PostAvailButton(row=row))
         return self
@@ -1341,8 +1788,20 @@ def _my_requests(state: dict, uid: int) -> list[dict]:
     return [r for r in store.requests_sorted(state) if r.get("requester_id") == uid]
 
 
+def _avail_label(a: dict) -> str:
+    """How one availability listing reads in a picker/confirm: the league, plus the
+    games it covers (or "any game")."""
+    league = stored_league(a.get("league", "")) or "League"
+    games = ", ".join(fmt_when_short(g) for g in (a.get("games") or [])) or "any game"
+    return f"{league} · {games}"
+
+
 class RemoveAvailSelect(discord.ui.Select):
-    """Remove one of the caller's availability listings (keyed by league)."""
+    """Pick one of the caller's availability listings to clear. Picking only OPENS the
+    confirm — the other two selects in this menu (remove a sub, cancel a request) both
+    confirm before acting, and a stray tap here silently un-volunteers you from a game
+    people may already be counting on you for."""
+
     def __init__(self, entries: list[dict], row: int | None = None):
         opts = _unique_options([
             discord.SelectOption(
@@ -1357,20 +1816,68 @@ class RemoveAvailSelect(discord.ui.Select):
                          options=opts, min_values=1, max_values=1, row=row)
 
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer()
         cog: "Subs" = interaction.client.get_cog("Subs")
         league_id = "" if self.values[0] == "__nolg__" else self.values[0]
-        removed = await cog.remove_availability(interaction.user.id, league_id, interaction.channel)
-        msg = "🗑️  Removed that availability listing." if removed else "That listing was already gone."
+        entry = store.find_availability(cog.state, interaction.user.id, league_id)
+        if entry is None:
+            await interaction.response.edit_message(
+                content="That listing is already gone.", view=None)
+            return
+        await interaction.response.edit_message(
+            content=f"Clear your availability for **{_avail_label(entry)}**?",
+            view=ConfirmRemoveAvailView(league_id, _avail_label(entry)))
+
+
+class ConfirmRemoveAvailView(discord.ui.View):
+    def __init__(self, league_id: str, label: str):
+        super().__init__(timeout=120)
+        self.league_id = league_id
+        self.label = label
+
+    @discord.ui.button(label="Clear it", emoji="🗑️", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        cog: "Subs" = interaction.client.get_cog("Subs")
+        if cog._is_repeat_click(cog._click_cooldown,
+                                ("rmavail", interaction.user.id, self.league_id)):
+            return
+        removed = await cog.remove_availability(
+            interaction.user.id, self.league_id, interaction.channel)
+        msg = (f"🗑️  Cleared your availability for **{self.label}**." if removed
+               else "That listing was already gone.")
         await interaction.edit_original_response(content=msg, view=None)
+
+    @discord.ui.button(label="Keep", style=discord.ButtonStyle.secondary)
+    async def keep(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content="Okay — you're still listed as available.", view=None)
 
 
 # ── Alert page (public "sub needed" message with a one-tap claim button) ──────
 
 class PageView(discord.ui.View):
-    def __init__(self, rid: str):
+    """The buttons on an alert page.
+
+    One date: the plain hand-raise. Several: take them all, or take some — and either
+    way, **Fill for someone**, pre-aimed at this posting. That last one matters more
+    than it looks: posting no longer asks who's covering the dates, so this alert is
+    where "Ben's got Tuesdays" actually gets recorded, one tap from the ask."""
+
+    def __init__(self, rid: str, series_id: str = "", dates: int = 0):
         super().__init__(timeout=None)
-        self.add_item(PageClaimButton(rid))
+        if series_id:
+            self.add_item(SeriesClaimButton(
+                series_id, label=f"Take {dates} dates" if dates else "Take them all"))
+            self.add_item(RunPickButton(series_id, label="I'll take some…",
+                                        style=discord.ButtonStyle.secondary))
+            # Secondary: on an alert the green button is the ask ("take it"), and
+            # recording it for someone else is the quieter, less common answer.
+            self.add_item(FillForButton(f"run:{series_id}",
+                                        style=discord.ButtonStyle.secondary))
+        else:
+            self.add_item(PageClaimButton(rid))
+            self.add_item(FillForButton(f"one:{rid}",
+                                        style=discord.ButtonStyle.secondary))
 
 
 class PageClaimButton(discord.ui.DynamicItem[discord.ui.Button],
@@ -1405,6 +1912,159 @@ class PageClaimButton(discord.ui.DynamicItem[discord.ui.Button],
             "closed": "That request is no longer on the board.",
         }
         await interaction.followup.send(msgs.get(result, "Done."), ephemeral=True)
+
+
+class NightSelect(discord.ui.Select):
+    """Which nights of a run to act on.
+
+    Values are REQUEST ids, not timestamps: a run is N separate requests and every
+    mutation downstream takes a request id, so resolving it here means nothing has to
+    match dates back to records later. Only open, unlocked nights are ever offered."""
+
+    def __init__(self, reqs: list[dict], selected_rids, row: int = 0):
+        opts = _unique_options([
+            discord.SelectOption(
+                label=_truncate(fmt_when(r["game_ts"]), 100),
+                value=r["id"],
+                description=_truncate(f"{store.open_spots(r)} open", 100),
+                default=(r["id"] in (selected_rids or [])),
+            )
+            for r in reqs[:25]
+        ])
+        super().__init__(placeholder="Which dates…", min_values=1,
+                         max_values=len(opts), options=opts, row=row)
+
+    async def callback(self, interaction: discord.Interaction):
+        self.view.rids = list(self.values)
+        await self.view.refresh(interaction)
+
+
+class TakeNightsButton(discord.ui.Button):
+    def __init__(self, count: int, row: int = 1):
+        super().__init__(label=f"Take {count} date{'s' if count != 1 else ''}",
+                         emoji="🙋", style=discord.ButtonStyle.success, row=row)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        view: "NightPickView" = self.view
+        cog: "Subs" = interaction.client.get_cog("Subs")
+        if cog._is_repeat_click(cog._click_cooldown,
+                                ("takenights", interaction.user.id, tuple(sorted(view.rids)))):
+            return
+        took, skipped = await cog.claim_nights(interaction.user, view.rids, interaction.channel)
+        if not took:
+            await interaction.edit_original_response(
+                content="Nothing there to take any more — covered, locked, or your own request.",
+                view=None)
+            return
+        tail = (f" ({skipped} of the ones you picked got taken or locked first.)"
+                if skipped else "")
+        await interaction.edit_original_response(
+            content=f"✅  You're in for **{fmt_run(took)}** — thanks for covering!{tail}",
+            view=None)
+
+
+class NightPickView(discord.ui.View):
+    """Pick which nights of a run to take. Every open night starts TICKED: covering the
+    whole run is the common case and shouldn't cost eight taps, while unticking is the
+    only way "I can do the first two but not the rest" can be expressed at all."""
+
+    def __init__(self, state: dict, sid: str):
+        super().__init__(timeout=300)
+        self.state = state
+        self.sid = sid
+        self.rids = [r["id"] for r in self.nights()]
+        self.build()
+
+    def nights(self) -> list[dict]:
+        return [r for r in store.series_requests(self.state, self.sid)
+                if store.open_spots(r) > 0 and not is_locked(r)]
+
+    def build(self) -> "NightPickView":
+        self.clear_items()
+        ns = self.nights()
+        if ns:
+            self.add_item(NightSelect(ns, self.rids, row=0))
+            self.add_item(TakeNightsButton(len(self.rids), row=1))
+        return self
+
+    def prompt(self) -> str:
+        ns = self.nights()
+        if not ns:
+            return "Nothing open on those dates any more — someone got there first."
+        head = f"**{_req_for(ns[0])}** · {fmt_run([r['game_ts'] for r in ns])}\n"
+        if len(ns) > 25:
+            # Discord caps a select at 25 options. The button still takes ALL of them
+            # (rids starts from the full list), so the cap only limits *unticking* —
+            # say so rather than letting the list look complete.
+            return (head + f"All {len(ns)} are ticked and the button takes every one. "
+                           f"Only the first 25 can be unticked here — for a finer split, "
+                           f"take these and drop what you can't make with **➖ Remove**.")
+        return head + f"All {len(ns)} are ticked. Untick any you can't make, then press the button."
+
+    async def refresh(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(content=self.prompt(), view=self.build())
+
+
+class RunPickButton(discord.ui.DynamicItem[discord.ui.Button],
+                    template=r"sub:pickrun:(?P<sid>[0-9a-f]+)"):
+    """A run's single button — on the board, and beside the one-tap button on an alert
+    page. Opens the night picker rather than acting, because a run is the one case
+    where "all of it" and "some of it" are both ordinary answers."""
+
+    def __init__(self, sid: str, *, label: str = "I'll take some…", emoji: str = "🙋",
+                 style: discord.ButtonStyle = discord.ButtonStyle.success,
+                 row: int | None = None):
+        self.sid = sid
+        super().__init__(discord.ui.Button(
+            label=label, emoji=emoji, style=style, row=row,
+            custom_id=f"{CID_PICK_RUN_PREFIX}{sid}"))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match["sid"])
+
+    async def callback(self, interaction: discord.Interaction):
+        cog: "Subs" = interaction.client.get_cog("Subs")
+        view = NightPickView(cog.state, self.sid)
+        await interaction.response.send_message(content=view.prompt(),
+                                                view=view if view.nights() else None,
+                                                ephemeral=True)
+
+
+class SeriesClaimButton(discord.ui.DynamicItem[discord.ui.Button],
+                        template=r"sub:takerun:(?P<sid>[0-9a-f]+)"):
+    """One tap covers every open night of a run. Saying "I'll take Tuesdays" is a
+    single decision, so it should cost a single click — the nights stay separate
+    requests underneath, so any one of them can still be dropped later."""
+
+    def __init__(self, sid: str, *, label: str = "I'll take them all"):
+        self.sid = sid
+        super().__init__(discord.ui.Button(
+            label=label, emoji="🙋",
+            style=discord.ButtonStyle.success,
+            custom_id=f"{CID_TAKE_RUN_PREFIX}{sid}"))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match["sid"])
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        cog: "Subs" = interaction.client.get_cog("Subs")
+        if cog._is_repeat_click(cog._click_cooldown, ("takerun", interaction.user.id, self.sid)):
+            return
+        took, skipped = await cog.claim_series(interaction.user, self.sid, interaction.channel)
+        if not took:
+            await interaction.followup.send(
+                "Nothing left to take there — it's covered, locked, or yours. "
+                "Thanks anyway!", ephemeral=True)
+            return
+        tail = (f" ({skipped} date{'s' if skipped != 1 else ''} were already covered or "
+                f"too close to start.)" if skipped else "")
+        await interaction.followup.send(
+            f"✅  You're in for **{fmt_run(took)}** — thanks for covering!{tail}",
+            ephemeral=True)
 
 
 # ── The cog ─────────────────────────────────────────────────────────────────
@@ -1537,25 +2197,49 @@ class Subs(commands.Cog):
 
 
     # -- alert pages ("sub needed" pings + one-tap claim) -------------------
+    def _series_open(self, req: dict, reason: str = "new") -> list[dict]:
+        """The still-claimable nights of `req`'s run — the unit a "new"/"bump" alert
+        speaks about, so an 8-week arrangement pings the room ONCE instead of eight
+        times. A REMINDER is always about the single night that's a few hours away,
+        so it never aggregates. Returns [] for anything that isn't a live run."""
+        if reason == "reminder":
+            return []
+        run = [r for r in store.series_requests(self.state, req.get("series_id", ""))
+               if store.open_spots(r) > 0 and not is_locked(r)]
+        return run if len(run) > 1 else []
+
+    def _page_view(self, req: dict, reason: str = "new") -> discord.ui.View:
+        run = self._series_open(req, reason)
+        if not run:
+            return PageView(req["id"])
+        return PageView(run[0]["id"], series_id=str(req.get("series_id") or ""),
+                        dates=len(run))
+
     def _page_body(self, req: dict, *, reason: str) -> str:
         heads = {
             "new":      "🆘 **Sub needed**",
             "bump":     "🔔 **Still need a sub**",
             "reminder": "⏰ **Game soon — still need a sub**",
         }
+        run = self._series_open(req, reason)
         league = stored_league(req.get("league", ""))
-        when = fmt_when(req["game_ts"])
-        opn = store.open_spots(req)
-        detail = " · ".join(x for x in [
-            league or None, _req_for(req), when,
-            f"{opn} spot{'s' if opn != 1 else ''} open",
-        ] if x)
+        if run:
+            when = fmt_run([r["game_ts"] for r in run])
+            opn = sum(store.open_spots(r) for r in run)
+            spots_txt = f"{opn} spot{'s' if opn != 1 else ''} open in total"
+        else:
+            when = fmt_when(req["game_ts"])
+            opn = store.open_spots(req)
+            spots_txt = f"{opn} spot{'s' if opn != 1 else ''} open"
+        detail = " · ".join(x for x in [league or None, _req_for(req), when, spots_txt] if x)
         subs = _availability_for_request(self.state, req)
         mentions = " ".join(f"<@{a['user_id']}>" for a in subs)
+        verb = "take any or all of them" if run else "grab it"
         if mentions:
-            tail = f"{mentions} — you're listed as available. Tap to grab it:"
+            tail = f"{mentions} — you're listed as available. Tap to {verb}:"
         else:
-            tail = "_No one's listed as available yet — first to tap grabs it:_"
+            tail = ("_No one's listed as available yet — first to tap takes "
+                    f"{'them' if run else 'it'}:_")
         return f"{heads.get(reason, heads['new'])}\n{detail}\n{tail}"
 
     async def _delete_page(self, req: dict):
@@ -1587,7 +2271,7 @@ class Subs(commands.Cog):
         await self._delete_page(req)
         body = self._page_body(req, reason=reason)
         try:
-            msg = await ch.send(body, view=PageView(req["id"]),
+            msg = await ch.send(body, view=self._page_view(req, reason),
                                 allowed_mentions=discord.AllowedMentions(users=True))
         except discord.HTTPException as e:
             log.warning("Could not post sub alert page: %s", e)
@@ -1608,12 +2292,20 @@ class Subs(commands.Cog):
         if ch is None:
             return
         partial = ch.get_partial_message(alert["message_id"])
-        still_open = store.find_request(self.state, req["id"]) is not None and store.open_spots(req) > 0
+        # A run's page stays live while ANY of its nights is still open, even once the
+        # night it was posted for has filled — otherwise covering week 1 would retire
+        # the ask for the other seven.
+        run = self._series_open(req)
+        live = store.find_request(self.state, req["id"]) is not None
+        still_open = live and (bool(run) or store.open_spots(req) > 0)
         try:
             if still_open:
-                await partial.edit(content=self._page_body(req, reason="new"), view=PageView(req["id"]))
+                await partial.edit(content=self._page_body(req, reason="new"),
+                                   view=self._page_view(req))
                 return
-            await partial.edit(content=f"✅  Covered — thanks! ({fmt_when(req['game_ts'])})", view=None)
+            covered_what = ("every date" if req.get("series_id")
+                            else fmt_when(req["game_ts"]))
+            await partial.edit(content=f"✅  Covered — thanks! ({covered_what})", view=None)
         except discord.HTTPException:
             pass
         async with self._lock:
@@ -1676,39 +2368,221 @@ class Subs(commands.Cog):
                 if not lg.get("ended") and not league_is_over(lg, now)]
 
     # -- mutations (called from button/modal callbacks) ---------------------
-    async def add_request(self, *, requester, spots, game_ts="", league_id="", league="",
-                          team="", channel=None):
-        """Create a request, unless an open one already exists for the same league +
-        game + team. Returns (status, req): ("duplicate", existing) or ("created", new).
-        The dup check + create happen under one lock so two posts can't both slip in.
-        `game_ts` and `team` are both optional — a request may be no more than
-        "<name> needs a sub in <league>"."""
-        async with self._lock:
-            dup = _find_open_duplicate(self.state, league_id, game_ts, team,
-                                       requester_id=requester.id)
-            if dup is not None:
-                return ("duplicate", dup)
-            req = store.new_request(
-                self.state,
-                requester_id=requester.id,
-                requester_name=requester.display_name,
-                game_ts=game_ts,
-                spots_needed=spots,
-                league_id=league_id,
-                league=league,
-                team=team,
-                guild_id=self._guild_id(channel),
-                channel_id=getattr(channel, "id", None),
-                now=club_now(),
-            )
-            self._save()
-        # Refresh this server's board (create it here if it has none yet), then post
-        # the public alert page in this channel — it pings the members available for
-        # this game and carries a one-tap "I'll take it" button.
-        await self.render_board(self._guild_id(channel), fallback_channel=channel)
-        await self.post_page(req, reason="new", channel=channel)
-        return ("created", req)
+    async def add_series(self, *, requester, league_id, league, team, game_isos, spots,
+                         channel=None) -> tuple[int, int, int]:
+        """Post one or more nights as ordinary requests, sharing a series_id when
+        there's more than one. A single date is just a posting of one and goes through
+        here too, so there's exactly one create path.
 
+        A date that ALREADY has an open request is left alone — dates laid over one
+        someone posted by hand must not double-book it.
+
+        The whole posting goes out under ONE alert: eight pings for eight Tuesdays is
+        how a useful board becomes a muted one. Naming who covers them is a separate
+        step (Fill for someone, offered on that alert).
+
+        Returns (created, skipped, filled) — `filled` is always 0 now and kept only so
+        callers don't have to change shape."""
+        isos = list(dict.fromkeys(game_isos))          # dedupe, keep order
+        sid = uuid.uuid4().hex[:8] if len(isos) > 1 else ""
+        created, skipped, filled = [], 0, 0
+        async with self._lock:
+            for iso in isos:
+                dup = _find_open_duplicate(self.state, league_id, iso, team,
+                                           requester_id=requester.id)
+                if dup is not None:
+                    skipped += 1
+                    continue
+                req = store.new_request(
+                    self.state,
+                    requester_id=requester.id,
+                    requester_name=requester.display_name,
+                    game_ts=iso,
+                    spots_needed=spots,
+                    league_id=league_id,
+                    league=league,
+                    team=team,
+                    series_id=sid,
+                    guild_id=self._guild_id(channel),
+                    channel_id=getattr(channel, "id", None),
+                    now=club_now(),
+                )
+                created.append(req)
+            if created or filled:
+                self._save()
+        if not (created or filled):
+            return (0, skipped, 0)
+        await self.render_board(self._guild_id(channel), fallback_channel=channel)
+        # One alert for the whole run, anchored on its soonest still-open night.
+        anchor = next((r for r in created if store.open_spots(r) > 0), None)
+        if anchor is not None:
+            await self.post_page(anchor, reason="new", channel=channel)
+        return (len(created), skipped, filled)
+
+    async def set_request_spots(self, actor, rid: str, spots: int,
+                                channel=None) -> tuple[str, dict | None]:
+        """Change how many subs a live request needs — the "we found one, now we need
+        two more" case, which used to have no answer but cancelling and re-posting
+        (losing the sub already on it).
+
+        ANYONE may RAISE the count: the team, not the poster, is who lost players, and
+        whoever is at the keyboard isn't always whoever posted. Only the requester may
+        LOWER it — that's the same call as cancelling part of their own ask.
+
+        Returns (result, req): "ok" | "unchanged" | "too_low" | "locked" | "closed"."""
+        async with self._lock:
+            req = store.find_request(self.state, rid)
+            if req is None:
+                return ("closed", None)
+            if is_locked(req):
+                return ("locked", req)
+            n = int(spots)
+            if n < int(req["spots_needed"]) and actor.id != req.get("requester_id"):
+                return ("too_low", req)
+            before_open = store.open_spots(req)
+            result = store.set_spots(req, n)
+            if result == "ok":
+                # Spots that just opened deserve their own shout. The pre-game
+                # reminder has to be re-armed too, or a request that already fired one
+                # while it was covered would never chase these new spots.
+                if store.open_spots(req) > before_open:
+                    req["reminded"] = False
+                self._save()
+            requester_id = req["requester_id"]
+            when = fmt_when(req["game_ts"])
+            opened = store.open_spots(req) - before_open
+            opn = store.open_spots(req)
+        if result != "ok":
+            return (result, req)
+        await self.bump_board(self._guild_id(channel), fallback_channel=channel)
+        if opened > 0 and opn > 0:
+            # Re-ping: nobody re-reads an alert that already said "covered".
+            await self.post_page(req, reason="bump", channel=channel)
+        else:
+            await self.refresh_page(req)
+        if requester_id != actor.id:
+            await self._dm_requester(
+                requester_id,
+                f"🥌 {actor.display_name} set your {when} game to {n} sub"
+                f"{'s' if n != 1 else ''} needed — {opn} open.")
+        return (result, req)
+
+    async def _refresh_pages_for(self, rids, sids) -> None:
+        """Refresh whichever affected requests carry a live alert page. A run's page
+        lives on ONE of its nights, and that needn't be one of the nights just acted on
+        — so refresh the whole series, not only what changed, or the page keeps
+        advertising spots that are gone."""
+        targets, seen = [], set()
+        for sid in {str(x or "") for x in sids} - {""}:
+            targets += store.series_requests(self.state, sid)
+        for rid in rids:
+            r = store.find_request(self.state, rid)
+            if r is not None:
+                targets.append(r)
+        for r in targets:
+            if r["id"] in seen:
+                continue
+            seen.add(r["id"])
+            await self.refresh_page(r)
+
+    async def claim_nights(self, user, rids, channel=None) -> tuple[list[str], int]:
+        """Fill `user` into each of these nights (request ids) as ONE action — the night
+        picker's "take these five of eight", and the whole-run one-tap underneath.
+
+        Skips nights they're already on, ones that are full, ones whose roster has
+        locked, and any they opened themselves: a partial cover is a good outcome, so
+        nothing here is all-or-nothing. One board repost and one DM for the lot, not one
+        per night. Returns (nights taken, nights skipped)."""
+        took: list[str] = []
+        skipped = 0
+        sids, requester_id = set(), None
+        async with self._lock:
+            for rid in rids:
+                r = store.find_request(self.state, rid)
+                if r is None:
+                    skipped += 1
+                    continue
+                if requester_id is None:
+                    requester_id = r.get("requester_id")
+                if (is_locked(r) or store.open_spots(r) <= 0
+                        or user.id == r.get("requester_id")
+                        or store.is_involved(r, user.id)):
+                    skipped += 1
+                    continue
+                if store.add_sub(r, user.id, user.display_name, now=club_now()) == "added":
+                    took.append(r["game_ts"])
+                    sids.add(r.get("series_id") or "")
+                else:
+                    skipped += 1
+            if took:
+                self._save()
+        if not took:
+            return (took, skipped)
+        took.sort()
+        await self.bump_board(self._guild_id(channel), fallback_channel=channel)
+        await self._refresh_pages_for(rids, sids)
+        if requester_id is not None and requester_id != user.id:
+            await self._dm_requester(
+                requester_id,
+                f"🥌 {user.display_name} is covering {len(took)} date"
+                f"{'s' if len(took) != 1 else ''} for you — {fmt_run(took)}.")
+        return (took, skipped)
+
+    async def claim_series(self, user, sid: str, channel=None) -> tuple[list[str], int]:
+        """One-tap "I'll take the whole run" from an alert page. Every night of the run
+        goes through claim_nights, which skips whatever isn't actually takeable."""
+        async with self._lock:
+            rids = [r["id"] for r in store.series_requests(self.state, sid)]
+        return await self.claim_nights(user, rids, channel)
+
+    async def fill_nights_for(self, actor, rids, member, channel=None) -> tuple[list[str], int, str]:
+        """Mark `member` into these nights (offline sync — they told someone they'd
+        cover it). The same one-or-all power as claiming for yourself, because "Ben says
+        he'll do the rest of Tuesdays" is one thing that happened, not eight.
+
+        Returns (nights filled, nights skipped, dominant skip reason) — the reason lets
+        the single-night case keep its precise wording instead of a vague count."""
+        filled: list[str] = []
+        reasons: dict[str, int] = {}
+        sids, requester_id = set(), None
+
+        def note(k):
+            reasons[k] = reasons.get(k, 0) + 1
+
+        async with self._lock:
+            for rid in rids:
+                r = store.find_request(self.state, rid)
+                if r is None:
+                    note("closed")
+                    continue
+                if requester_id is None:
+                    requester_id = r.get("requester_id")
+                if is_locked(r):
+                    note("locked")
+                elif member.id == r.get("requester_id"):
+                    note("requester")          # can't sub your own request
+                elif store.is_involved(r, member.id):
+                    note("already")
+                elif store.add_sub(r, member.id, member.display_name, now=club_now()) == "added":
+                    filled.append(r["game_ts"])
+                    sids.add(r.get("series_id") or "")
+                else:
+                    note("full")
+            if filled:
+                self._save()
+        skipped = sum(reasons.values())
+        top = max(reasons, key=reasons.get) if reasons else ""
+        if not filled:
+            return ([], skipped, top)
+        filled.sort()
+        await self.bump_board(self._guild_id(channel), fallback_channel=channel)
+        await self._refresh_pages_for(rids, sids)
+        if requester_id is not None and requester_id != actor.id:
+            await self._dm_requester(
+                requester_id,
+                f"🥌 {actor.display_name} put {member.display_name} on {len(filled)} date"
+                f"{'s' if len(filled) != 1 else ''} for you — {fmt_run(filled)}.")
+        return (filled, skipped, top)
 
     @staticmethod
     def _is_repeat_click(cooldown: dict, key) -> bool:
@@ -1774,36 +2648,6 @@ class Subs(commands.Cog):
                 f"🥌 {user.display_name} took a sub spot for your {when} game — {opn} still open.")
         return (result, req)
 
-    async def fill_spot_for(self, actor, rid: str, member, channel=None) -> tuple[str, dict | None]:
-        """Any member marks `member` into an open spot on request `rid` (offline sync).
-        Direct fill — no confirmation. DMs the requester that their game got a sub, and
-        reposts the acting server's board. Returns (result, req):
-        "added" | "already" | "requester" | "full" | "locked" | "closed"."""
-        async with self._lock:
-            req = store.find_request(self.state, rid)
-            if req is None:
-                return ("closed", None)
-            if is_locked(req):
-                return ("locked", req)
-            if member.id == req.get("requester_id"):
-                return ("requester", req)  # can't sub your own request
-            result = store.add_sub(req, member.id, member.display_name, now=club_now())
-            when = fmt_when(req["game_ts"])
-            requester_id = req["requester_id"]
-            opn = store.open_spots(req)
-            self._save()
-        if result != "added":
-            return (result, req)
-        await self.bump_board(self._guild_id(channel), fallback_channel=channel)
-        await self.refresh_page(req)
-        if requester_id != actor.id:
-            await self._dm_requester(
-                requester_id,
-                f"🥌 {actor.display_name} added {member.display_name} as a sub for your {when} game "
-                f"— {opn} still open.")
-        return (result, req)
-
-
     async def close_request(self, rid: str, channel=None):
         async with self._lock:
             req = store.find_request(self.state, rid)
@@ -1839,6 +2683,14 @@ class Subs(commands.Cog):
                         await ch.get_partial_message(alert["message_id"]).delete()
                     except discord.HTTPException:
                         pass
+        # A run's alert lives on its soonest open night. When that night is played and
+        # pruned, its page goes with it — so hand the alert to the next open night
+        # instead of letting the remaining weeks of the run go quiet.
+        for sid in {str(r.get("series_id") or "") for r in dropped["requests"]} - {""}:
+            nxt = next((r for r in store.series_requests(self.state, sid)
+                        if store.open_spots(r) > 0 and not is_locked(r)), None)
+            if nxt is not None and not (nxt.get("alert") or {}).get("message_id"):
+                await self.post_page(nxt, reason="bump")
         if changed:
             await self.render_all_boards()
 

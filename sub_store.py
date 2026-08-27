@@ -30,6 +30,7 @@ State shape:
         "position": str,                       # e.g. "Lead", "Vice" (optional)
         "notes": str,                          # free text (optional)
         "spots_needed": int,
+        "series_id": "9f8e7d6c",              # "" = standalone; shared by a run
         "filled": [{"user_id": int, "name": str, "ts": "..."}],
         "created_ts": "..."
       }, ...
@@ -90,6 +91,7 @@ def load(path: str) -> dict:
         r.setdefault("pending", [])
         r.setdefault("alert", {"channel_id": None, "message_id": None})
         r.setdefault("reminded", False)
+        r.setdefault("series_id", "")     # "" = standalone (pre-series stores)
         r.setdefault("guild_id", None)    # server the request was posted from
         r.setdefault("channel_id", None)  # channel it was posted in (for alerts)
     return state
@@ -145,6 +147,7 @@ def new_request(
     position: str = "",
     notes: str = "",
     kind: str = "sub",
+    series_id: str = "",
     guild_id=None,
     channel_id=None,
     now: Optional[datetime] = None,
@@ -167,6 +170,12 @@ def new_request(
         "position": position.strip(),
         "notes": notes.strip(),
         "spots_needed": max(1, int(spots_needed)),
+        # A long-term arrangement ("Ben subs Tuesdays for 8 weeks") is stored as one
+        # ordinary request PER NIGHT sharing a series_id — never as one multi-date
+        # record. Every night then keeps its own status, claim button, lock, expiry
+        # and roster, so dropping week 3 touches nothing else. The id exists only so
+        # the run can be alerted once and claimed in one tap.
+        "series_id": str(series_id or ""),
         "filled": [],
         "pending": [],
         # The live "sub needed" alert message we posted for this request (so we can
@@ -214,6 +223,42 @@ def remove_sub(req: dict, user_id: int) -> str:
         req["pending"] = [p for p in req["pending"] if p["user_id"] != user_id]
         return "removed"
     return "absent"
+
+
+def covered(req: dict) -> int:
+    """Spots already accounted for — filled plus invited-but-unconfirmed."""
+    return len(req.get("filled", [])) + len(req.get("pending", []))
+
+
+def set_spots(req: dict, spots: int) -> str:
+    """Change how many subs a live request needs.
+
+    The common case is a team that asked for one, found one, and then lost two more
+    players: they need the SAME request to say 3, not a second request competing with
+    it for the same night. Returns:
+      "ok"        — spots_needed changed
+      "unchanged" — already that many
+      "too_low"   — fewer than the people already on it; nobody is silently bumped,
+                    the caller removes a sub first.
+    """
+    n = int(spots)
+    if n < 1:
+        return "too_low"
+    if n < covered(req):
+        return "too_low"
+    if n == int(req["spots_needed"]):
+        return "unchanged"
+    req["spots_needed"] = n
+    return "ok"
+
+
+def series_requests(state: dict, series_id: str) -> list[dict]:
+    """Every live request in a run, soonest first. Empty series_id matches nothing —
+    standalone requests all carry "" and are not a series."""
+    sid = str(series_id or "")
+    if not sid:
+        return []
+    return [r for r in requests_sorted(state) if str(r.get("series_id") or "") == sid]
 
 
 def close_request(state: dict, rid: str) -> bool:
