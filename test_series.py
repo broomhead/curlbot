@@ -1,4 +1,4 @@
-"""Unit tests for the two 2026-08-26 sub-board features:
+"""Unit tests for two sub-board features:
 
   1. Long-term subs — "Ben has Tuesdays for the next 8 weeks". A run is N ordinary
      requests, one per league night, sharing a series_id: one alert, one tap to
@@ -136,7 +136,7 @@ def make_cog():
 
 
 # ── 1. fmt_run: several dates in one line ───────────────────────────────────
-# "dates", never "nights" — Brian: "some leagues are daytime hours".
+# "dates", never "nights": some leagues are daytime hours.
 check("fmt_run/one date", subs.fmt_run([TUE[0]]), subs.fmt_when(TUE[0]))
 check("fmt_run/has a span, a count and one time",
       [("→" in subs.fmt_run(TUE)), ("· 6 dates ·" in subs.fmt_run(TUE)),
@@ -373,7 +373,7 @@ check("spots/never bumps a listed sub", (store.set_spots(r2, 1), r2["spots_neede
 async def anyone_may_raise_only_the_owner_may_lower():
     cog = make_cog()
     cog.state, req = a_request(spots=1, filled=[BEN])
-    # Brian's case: one request, one sub on it, now two more are needed.
+    # The reported case: one request, one sub on it, now two more are needed.
     result, out = await cog.set_request_spots(CY, req["id"], 3, channel=Ch())
     check("edit/a teammate may raise it", (result, out["spots_needed"], store.open_spots(out)),
           ("ok", 3, 2))
@@ -442,9 +442,9 @@ check("editflow/other team is its own request", edit_flow.existing(), None)
 
 
 # ── 6b. The night picker's wording follows the FLOW, not the multi flag ──────
-# Brian: "'Games you can cover' shows up when I open a sub request." Going
-# multi-select in the need-a-sub flow handed the requester the availability flow's
-# placeholder — opposite person, opposite meaning.
+# Reported from the board: "Games you can cover…" appeared when OPENING a sub
+# request. Going multi-select in the need-a-sub flow handed the requester the
+# availability flow's placeholder — opposite person, opposite meaning.
 need = subs.NeedSubFlowView([LEAGUE], {"requests": []}, ANN.id)
 need.league_id = "999"
 need_ph = next(i for i in need.build().children if isinstance(i, subs.GameSelect)).placeholder
@@ -472,9 +472,9 @@ check("legacy/is not a series", store.series_requests(loaded, ""), [])
 
 
 # ── 7. The board lists NIGHTS, not runs ─────────────────────────────────────
-# Brian: "what if Bruce is covering 5 weeks, but one week he can't suddenly? His run is
-# broken. Don't look at them as runs. They're just subbing opportunities and the input
-# form let us mass-fill them. Each one can change after that."
+# The governing rule: if someone covering 5 weeks can't suddenly make one of them,
+# "their run" is a fiction. These are not runs. They are separate subbing
+# opportunities that one form happened to mass-fill, and each can change afterwards.
 
 async def the_board_lists_nights_not_runs():
     cog = make_cog()
@@ -504,7 +504,7 @@ async def a_dropped_night_rejoins_as_its_own_opportunity():
     check("drop/Ben starts on all five",
           [len(r["filled"]) for r in store.requests_sorted(cog.state)], [1] * 5)
     # Covered nights get no claim button — but they're still worth being able to LOOK
-    # at, which is exactly what Brian's 16 covered Tuesdays are for.
+    # at, which is exactly what a season of covered Tuesdays is for.
     kinds = [type(c).__name__ for c in subs.build_view(cog.state).children]
     check("drop/nothing open, so no game buttons", "PageClaimButton" in kinds, False)
     check("drop/covered nights past the horizon are still reachable",
@@ -689,7 +689,7 @@ async def fill_for_opens_pre_aimed_from_an_alert():
 
 
 async def picking_a_name_does_not_fill_anything():
-    """Brian: "One mistake, and no undo." The member select used to BE the action, so a
+    """One mistake, and no undo: the member select used to BE the action, so a
     mis-tap put the wrong person on someone else's game. Nothing is recorded until the
     green button, like every other form in this cog."""
     cog = make_cog()

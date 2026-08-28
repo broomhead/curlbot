@@ -12,7 +12,7 @@ So this client:
   2. GETs each league's public page and parses two sections:
        • "Standings"        -> an HTML <table>; data-row count = number of teams.
        • "Schedule & Scores"-> one <h6> per draw, e.g.
-             "June 16, 2026 7:45 pm  Griffith - Poklitar -  Sheet A  ...  Sheet D is open."
+             "June 16, 2026 7:45 pm  Adams - Brooks -  Sheet A  ...  Sheet D is open."
          Date + time come straight from the header; a draw is upcoming when its
          date >= today (club timezone). Played draws are in the past.
          Sheets used per draw = count("Sheet X") - count("Sheet X is open").

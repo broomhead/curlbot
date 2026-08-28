@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import os
 import re
+import asyncio
 import html
 import time
 import uuid
@@ -102,11 +103,17 @@ UNDATED_DAYS    = int(os.environ.get("SUBS_UNDATED_DAYS", str(store.DEFAULT_UNDA
 REMINDER_HOURS  = int(os.environ.get("SUBS_REMINDER_HOURS", "24"))
 # Sub rosters freeze this many minutes before tip-off — no more adds/removes/claims.
 LOCK_MINUTES    = int(os.environ.get("SUBS_LOCK_MINUTES", "30"))
-# How close to game time an AUTO-ASSIGNED go-to sub who still hasn't confirmed gets
+# How close to game time an AUTO-ASSIGNED super sub who still hasn't confirmed gets
 # chased (once). Longer than REMINDER_HOURS on purpose: an unconfirmed assignment
 # is the one case where the board looks covered and might not be, so it needs to
 # surface while there is still time to find someone else.
 ACK_HOURS       = int(os.environ.get("SUBS_ACK_HOURS", "48"))
+# How long outbound notices to ONE person are held so they arrive as one message.
+# A chair posting nine dates one at a time is nine separate assignments, but it is
+# ONE thing that happened to the super sub — and nine DMs (or nine @-mentions on
+# nine alerts) is how a person mutes the bot. Everything inside this window folds
+# into a single message, rebuilt from the store when it goes out. 0 = send at once.
+NOTIFY_WINDOW   = int(os.environ.get("SUBS_NOTIFY_WINDOW", "180"))
 # Discord caps a message at 25 components: row 0 holds the four verbs, leaving 20
 # slots for the game buttons below. A RUN spends only one of them (see open_units),
 # so these two caps are no longer the same number — the embed can list far more
@@ -136,10 +143,11 @@ CID_TAKE_PREFIX = "sub:take:"
 CID_TAKE_RUN_PREFIX = "sub:takerun:"
 # A run's button that opens the night picker (board + alert page): "sub:pickrun:<sid>".
 CID_PICK_RUN_PREFIX = "sub:pickrun:"
-# A go-to sub acknowledging or dropping the dates they were auto-assigned, keyed by
-# the assignment batch: "sub:autook:<assign_id>" / "sub:autodrop:<assign_id>".
-CID_AUTO_OK_PREFIX   = "sub:autook:"
-CID_AUTO_DROP_PREFIX = "sub:autodrop:"
+# A super sub acknowledging or dropping the dates they were auto-assigned. Keyed on
+# the PERSON, not on a batch: their notices are folded into one message, so the
+# buttons have to cover everything that message lists.
+CID_AUTO_OK   = "sub:autook"
+CID_AUTO_DROP = "sub:autodrop"
 # "Your league has teams now — which one is your spot on?", keyed by league id.
 CID_SET_TEAM_PREFIX  = "sub:setteam:"
 
@@ -604,7 +612,7 @@ def _req_for(req: dict) -> str:
 def _req_status_line(req: dict) -> str:
     needed = int(req["spots_needed"])
     covered = needed - store.open_spots(req)
-    # An auto-assigned go-to sub who hasn't acknowledged yet is shown as such: the
+    # An auto-assigned super sub who hasn't acknowledged yet is shown as such: the
     # spot IS covered, but nobody has heard from them, and a board that hides that
     # is how a team turns up three-handed.
     names = [f["name"] + (" (unconfirmed)" if f.get("auto") and not f.get("confirmed") else "")
@@ -1681,10 +1689,10 @@ class PostNeedButton(discord.ui.Button):
             bits.append(f"({skipped} date{'s' if skipped != 1 else ''} already had an open "
                         f"request — left alone.)")
         if filled:
-            # The team has a go-to sub, so nothing was asked of the room.
+            # The team has a super sub, so nothing was asked of the room.
             goto = store.standing_for(cog.state, f.league_id or "", f.team or "")
-            who = first_name(goto[0]["name"]) if goto else "your team's go-to sub"
-            bits.append(f"**{who}** is the go-to for {f.team} and has been put on "
+            who = first_name(goto[0]["name"]) if goto else "your team's super sub"
+            bits.append(f"**{who}** is the super sub for {f.team} and has been put on "
                         f"{filled} of {'them' if len(dates) > 1 else 'it'} — "
                         f"they've been asked to confirm.")
         if filled < len(dates):
@@ -1833,10 +1841,10 @@ def _availability_for_request(state: dict, req: dict | None) -> list[dict]:
 
 
 def _standing_for_request(state: dict, req: dict | None) -> list[dict]:
-    """The go-to subs for THIS request's league + team, first up first — the people an
+    """The super subs for THIS request's league + team, first up first — the people an
     alert should tag ahead of the general availability list.
 
-    Excludes anyone already on it (the top go-to is normally auto-assigned, so an
+    Excludes anyone already on it (the first super sub is normally auto-assigned, so an
     alert usually only exists because they dropped it or the team needs more than
     one), the requester, and anyone who has already declined this particular date."""
     if not req:
@@ -2139,8 +2147,8 @@ class SeriesClaimButton(discord.ui.DynamicItem[discord.ui.Button],
 
 # ── The cog ─────────────────────────────────────────────────────────────────
 
-# ── Go-to subs: the auto-assignment handshake ───────────────────────────────
-# A go-to sub doesn't claim a spot, they're put on it. That's the point — the team
+# ── Super subs: the auto-assignment handshake ───────────────────────────────
+# A super sub doesn't claim a spot, they're put on it. That's the point — the team
 # gets coverage the moment they ask, without waiting for anyone to notice an alert.
 # The cost is that a name lands on a game its owner hasn't seen, so every assignment
 # is followed by a DM they can answer in one tap: Confirm, or drop the dates they
@@ -2149,35 +2157,39 @@ class SeriesClaimButton(discord.ui.DynamicItem[discord.ui.Button],
 
 
 class AutoAssignView(discord.ui.View):
-    """What a freshly auto-assigned go-to sub gets in their DM."""
+    """What an auto-assigned super sub gets in their DM."""
 
-    def __init__(self, assign_id: str, count: int):
+    def __init__(self, count: int = 1):
         super().__init__(timeout=None)
-        self.add_item(ConfirmAutoButton(assign_id, count=count))
-        self.add_item(DropAutoButton(assign_id, count=count))
+        self.add_item(ConfirmAutoButton(count=count))
+        self.add_item(DropAutoButton(count=count))
 
 
 class ConfirmAutoButton(discord.ui.DynamicItem[discord.ui.Button],
-                        template=r"sub:autook:(?P<aid>[0-9a-f]+)"):
-    """Acknowledge an auto-assignment. Confirming doesn't change who's on the spot —
+                        template=r"sub:autook"):
+    """Acknowledge your assignments. Confirming doesn't change who's on the spot —
     they're already on it — it only stops the T-minus chase, which is the whole
-    difference between "covered" and "we think it's covered"."""
+    difference between "covered" and "we think it's covered".
 
-    def __init__(self, aid: str, *, count: int = 1):
-        self.aid = aid
+    Keyed on the PERSON, not on the batch it was sent for. Notices are folded into
+    one message per person (see Subs._flush_notice), so a button tied to one batch
+    would confirm part of what its own message lists. "Confirm" means "yes to what
+    I'm down for", and the reply names exactly what that turned out to be."""
+
+    def __init__(self, *, count: int = 1):
         super().__init__(discord.ui.Button(
             label=("Confirm" if count <= 1 else f"Confirm all {count}"),
             emoji="\u2705", style=discord.ButtonStyle.success,
-            custom_id=f"{CID_AUTO_OK_PREFIX}{aid}"))
+            custom_id=CID_AUTO_OK))
 
     @classmethod
     async def from_custom_id(cls, interaction, item, match):
-        return cls(match["aid"])
+        return cls()
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         cog: "Subs" = interaction.client.get_cog("Subs")
-        confirmed = await cog.confirm_auto(interaction.user, self.aid)
+        confirmed = await cog.confirm_auto(interaction.user)
         if not confirmed:
             await interaction.followup.send(
                 "Nothing left to confirm there — those dates have already been "
@@ -2185,29 +2197,30 @@ class ConfirmAutoButton(discord.ui.DynamicItem[discord.ui.Button],
             return
         await interaction.followup.send(
             f"\u2705  Confirmed \u2014 you're down for **{fmt_run(confirmed)}**. "
-            "If something changes, hit **I can't make some** or use **\u2716\ufe0f Remove** "
+            "If something changes, hit **I can't make some** or use **\u2796 Remove** "
             "on the board.", ephemeral=True)
 
 
 class DropAutoButton(discord.ui.DynamicItem[discord.ui.Button],
-                     template=r"sub:autodrop:(?P<aid>[0-9a-f]+)"):
+                     template=r"sub:autodrop"):
     """Opens the picker for dropping assigned dates. Never drops on the tap itself:
-    an arrangement is many dates and "I can't make one of them" is the common case."""
+    an arrangement is many dates and "I can't make one of them" is the common case.
+    Person-keyed for the same reason as Confirm — and it usefully means this button
+    reaches every date they're down for, not just the ones in one message."""
 
-    def __init__(self, aid: str, *, count: int = 1):
-        self.aid = aid
+    def __init__(self, *, count: int = 1):
         super().__init__(discord.ui.Button(
             label=("I can't make it" if count <= 1 else "I can't make some\u2026"),
             style=discord.ButtonStyle.secondary,
-            custom_id=f"{CID_AUTO_DROP_PREFIX}{aid}"))
+            custom_id=CID_AUTO_DROP))
 
     @classmethod
     async def from_custom_id(cls, interaction, item, match):
-        return cls(match["aid"])
+        return cls()
 
     async def callback(self, interaction: discord.Interaction):
         cog: "Subs" = interaction.client.get_cog("Subs")
-        view = AutoDropView(cog.state, self.aid, interaction.user.id)
+        view = AutoDropView(cog.state, interaction.user.id)
         await interaction.response.send_message(
             content=view.prompt(), view=view if view.dates() else None, ephemeral=True)
 
@@ -2216,18 +2229,16 @@ class AutoDropView(discord.ui.View):
     """Which of the dates you were assigned you can't make. Nothing starts ticked —
     the default answer to "can you still do these" is yes."""
 
-    def __init__(self, state: dict, aid: str, user_id: int):
+    def __init__(self, state: dict, user_id: int):
         super().__init__(timeout=300)
         self.state = state
-        self.aid = aid
         self.user_id = user_id
         self.rids: list[str] = []
         self.build()
 
     def dates(self) -> list[dict]:
-        return [r for r in store.requests_sorted(self.state)
-                if not is_locked(r)
-                and (store.auto_entry(r, self.user_id) or {}).get("auto") == self.aid]
+        return [r for r in store.auto_requests(self.state, self.user_id)
+                if not is_locked(r)]
 
     def build(self) -> "AutoDropView":
         self.clear_items()
@@ -2387,37 +2398,83 @@ class SetTeamSubmit(discord.ui.Button):
             return
         bits = [f"\u2705  **{view.team}** is now on **{fmt_run(done)}**."]
         if assigned:
-            bits.append(f"{assigned} of them went straight to your team's go-to sub.")
+            bits.append(f"{assigned} of them went straight to your team's super sub.")
         if clashes:
             bits.append(f"\u26a0\ufe0f  Heads up \u2014 **{view.team}** already had a sub request on "
                         f"**{fmt_run(clashes)}** from someone else. If that's the same spot, "
-                        f"one of you should drop it with **\u2716\ufe0f Remove**, or two subs will "
+                        f"one of you should drop it with **\u2796 Remove**, or two subs will "
                         f"turn up.")
         await interaction.edit_original_response(content=" ".join(bits), view=None)
 
 
-# ── Managing go-to subs ─────────────────────────────────────────────────────
+# ── Managing super subs ─────────────────────────────────────────────────────
 
 
 def leagues_with_teams(leagues: list[dict]) -> list[dict]:
-    """The only leagues a go-to arrangement can be made on. A standing arrangement is
+    """The only leagues a super sub arrangement can be made on. A standing arrangement is
     per TEAM, and a team you can't name is a team nothing can be matched to \u2014 so
     unlike an ordinary request, this has no "teams aren't up yet" escape hatch."""
     return [l for l in leagues if (l.get("team_names") or [])]
 
 
 def standing_summary(state: dict) -> str:
-    """Every go-to arrangement, grouped by league and team, in priority order."""
+    """Every super sub arrangement, grouped by league and team, in priority order."""
     groups: dict[tuple, list[dict]] = {}
     for g in store.standing_sorted(state):
         groups.setdefault((str(g.get("league_id") or ""), g.get("team", "")), []).append(g)
     if not groups:
-        return "_No go-to subs set up yet._"
+        return "_No super subs set up yet._"
     lines = []
     for (_lid, team), members in groups.items():
         league = stored_league(members[0].get("league", "")) or "League"
         who = " \u00b7 ".join(f"{i}. {m['name']}" for i, m in enumerate(members, 1))
         lines.append(f"\u2022 **{league}** \u00b7 {team} \u2014 {who}")
+    return "\n".join(lines)
+
+
+def build_notice(news: list[tuple], groups: dict) -> str:
+    """The one message a super sub gets: `news` is arrangements just made
+    [(league, team, actor)], `groups` is dates they haven't been told about yet
+    {(league, team): [iso]}.
+
+    These two arrive together more often than you'd think — making an arrangement
+    sweeps up whatever that team already has open, and a notice that was lost to a
+    restart is picked up by the next flush. Concatenating two announcements is how
+    one message reads as two unrelated ones, so a new arrangement and the dates are
+    joined by "You're also down for" rather than stacked."""
+    lines = []
+    for league, team, actor in news:
+        lines.append(f"\u2b50  {actor} made you the **super sub** for **{team}** in "
+                     f"**{league}**.")
+    if news:
+        lines.append(
+            f"Whenever {'that team needs' if len(news) == 1 else 'those teams need'} a "
+            "sub, you'll be put on it automatically and DM'd to confirm \u2014 you can "
+            "drop any date you can't make, and it goes back on the board. An organiser "
+            "can end the arrangement any time.")
+    rest = list(groups.items())
+    if rest:
+        new_keys = {(lg, tm) for lg, tm, _a in news}
+        if news and len(rest) == 1 and rest[0][0] in new_keys:
+            # The arrangement swept up its own team's open dates — don't say the team
+            # and league again three lines after naming them.
+            lines += ["", f"**You're down for:** {fmt_run(sorted(rest[0][1]))}"]
+        elif news:
+            head = ("**You're also down for:**"
+                    if any(k not in new_keys for k, _ in rest) else "**You're down for:**")
+            lines += ["", head]
+            lines += [f"\u00b7 **{tm}** \u00b7 {lg} \u2014 **{fmt_run(sorted(iso))}**"
+                      for (lg, tm), iso in rest]
+        elif len(rest) == 1:
+            (lg, tm), iso = rest[0]
+            lines.append(f"\u2b50  You're the super sub for **{tm}** in **{lg}** \u2014 "
+                         f"you're down for **{fmt_run(sorted(iso))}**.")
+        else:
+            lines.append("\u2b50  You're down for:")
+            lines += [f"\u00b7 **{tm}** \u00b7 {lg} \u2014 **{fmt_run(sorted(iso))}**"
+                      for (lg, tm), iso in rest]
+        lines.append("Confirm so the team knows it's sorted, or tell me which dates you "
+                     "can't make \u2014 those go straight back on the board.")
     return "\n".join(lines)
 
 
@@ -2433,7 +2490,7 @@ class StandingHomeView(discord.ui.View):
 
 class StandingAddButton(discord.ui.Button):
     def __init__(self, *, disabled: bool = False):
-        super().__init__(label="Add a go-to sub", emoji="\u2795",
+        super().__init__(label="Add a super sub", emoji="\u2795",
                          style=discord.ButtonStyle.success, disabled=disabled)
 
     async def callback(self, interaction: discord.Interaction):
@@ -2444,15 +2501,17 @@ class StandingAddButton(discord.ui.Button):
 
 class StandingRemoveButton(discord.ui.Button):
     def __init__(self):
-        super().__init__(label="Remove one", emoji="\u2716\ufe0f",
-                         style=discord.ButtonStyle.secondary)
+        # ➖ and danger, to match Remove on the board: taking something off looks
+        # the same wherever it happens.
+        super().__init__(label="Remove one", emoji="\u2796",
+                         style=discord.ButtonStyle.danger)
 
     async def callback(self, interaction: discord.Interaction):
         home: "StandingHomeView" = self.view
         entries = store.standing_sorted(home.state)
         if not entries:
             await interaction.response.edit_message(
-                content="Nothing to remove \u2014 there are no go-to subs set up.", view=None)
+                content="Nothing to remove \u2014 there are no super subs set up.", view=None)
             return
         view = discord.ui.View(timeout=300)
         view.add_item(StandingRemoveSelect(entries))
@@ -2462,7 +2521,7 @@ class StandingRemoveButton(discord.ui.Button):
 
 class StandingAddView(discord.ui.View):
     """league \u2192 team \u2192 person, ending on an explicit button. The order matters: the
-    team list comes from the league, and naming someone the go-to for a team is a
+    team list comes from the league, and naming someone the super sub for a team is a
     commitment made on their behalf, so it never fires off a select."""
 
     def __init__(self, leagues: list[dict], state: dict):
@@ -2498,12 +2557,12 @@ class StandingAddView(discord.ui.View):
     def prompt(self) -> str:
         lg = self.league()
         if not lg:
-            return ("**Go-to sub** \u2014 pick the league. Only leagues with teams posted "
+            return ("**Super sub** \u2014 pick the league. Only leagues with teams posted "
                     "can have one: the arrangement is per team.")
         parts = [f"League: **{league_label(lg)}**",
                  f"Team: **{self.team}**" if self.team else "Team: **not set**",
                  f"Sub: **{self.member.display_name}**" if self.member else "Sub: **not set**"]
-        head = "**Go-to sub** \u2014 " + " \u00b7 ".join(parts)
+        head = "**Super sub** \u2014 " + " \u00b7 ".join(parts)
         if not self.ready():
             return head + "\nPick the team and the person."
         current = store.standing_for(self.state, self.league_id, self.team)
@@ -2526,8 +2585,8 @@ class StandingMemberSelect(discord.ui.UserSelect):
         defaults = ([discord.SelectDefaultValue.from_user(selected)]
                     if selected is not None else [])
         super().__init__(
-            placeholder=("Change who the go-to is\u2026" if selected is not None
-                         else "Who's the go-to sub\u2026"),
+            placeholder=("Change who the super sub is\u2026" if selected is not None
+                         else "Who's the super sub\u2026"),
             min_values=1, max_values=1, row=row, default_values=defaults)
 
     async def callback(self, interaction: discord.Interaction):
@@ -2537,8 +2596,8 @@ class StandingMemberSelect(discord.ui.UserSelect):
 
 class StandingSubmitButton(discord.ui.Button):
     def __init__(self, member=None, team=None, *, disabled: bool, row: int = 3):
-        label = (f"Make {first_name(member.display_name)} the go-to for {team}"
-                 if member is not None and team else "Make them the go-to")
+        label = (f"Make {first_name(member.display_name)} the super sub for {team}"
+                 if member is not None and team else "Make them the super sub")
         super().__init__(label=_truncate(label, 80), emoji="\u2b50",
                          style=discord.ButtonStyle.success, row=row, disabled=disabled)
 
@@ -2561,11 +2620,11 @@ class StandingSubmitButton(discord.ui.Button):
         if result == "already":
             view.submitted = False
             await interaction.edit_original_response(
-                content=(f"{view.member.display_name} is already a go-to sub for "
+                content=(f"{view.member.display_name} is already a super sub for "
                          f"**{view.team}** in that league.\n\n" + view.prompt()),
                 view=view.build())
             return
-        bits = [f"\u2b50  **{view.member.display_name}** is the go-to sub for **{view.team}** "
+        bits = [f"\u2b50  **{view.member.display_name}** is the super sub for **{view.team}** "
                 f"in **{league_label(lg) if lg else 'that league'}**."]
         bits.append("They've been DM'd." if result == "added" else "")
         if assigned:
@@ -2588,7 +2647,7 @@ class StandingRemoveSelect(discord.ui.Select):
             )
             for g in entries[:25]
         ])
-        super().__init__(placeholder="Which go-to arrangement\u2026", min_values=1,
+        super().__init__(placeholder="Which super sub arrangement\u2026", min_values=1,
                          max_values=1, options=opts, row=row)
 
     async def callback(self, interaction: discord.Interaction):
@@ -2602,7 +2661,7 @@ class StandingRemoveSelect(discord.ui.Select):
                 content="That arrangement is already gone.", view=None)
             return
         await interaction.response.edit_message(
-            content=(f"End **{entry['name']}**'s go-to arrangement for **{team}** in "
+            content=(f"End **{entry['name']}**'s super sub arrangement for **{team}** in "
                      f"**{stored_league(entry.get('league',''))}**? Dates they're already "
                      f"on stay theirs \u2014 this only stops future ones."),
             view=ConfirmRemoveStandingView(int(uid), lid, team, entry["name"]))
@@ -2626,7 +2685,7 @@ class ConfirmRemoveStandingView(discord.ui.View):
             return
         removed = await cog.remove_standing(self.user_id, self.league_id, self.team,
                                             actor=interaction.user)
-        msg = (f"\U0001f5d1\ufe0f  **{self.name}** is no longer the go-to for **{self.team}**."
+        msg = (f"\U0001f5d1\ufe0f  **{self.name}** is no longer the super sub for **{self.team}**."
                if removed else "That arrangement was already gone.")
         await interaction.edit_original_response(content=msg, view=None)
 
@@ -2645,6 +2704,12 @@ class Subs(commands.Cog):
         # double-taps across all buttons. Keys are tagged tuples, e.g.
         # ("take", user_id, rid) or ("manage_add", user_id, rid, member_id).
         self._click_cooldown: dict[tuple, float] = {}
+        # user id -> {"preambles": [...], "task": Task}: assignment news waiting to be
+        # folded into one DM. See _queue_sub_notice.
+        self._notices: dict[int, dict] = {}
+        # user id -> monotonic time we last @-mentioned them on an alert, so a burst
+        # of separate postings pings each person once instead of once per posting.
+        self._mention_cooldown: dict[int, float] = {}
 
     # -- lifecycle ----------------------------------------------------------
     async def cog_load(self):
@@ -2656,6 +2721,7 @@ class Subs(commands.Cog):
         self.expiry_loop.cancel()
         self.reminder_loop.cancel()
         self.team_reconcile_loop.cancel()
+        await self._flush_all_notices()
 
     async def startup(self):
         """Prune expired requests and re-render every server's board after a (re)connect."""
@@ -2663,6 +2729,21 @@ class Subs(commands.Cog):
             store.expire(self.state, club_now(), GRACE_HOURS, undated_days=UNDATED_DAYS)
             store.save(STORE_PATH, self.state)
         await self.render_all_boards()
+        self._requeue_unnotified()
+
+    def _requeue_unnotified(self):
+        """Anyone still owed an assignment notice gets queued on (re)connect.
+
+        `notified` is in the store precisely so this survives a restart. Without it a
+        notice lost mid-window was never retried — and then rode along with the next
+        unrelated flush hours later, which is how one member got told about a team he'd
+        just been assigned to AND a different team's date in the same breath."""
+        owed = {f["user_id"] for r in self.state["requests"]
+                for f in store.auto_entries(r) if not f.get("notified")}
+        for uid in owed:
+            self._queue_sub_notice(uid)
+        if owed:
+            log.info("Re-queued super sub notices for %d member(s)", len(owed))
 
     # -- persistence + board refresh ----------------------------------------
     def _save(self):
@@ -2784,7 +2865,41 @@ class Subs(commands.Cog):
         return PageView(run[0]["id"], series_id=str(req.get("series_id") or ""),
                         dates=len(run))
 
-    def _page_body(self, req: dict, *, reason: str) -> str:
+    def _alert_recipients(self, req: dict) -> tuple[list[dict], list[dict]]:
+        """(super subs, everyone else listed as available) for this request, with
+        nobody counted twice."""
+        goto = _standing_for_request(self.state, req)
+        goto_ids = {g["user_id"] for g in goto}
+        subs = [a for a in _availability_for_request(self.state, req)
+                if a["user_id"] not in goto_ids]
+        return goto, subs
+
+    def _quiet_recipients(self, req: dict) -> set:
+        """Who to name WITHOUT an @ on this alert, because we pinged them within the
+        last NOTIFY_WINDOW seconds.
+
+        A chair posting nine dates one at a time puts up nine alerts, and each one
+        tagging the same two available members is nine phone buzzes each — the thing
+        people actually complain about. They're still named, so the alert reads the
+        same; they just aren't pinged nine times about the same league."""
+        if NOTIFY_WINDOW <= 0:
+            return set()
+        now_m = time.monotonic()
+        goto, subs = self._alert_recipients(req)
+        quiet = set()
+        for who in [g["user_id"] for g in goto] + [a["user_id"] for a in subs]:
+            last = self._mention_cooldown.get(who)
+            if last is not None and now_m - last < NOTIFY_WINDOW:
+                quiet.add(who)
+            else:
+                self._mention_cooldown[who] = now_m
+        if len(self._mention_cooldown) > 256:
+            for k in [k for k, t in self._mention_cooldown.items()
+                      if now_m - t >= NOTIFY_WINDOW]:
+                del self._mention_cooldown[k]
+        return quiet
+
+    def _page_body(self, req: dict, *, reason: str, quiet=frozenset()) -> str:
         heads = {
             "new":      "🆘 **Sub needed**",
             "bump":     "🔔 **Still need a sub**",
@@ -2801,21 +2916,29 @@ class Subs(commands.Cog):
             opn = store.open_spots(req)
             spots_txt = f"{opn} spot{'s' if opn != 1 else ''} open"
         detail = " · ".join(x for x in [league or None, _req_for(req), when, spots_txt] if x)
-        # Go-to subs are tagged FIRST and named as such — that ordering is the whole
-        # of "priority" as far as an alert is concerned. Anyone who is both a go-to
-        # and listed as available is only tagged once, on the go-to line.
-        goto = _standing_for_request(self.state, req)
-        goto_ids = {g["user_id"] for g in goto}
-        subs = [a for a in _availability_for_request(self.state, req)
-                if a["user_id"] not in goto_ids]
+        # Super subs are tagged FIRST and named as such — that ordering is the whole
+        # of "priority" as far as an alert is concerned. Anyone who is both a super sub
+        # and listed as available is only tagged once, on the super sub line. Anyone in
+        # `quiet` was pinged moments ago and is named in plain text instead.
+        goto, subs = self._alert_recipients(req)
         verb = "take any or all of them" if run else "grab it"
+
+        def tag(people, note):
+            loud = [p for p in people if p["user_id"] not in quiet]
+            hushed = [p for p in people if p["user_id"] in quiet]
+            out = []
+            if loud:
+                out.append(" ".join(f"<@{p['user_id']}>" for p in loud) + f" — {note}")
+            if hushed:
+                out.append(", ".join(first_name(p["name"]) for p in hushed)
+                           + f" — {note} (tagged a moment ago)")
+            return out
+
         lines = []
         if goto:
-            lines.append(" ".join(f"<@{g['user_id']}>" for g in goto)
-                         + " — you're the go-to sub for this team.")
+            lines += tag(goto, "you're the super sub for this team.")
         if subs:
-            lines.append(" ".join(f"<@{a['user_id']}>" for a in subs)
-                         + " — you're listed as available.")
+            lines += tag(subs, "you're listed as available.")
         if lines:
             tail = "\n".join(lines) + f"\nTap to {verb}:"
         else:
@@ -2850,7 +2973,7 @@ class Subs(commands.Cog):
         if ch is None:
             return
         await self._delete_page(req)
-        body = self._page_body(req, reason=reason)
+        body = self._page_body(req, reason=reason, quiet=self._quiet_recipients(req))
         try:
             msg = await ch.send(body, view=self._page_view(req, reason),
                                 allowed_mentions=discord.AllowedMentions(users=True))
@@ -2962,7 +3085,7 @@ class Subs(commands.Cog):
         how a useful board becomes a muted one. Naming who covers them is a separate
         step (Fill for someone, offered on that alert).
 
-        A team with a go-to sub never reaches the room at all: the arrangement fills
+        A team with a super sub never reaches the room at all: the arrangement fills
         the spot as the posting is made, and the alert is simply not posted. `filled`
         is how many dates went that way (it was dead weight before this).
 
@@ -2996,7 +3119,7 @@ class Subs(commands.Cog):
                 self._save()
         if not created:
             return (0, skipped, 0)
-        # Before anyone is asked: whoever the team has arranged as its go-to sub is put
+        # Before anyone is asked: whoever the team has arranged as its super sub is put
         # on these dates. Whatever they cover is never alerted — asking the room to
         # cover a spot that is already covered is how a board gets muted.
         assigned = await self._auto_assign(created, actor_id=requester.id, channel=channel)
@@ -3266,9 +3389,9 @@ class Subs(commands.Cog):
                 except discord.HTTPException:
                     pass
 
-    # -- go-to subs ---------------------------------------------------------
+    # -- super subs ---------------------------------------------------------
     async def _auto_assign(self, reqs: list[dict], *, actor_id=None, channel=None) -> dict:
-        """Put each request's go-to sub(s) on it, then tell them.
+        """Put each request's super sub(s) on it, then tell them.
 
         Called from every path that can create an unfilled spot on a team that has an
         arrangement: a fresh posting, a team being attached after the fact, and the
@@ -3279,6 +3402,9 @@ class Subs(commands.Cog):
         A whole batch shares one assign_id so eight Thursdays are one DM, not eight —
         but the assignment itself is still per date (see the no-runs rule): dropping
         one leaves the others alone.
+
+        Telling them is QUEUED, not sent here (see _queue_sub_notice): nine dates
+        posted one at a time would otherwise be nine DMs.
 
         Returns {user_id: {"name", "isos"}}. Never holds the lock across a DM."""
         if not reqs:
@@ -3294,7 +3420,7 @@ class Subs(commands.Cog):
                 for g in store.standing_for(self.state, live.get("league_id", ""),
                                             live.get("team", "")):
                     # Priority order, and as many as the request has spots for: the
-                    # #2 go-to isn't a spare, they're the second spot's answer.
+                    # second super sub isn't a spare, they're the second spot's answer.
                     if store.assign_auto(live, g["user_id"], g["name"], aid,
                                          now=club_now()) != "assigned":
                         continue
@@ -3307,31 +3433,81 @@ class Subs(commands.Cog):
                         told.setdefault(rid_owner, []).append(live["game_ts"])
             if batches:
                 self._save()
-        for uid, b in batches.items():
-            n = len(b["isos"])
-            count = f" \u2014 {n} dates" if n > 1 else ""
-            await self._dm(
-                uid,
-                f"\u2b50  You're the go-to sub for **{b['team']}** in "
-                f"**{stored_league(b['league'])}**.\n"
-                f"You've been put down for **{fmt_run(b['isos'])}**{count}.\n"
-                "Confirm so the team knows it's sorted, or tell me which you can't make "
-                "\u2014 those go straight back on the board.",
-                view=AutoAssignView(aid, n))
+        for uid in batches:
+            self._queue_sub_notice(uid)
         for requester_id, isos in told.items():
             if requester_id == actor_id or requester_id is None:
                 continue
             names = ", ".join(sorted({b["name"] for b in batches.values()}))
             await self._dm(
                 requester_id,
-                f"\u2b50  {names} is your team's go-to sub and has been assigned to your "
+                f"\u2b50  {names} is your team's super sub and has been assigned to your "
                 f"{fmt_run(isos)} game{'s' if len(isos) != 1 else ''}. "
                 "You'll see it on the board \u2014 they've been asked to confirm.")
         return {uid: {"name": b["name"], "isos": b["isos"]} for uid, b in batches.items()}
 
+    def _queue_sub_notice(self, user_id: int, new_arrangement: tuple | None = None):
+        """Hold this person's assignment news briefly so it arrives as ONE message.
+
+        Nine dates posted one at a time are nine assignments, but to the person on the
+        other end it's one thing that happened. The message is built from the STORE at
+        flush time, not from whatever triggered the queueing, so anything that lands
+        during the window is simply included.
+
+        A message lost to a restart is NOT lost for good: `notified` lives in the
+        store, so startup re-queues anyone still owed one (see _requeue_unnotified).
+        Without that, an assignment made moments before a restart went unannounced and
+        then turned up glued to an unrelated message hours later, which is exactly how
+        one message ends up reading as two."""
+        slot = self._notices.setdefault(user_id, {"new": [], "task": None})
+        if new_arrangement is not None and new_arrangement not in slot["new"]:
+            slot["new"].append(new_arrangement)
+        task = slot.get("task")
+        if task is None or task.done():
+            slot["task"] = asyncio.create_task(self._flush_notice_later(user_id))
+
+    async def _flush_notice_later(self, user_id: int):
+        try:
+            if NOTIFY_WINDOW > 0:
+                await asyncio.sleep(NOTIFY_WINDOW)
+            await self._flush_notice(user_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — a bad notice must not kill the task silently
+            log.exception("Could not send a super sub notice")
+
+    async def _flush_notice(self, user_id: int):
+        """Send one person everything they haven't been told about yet."""
+        slot = self._notices.pop(user_id, None)
+        if slot is None:
+            return
+        reqs = store.auto_requests(self.state, user_id, only_unnotified=True)
+        news = slot.get("new") or []
+        if not reqs and not news:
+            return
+        groups: dict[tuple, list[str]] = {}
+        for r in reqs:
+            key = (stored_league(r.get("league", "")), r.get("team", ""))
+            groups.setdefault(key, []).append(r["game_ts"])
+        await self._dm(user_id, build_notice(news, groups),
+                       view=AutoAssignView(len(reqs)) if reqs else None)
+        # Marked whether or not the DM landed: someone with DMs closed can't be reached
+        # by re-queuing forever, and the board and the chase both still cover them.
+        async with self._lock:
+            if store.mark_notified(self.state, user_id, reqs):
+                self._save()
+
+    async def _flush_all_notices(self):
+        for uid in list(self._notices):
+            slot = self._notices.get(uid) or {}
+            task = slot.get("task")
+            if task is not None and not task.done():
+                task.cancel()
+            await self._flush_notice(uid)
+
     async def add_standing(self, *, actor, member, league_id, league, team,
                            channel=None) -> tuple[str, list[str]]:
-        """Make someone the go-to sub for a league + team. Returns (result, isos) where
+        """Make someone the super sub for a league + team. Returns (result, isos) where
         isos are open dates for that team they were assigned on the spot \u2014 an
         arrangement made mid-season should cover what's already asking."""
         async with self._lock:
@@ -3344,14 +3520,10 @@ class Subs(commands.Cog):
         if result != "added":
             return (result, [])
         # The arrangement is made ON someone's behalf, so they hear it from the bot
-        # rather than finding their name on a game.
-        await self._dm(
-            member.id,
-            f"\u2b50  {actor.display_name} made you the **go-to sub** for **{team}** in "
-            f"**{stored_league(league)}**.\n"
-            "Whenever that team needs a sub, you'll be put on it automatically and DM'd "
-            "to confirm \u2014 you can drop any date you can't make, and it goes back on the "
-            "board. Ask an organiser to end the arrangement any time.")
+        # rather than finding their name on a game. Queued, not sent: if it also sweeps
+        # up dates that are already open, that news belongs in the SAME message.
+        self._queue_sub_notice(
+            member.id, (stored_league(league), team.strip(), actor.display_name))
         tk = (team or "").strip().casefold()
         targets = [r for r in store.requests_sorted(self.state)
                    if str(r.get("league_id") or "") == str(league_id or "")
@@ -3375,18 +3547,17 @@ class Subs(commands.Cog):
         if removed and actor is not None and actor.id != user_id:
             await self._dm(
                 user_id,
-                f"\u2139\ufe0f  {actor.display_name} ended your go-to sub arrangement for "
+                f"\u2139\ufe0f  {actor.display_name} ended your super sub arrangement for "
                 f"**{team}**. Any dates you're already on are still yours.")
         return removed
 
-    async def confirm_auto(self, user, aid: str) -> list[str]:
-        """Acknowledge every date in one assignment batch. Returns the dates confirmed."""
+    async def confirm_auto(self, user) -> list[str]:
+        """Acknowledge everything they're down for. Returns the dates confirmed — the
+        caller names them back, so a date that arrived after the message they tapped is
+        still something they see rather than something they silently agreed to."""
         done = []
         async with self._lock:
-            for r in store.requests_sorted(self.state):
-                entry = store.auto_entry(r, user.id)
-                if entry is None or entry.get("auto") != aid:
-                    continue
+            for r in store.auto_requests(self.state, user.id, only_unconfirmed=True):
                 if store.confirm_auto(r, user.id) == "confirmed":
                     done.append(r["game_ts"])
             if done:
@@ -3396,7 +3567,7 @@ class Subs(commands.Cog):
         return done
 
     async def drop_auto(self, user, rids, channel=None) -> list[str]:
-        """A go-to sub drops dates they were assigned. Each one reopens as an ordinary
+        """A super sub drops dates they were assigned. Each one reopens as an ordinary
         request and re-alerts its own channel — the arrangement itself stands."""
         dropped, reopened = [], []
         async with self._lock:
@@ -3424,7 +3595,7 @@ class Subs(commands.Cog):
                            channel=None) -> tuple[list[str], list[str], int]:
         """Attach a team to the caller's own teamless requests. Returns
         (dates set, dates that now collide with someone else's request for the same
-        team, how many went to a go-to sub).
+        team, how many went to a super sub).
 
         The collision check runs BEFORE the team is written, so it finds other
         people's requests rather than this one. It warns and never merges: two open
@@ -3519,7 +3690,7 @@ class Subs(commands.Cog):
         await self._chase_unconfirmed(now)
 
     async def _chase_unconfirmed(self, now: datetime):
-        """Once per request: a go-to sub was put on this date and has never answered,
+        """Once per request: a super sub was put on this date and has never answered,
         and the game is now inside ACK_HOURS.
 
         This is the one hole auto-assignment opens. Every other unfilled game is
@@ -3542,34 +3713,47 @@ class Subs(commands.Cog):
                     due.append(r["id"])
             if due:
                 self._save()
+        # Grouped by channel, and said ONCE: three unconfirmed dates in the same room
+        # is one message naming all three, not three messages and three DMs on top.
+        # The @-mention IS the notification, so there is no separate DM.
+        by_channel: dict[object, list[dict]] = {}
+        homeless: list[dict] = []
         for rid in due:
             req = store.find_request(self.state, rid)
-            if req is None:
+            if req is None or not store.unconfirmed_auto(req):
                 continue
-            waiting = store.unconfirmed_auto(req)
-            if not waiting:
+            (by_channel.setdefault(req.get("channel_id"), [])
+             if req.get("channel_id") is not None else homeless).append(req)
+        for cid, reqs in by_channel.items():
+            ch = await self._resolve_channel(cid)
+            if ch is None:
+                homeless += reqs
                 continue
-            aid = waiting[0].get("auto") or ""
-            mentions = " ".join(f"<@{f['user_id']}>" for f in waiting)
-            body = (f"\u23f0  **Not confirmed yet** \u2014 {stored_league(req.get('league',''))} "
-                    f"\u00b7 {_req_for(req)} \u00b7 {fmt_when(req['game_ts'])}\n"
-                    f"{mentions} you're the go-to sub for this one but haven't confirmed. "
-                    f"Tap **Confirm**, or drop it so someone else can pick it up:")
-            for f in waiting:
+            people, rows = [], []
+            for req in reqs:
+                waiting = store.unconfirmed_auto(req)
+                people += [f["user_id"] for f in waiting]
+                rows.append(f"\u00b7 {stored_league(req.get('league',''))} \u00b7 "
+                            f"{_req_for(req)} \u00b7 **{fmt_when(req['game_ts'])}**")
+            mentions = " ".join(f"<@{u}>" for u in dict.fromkeys(people))
+            head = ("\u23f0  **Not confirmed yet** \u2014 covered on paper, unconfirmed by "
+                    "the sub:" if len(rows) > 1 else "\u23f0  **Not confirmed yet**")
+            body = (f"{head}\n" + "\n".join(rows) + f"\n{mentions} \u2014 you're the super sub "
+                    "for these but haven't confirmed. Tap **Confirm**, or drop what you "
+                    "can't make so someone else can pick it up:")
+            try:
+                await ch.send(body, view=AutoAssignView(len(rows)),
+                              allowed_mentions=discord.AllowedMentions(users=True))
+            except discord.HTTPException as e:
+                log.warning("Could not post unconfirmed-assignment nudge: %s", e)
+        for req in homeless:   # no channel to speak in — fall back to a DM
+            for f in store.unconfirmed_auto(req):
                 await self._dm(
                     f["user_id"],
                     f"\u23f0  Quick check \u2014 you're down as the sub for "
                     f"**{_req_for(req)}** on **{fmt_when(req['game_ts'])}** and haven't "
                     f"confirmed. Confirm below, or drop it if you can't make it.",
-                    view=AutoAssignView(aid, 1))
-            ch = await self._resolve_channel(req.get("channel_id"))
-            if ch is None:
-                continue
-            try:
-                await ch.send(body, view=AutoAssignView(aid, len(waiting)),
-                              allowed_mentions=discord.AllowedMentions(users=True))
-            except discord.HTTPException as e:
-                log.warning("Could not post unconfirmed-assignment nudge: %s", e)
+                    view=AutoAssignView(1))
 
     # -- teams posted after the fact ----------------------------------------
     @tasks.loop(hours=1)
@@ -3614,7 +3798,7 @@ class Subs(commands.Cog):
                 f"its teams posted now.\n"
                 f"You have **{n}** sub request{'s' if n != 1 else ''} on it with no team "
                 f"named. Naming the team means nobody can post a second request for the "
-                f"same spot \u2014 and your team's go-to sub, if it has one, can pick it up.",
+                f"same spot \u2014 and your team's super sub, if it has one, can pick it up.",
                 view=view)
 
     @team_reconcile_loop.before_loop
@@ -3654,14 +3838,14 @@ class Subs(commands.Cog):
             "bottom whenever something changes on this server.", ephemeral=True)
 
     @app_commands.command(
-        name="gotosub",
-        description="See or set the go-to subs — who gets auto-assigned when a team needs one")
-    async def gotosub_cmd(self, interaction: discord.Interaction):
+        name="supersub",
+        description="See or set the super subs — who gets auto-assigned when a team needs one")
+    async def supersub_cmd(self, interaction: discord.Interaction):
         """Private by design: an arrangement is club information, but changing one is
-        a quiet administrative act, not a channel event. The person being made a go-to
+        a quiet administrative act, not a channel event. The person being made a super sub
         sub always hears about it by DM, which is the notification that matters."""
         leagues = await self.get_leagues()
-        body = ("\u2b50  **Go-to subs** \u2014 when a team needs a sub, its go-to is put on it "
+        body = ("\u2b50  **Super subs** \u2014 when a team needs a sub, its super sub is put on it "
                 "straight away and DM'd to confirm.\n\n" + standing_summary(self.state))
         if leagues and not leagues_with_teams(leagues):
             body += ("\n\n_No league has its teams posted yet, so there's nothing to attach "

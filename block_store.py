@@ -27,7 +27,7 @@ Pure module: no discord, no network. State shape:
         "sheets": 2,
         "reason": "LTC - off the books",
         "user_id": 123456,
-        "name": "Darin",
+        "name": "Dana",
         "ts": "2026-08-20T09:14:00"
       }, ...
     }
@@ -223,7 +223,7 @@ def as_sessions(
 
 def describe(block: dict, *, with_who: bool = True) -> str:
     """One-line human summary, e.g.
-    'Sun Aug 23 · 1:30–4:00 PM · 2 sheets — LTC (Darin)'."""
+    'Sun Aug 23 · 1:30–4:00 PM · 2 sheets — LTC (Dana)'."""
     start, end = _dt(block.get("start")), _dt(block.get("end"))
     n = int(block.get("sheets", 0))
     when = fmt_window(start, end) if start else block.get("start", "")

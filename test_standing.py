@@ -1,9 +1,9 @@
-"""Unit tests for go-to (standing) subs — the 2026-08-27 work.
+"""Unit tests for super subs — standing arrangements that auto-assign.
 
-  1. A go-to sub is bound to a LEAGUE + TEAM, never a weekday. Whoever sets it up
+  1. A super sub is bound to a LEAGUE + TEAM, never a weekday. Whoever sets it up
      picks both from the same pickers everyone else uses, so nothing has to infer
      what "the Thursday league" means, and the binding is dated for free.
-  2. When that team needs a sub, the go-to is PUT ON the spot as the request is
+  2. When that team needs a sub, the super sub is PUT ON the spot as the request is
      posted — the room is never asked — and DM'd to confirm or drop.
   3. Because a name lands on a game its owner hasn't seen, two things must hold:
      an unconfirmed assignment is visible as unconfirmed, and it gets chased before
@@ -63,12 +63,14 @@ def night(n_days: int, hour: int = 19, minute: int = 45) -> str:
 
 
 THU = [night(7 * i + 4) for i in range(6)]
+# A full season's worth, for the notification-volume checks below.
+NINE = [night(7 * i + 4) for i in range(9)]
 
 TEAMED = {
     "id": 555, "title": "Thursday League – Fall 2026 League 1 – Begins September 3",
     "day": "Thursday", "time": "7:45 pm",
     "draws": [{"date": iso[:10], "weekday": "Thursday", "time": "7:45 pm"} for iso in THU],
-    "team_names": ["Delaney", "Okafor"],
+    "team_names": ["Ashby", "Vance"],
 }
 UNTEAMED = {
     "id": 556, "title": "Sunday Rise and Shine League – Fall 2026 League 1 – Begins September 6",
@@ -95,12 +97,21 @@ class Ch:
         return type("M", (), {"id": 42})()
 
 
-LISA, WILL, SAM, BRUCE = U(1, "Lisa Chen"), U(2, "Will Grant"), U(3, "Sam Ortiz"), U(4, "Bruce Iyer")
+ALEX, ROBIN, SAM, BRUCE = U(1, "Alex Reed"), U(2, "Robin Vale"), U(3, "Sam Ortiz"), U(4, "Bruce Iyer")
+
+
+COGS = []
+
+
+async def flush(cog):
+    """Drain the notice outbox now instead of waiting out NOTIFY_WINDOW."""
+    await cog._flush_all_notices()
 
 
 def make_cog():
     """A Subs cog with everything that touches Discord stubbed, recording calls."""
     cog = subs.Subs(object())
+    COGS.append(cog)
     cog.state = store.empty_state()
     cog.calls = []
     cog.dms = []
@@ -139,13 +150,13 @@ def make_cog():
 
 
 def goto(cog, member, team, league=TEAMED):
-    """Register a go-to sub straight in the store (the UI path is tested separately)."""
+    """Register a super sub straight in the store (the UI path is tested separately)."""
     return store.add_standing(cog.state, user_id=member.id, name=member.display_name,
                               league_id=str(league["id"]), league=subs.league_label(league),
-                              team=team, created_by=LISA.id, now=subs.club_now())
+                              team=team, created_by=ALEX.id, now=subs.club_now())
 
 
-async def post(cog, requester, dates, *, team="Delaney", spots=1, league=TEAMED, channel=None):
+async def post(cog, requester, dates, *, team="Ashby", spots=1, league=TEAMED, channel=None):
     return await cog.add_series(
         requester=requester, league_id=str(league["id"]),
         league=subs.league_label(league), team=team, game_isos=dates, spots=spots,
@@ -155,33 +166,33 @@ async def post(cog, requester, dates, *, team="Delaney", spots=1, league=TEAMED,
 # ── 1. The store: an arrangement, not a sign-up ─────────────────────────────
 st = store.empty_state()
 check("store/new state has a standing list", st["standing"], [])
-check("store/add", store.add_standing(st, user_id=WILL.id, name="Will Grant", league_id="555",
-                                      league="Thursday League", team="Delaney"), "added")
+check("store/add", store.add_standing(st, user_id=ROBIN.id, name="Robin Vale", league_id="555",
+                                      league="Thursday League", team="Ashby"), "added")
 check("store/no team is not an arrangement",
-      store.add_standing(st, user_id=WILL.id, name="Will Grant", league_id="555",
+      store.add_standing(st, user_id=ROBIN.id, name="Robin Vale", league_id="555",
                          league="Thursday League", team=""), "no_team")
 check("store/same person twice",
-      store.add_standing(st, user_id=WILL.id, name="Will Grant", league_id="555",
-                         league="Thursday League", team="Delaney"), "already")
+      store.add_standing(st, user_id=ROBIN.id, name="Robin Vale", league_id="555",
+                         league="Thursday League", team="Ashby"), "already")
 store.add_standing(st, user_id=SAM.id, name="Sam Ortiz", league_id="555",
-                   league="Thursday League", team="Delaney")
+                   league="Thursday League", team="Ashby")
 check("store/priority is order of arrangement",
-      [g["name"] for g in store.standing_for(st, "555", "Delaney")], ["Will Grant", "Sam Ortiz"])
+      [g["name"] for g in store.standing_for(st, "555", "Ashby")], ["Robin Vale", "Sam Ortiz"])
 check("store/team match is case and space tolerant",
-      [g["name"] for g in store.standing_for(st, "555", "  delaney ")], ["Will Grant", "Sam Ortiz"])
-check("store/another team has none", store.standing_for(st, "555", "Okafor"), [])
+      [g["name"] for g in store.standing_for(st, "555", "  ashby ")], ["Robin Vale", "Sam Ortiz"])
+check("store/another team has none", store.standing_for(st, "555", "Vance"), [])
 check("store/a teamless request has none", store.standing_for(st, "555", ""), [])
-check("store/wrong league has none", store.standing_for(st, "999", "Delaney"), [])
-check("store/remove", store.remove_standing(st, WILL.id, "555", "Delaney"), True)
+check("store/wrong league has none", store.standing_for(st, "999", "Ashby"), [])
+check("store/remove", store.remove_standing(st, ROBIN.id, "555", "Ashby"), True)
 check("store/remove promotes nobody but leaves order",
-      [g["name"] for g in store.standing_for(st, "555", "Delaney")], ["Sam Ortiz"])
-check("store/remove twice", store.remove_standing(st, WILL.id, "555", "Delaney"), False)
+      [g["name"] for g in store.standing_for(st, "555", "Ashby")], ["Sam Ortiz"])
+check("store/remove twice", store.remove_standing(st, ROBIN.id, "555", "Ashby"), False)
 
 # THE load-bearing difference from availability: an arrangement never goes stale.
 st2 = store.empty_state()
 old = subs.club_now() - timedelta(days=90)
-store.add_standing(st2, user_id=WILL.id, name="Will Grant", league_id="555",
-                   league="Thursday League", team="Delaney", now=old)
+store.add_standing(st2, user_id=ROBIN.id, name="Robin Vale", league_id="555",
+                   league="Thursday League", team="Ashby", now=old)
 store.upsert_availability(st2, user_id=SAM.id, name="Sam Ortiz", league_id="555",
                           league="Thursday League", games=[], now=old)
 store.expire(st2, subs.club_now(), 3)
@@ -193,41 +204,41 @@ check("store/expire NEVER ages out an arrangement", len(st2["standing"]), 1)
 st3 = store.empty_state()
 req = store.new_request(st3, requester_id=BRUCE.id, requester_name="Bruce Iyer",
                         spots_needed=1, game_ts=THU[0], league_id="555",
-                        league="Thursday League", team="Delaney")
+                        league="Thursday League", team="Ashby")
 check("assign/requester can't sub their own game",
       store.assign_auto(req, BRUCE.id, "Bruce Iyer", "aaa"), "requester")
-check("assign/ok", store.assign_auto(req, WILL.id, "Will Grant", "aaa"), "assigned")
+check("assign/ok", store.assign_auto(req, ROBIN.id, "Robin Vale", "aaa"), "assigned")
 check("assign/covers the spot", store.open_spots(req), 0)
-check("assign/is an ordinary filled entry", [f["user_id"] for f in req["filled"]], [WILL.id])
+check("assign/is an ordinary filled entry", [f["user_id"] for f in req["filled"]], [ROBIN.id])
 check("assign/carries the batch id", req["filled"][0]["auto"], "aaa")
 check("assign/starts unconfirmed", req["filled"][0]["confirmed"], False)
-check("assign/again is a no-op", store.assign_auto(req, WILL.id, "Will Grant", "aaa"), "already")
+check("assign/again is a no-op", store.assign_auto(req, ROBIN.id, "Robin Vale", "aaa"), "already")
 check("assign/no spots left", store.assign_auto(req, SAM.id, "Sam Ortiz", "aaa"), "full")
-check("assign/unconfirmed list", [f["name"] for f in store.unconfirmed_auto(req)], ["Will Grant"])
-check("assign/confirm", store.confirm_auto(req, WILL.id), "confirmed")
-check("assign/confirm twice", store.confirm_auto(req, WILL.id), "already")
+check("assign/unconfirmed list", [f["name"] for f in store.unconfirmed_auto(req)], ["Robin Vale"])
+check("assign/confirm", store.confirm_auto(req, ROBIN.id), "confirmed")
+check("assign/confirm twice", store.confirm_auto(req, ROBIN.id), "already")
 check("assign/nothing left unconfirmed", store.unconfirmed_auto(req), [])
-check("assign/drop", store.decline_auto(req, WILL.id), "removed")
+check("assign/drop", store.decline_auto(req, ROBIN.id), "removed")
 check("assign/drop reopens the spot", store.open_spots(req), 1)
-check("assign/a drop is remembered for THIS date", req["auto_declined"], [WILL.id])
+check("assign/a drop is remembered for THIS date", req["auto_declined"], [ROBIN.id])
 check("assign/and nothing puts them back on it",
-      store.assign_auto(req, WILL.id, "Will Grant", "bbb"), "declined")
+      store.assign_auto(req, ROBIN.id, "Robin Vale", "bbb"), "declined")
 check("assign/but the next person still can",
       store.assign_auto(req, SAM.id, "Sam Ortiz", "bbb"), "assigned")
-check("assign/drop someone who isn't on it", store.decline_auto(req, LISA.id), "absent")
+check("assign/drop someone who isn't on it", store.decline_auto(req, ALEX.id), "absent")
 
 # A manual (self-serve) fill is NOT an auto assignment and is never chased.
 manual = store.new_request(st3, requester_id=BRUCE.id, requester_name="Bruce Iyer",
-                           spots_needed=1, game_ts=THU[1], league_id="555", team="Delaney")
+                           spots_needed=1, game_ts=THU[1], league_id="555", team="Ashby")
 store.add_sub(manual, SAM.id, "Sam Ortiz")
 check("assign/a hand-raise is not an assignment", store.auto_entries(manual), [])
 check("assign/and never chased", store.unconfirmed_auto(manual), [])
 
 
-# ── 3. Posting: the go-to gets it, the room is never asked ──────────────────
+# ── 3. Posting: the super sub gets it, the room is never asked ──────────────────
 async def the_team_with_a_goto_never_reaches_the_room():
     cog = make_cog()
-    goto(cog, WILL, "Delaney")
+    goto(cog, ROBIN, "Ashby")
     made, skipped, filled = await post(cog, BRUCE, [THU[0]])
     check("post/one request made", made, 1)
     check("post/and it was filled by the arrangement", filled, 1)
@@ -237,7 +248,9 @@ async def the_team_with_a_goto_never_reaches_the_room():
           [c for c in cog.calls if c[0] == "page"], [])
     check("post/the board still gets rendered",
           ("board",) in cog.calls, True)
-    check("post/the go-to is DM'd", [d[0] for d in cog.dms], [WILL.id])
+    check("post/nothing is said until the notice window closes", cog.dms, [])
+    await flush(cog)
+    check("post/the super sub is DM'd", [d[0] for d in cog.dms], [ROBIN.id])
     dm = next(iter(cog.dms), None)
     check("post/there is a DM to inspect", dm is not None, True)
     if dm is None:
@@ -250,7 +263,7 @@ async def the_team_with_a_goto_never_reaches_the_room():
 
 async def a_team_without_one_still_asks_the_room():
     cog = make_cog()
-    made, skipped, filled = await post(cog, BRUCE, [THU[0]], team="Okafor")
+    made, skipped, filled = await post(cog, BRUCE, [THU[0]], team="Vance")
     check("post/no arrangement means nothing is auto-filled", filled, 0)
     check("post/and the alert goes up as before",
           [c[1] for c in cog.calls if c[0] == "page"], ["new"])
@@ -259,10 +272,11 @@ async def a_team_without_one_still_asks_the_room():
 
 async def six_dates_are_one_dm_but_six_assignments():
     cog = make_cog()
-    goto(cog, WILL, "Delaney")
+    goto(cog, ROBIN, "Ashby")
     made, skipped, filled = await post(cog, BRUCE, THU)
     check("post/every date is its own request", made, 6)
     check("post/every one auto-filled", filled, 6)
+    await flush(cog)
     check("post/one DM for the lot", len(cog.dms), 1)
     aids = {f["auto"] for r in cog.state["requests"] for f in r["filled"]}
     check("post/sharing one batch id", len(aids), 1)
@@ -273,25 +287,27 @@ async def six_dates_are_one_dm_but_six_assignments():
 
 async def priority_fills_the_second_spot_not_a_spare():
     cog = make_cog()
-    goto(cog, WILL, "Delaney")
-    goto(cog, SAM, "Delaney")
+    goto(cog, ROBIN, "Ashby")
+    goto(cog, SAM, "Ashby")
     await post(cog, BRUCE, [THU[0]], spots=2)
     req = cog.state["requests"][0]
-    check("priority/both spots go to the two go-tos, in order",
-          [f["name"] for f in req["filled"]], ["Will Grant", "Sam Ortiz"])
-    check("priority/two people, two DMs", sorted(d[0] for d in cog.dms), [WILL.id, SAM.id])
+    check("priority/both spots go to the two super subs, in order",
+          [f["name"] for f in req["filled"]], ["Robin Vale", "Sam Ortiz"])
+    await flush(cog)
+    check("priority/two people, two DMs", sorted(d[0] for d in cog.dms),
+          sorted([ROBIN.id, SAM.id]))
 
     cog2 = make_cog()
-    goto(cog2, WILL, "Delaney")
-    goto(cog2, SAM, "Delaney")
+    goto(cog2, ROBIN, "Ashby")
+    goto(cog2, SAM, "Ashby")
     await post(cog2, BRUCE, [THU[0]], spots=1)
     check("priority/one spot goes to the first only",
-          [f["name"] for f in cog2.state["requests"][0]["filled"]], ["Will Grant"])
+          [f["name"] for f in cog2.state["requests"][0]["filled"]], ["Robin Vale"])
 
 
 async def the_requesters_own_arrangement_doesnt_cover_them():
     cog = make_cog()
-    goto(cog, BRUCE, "Delaney")          # Bruce is the go-to AND the one who's out
+    goto(cog, BRUCE, "Ashby")          # Bruce is the super sub AND the one who's out
     made, skipped, filled = await post(cog, BRUCE, [THU[0]])
     check("post/you are never assigned to your own ask", filled, 0)
     check("post/so the room is asked",
@@ -301,14 +317,14 @@ async def the_requesters_own_arrangement_doesnt_cover_them():
 # ── 4. Dropping and confirming ──────────────────────────────────────────────
 async def dropping_one_date_leaves_the_rest():
     cog = make_cog()
-    goto(cog, WILL, "Delaney")
+    goto(cog, ROBIN, "Ashby")
     await post(cog, BRUCE, THU[:3])
     second = at(cog.state["requests"], 1, "drop/three dates were posted")
     if second is None:
         return
     rid = second["id"]
     cog.calls.clear()
-    dropped = await cog.drop_auto(WILL, [rid])
+    dropped = await cog.drop_auto(ROBIN, [rid])
     check("drop/just that date", dropped, [second["game_ts"]])
     check("drop/it reopens", store.open_spots(store.find_request(cog.state, rid)), 1)
     check("drop/and the room is asked for it",
@@ -317,8 +333,9 @@ async def dropping_one_date_leaves_the_rest():
     check("drop/the other dates are untouched",
           [store.open_spots(r) for r in others], [0, 0])
     check("drop/the arrangement itself stands",
-          len(store.standing_for(cog.state, "555", "Delaney")), 1)
+          len(store.standing_for(cog.state, "555", "Ashby")), 1)
     check("drop/the requester is told", any(d[0] == BRUCE.id for d in cog.dms), True)
+    await flush(cog)
     # And a re-post of that same date must not put them back on it.
     again = await cog._auto_assign([store.find_request(cog.state, rid)])
     check("drop/never re-assigned to a date they dropped", again, {})
@@ -326,28 +343,27 @@ async def dropping_one_date_leaves_the_rest():
 
 async def confirming_clears_the_flag():
     cog = make_cog()
-    goto(cog, WILL, "Delaney")
+    goto(cog, ROBIN, "Ashby")
     await post(cog, BRUCE, THU[:2])
     req = at(cog.state["requests"], 0, "confirm/a request exists")
     entry = at((req or {}).get("filled", []), 0, "confirm/somebody was assigned")
     if entry is None:
         return
-    aid = entry["auto"]
     line = subs._req_status_line(req)
     check("confirm/an unconfirmed assignment says so", "(unconfirmed)" in line, True)
-    done = await cog.confirm_auto(WILL, aid)
-    check("confirm/every date in the batch", len(done), 2)
+    done = await cog.confirm_auto(ROBIN)
+    check("confirm/every date they're down for", len(done), 2)
     check("confirm/the board stops flagging it",
           "(unconfirmed)" in subs._req_status_line(req), False)
-    check("confirm/twice is a no-op", await cog.confirm_auto(WILL, aid), [])
-    check("confirm/somebody else's batch is not theirs to confirm",
-          await cog.confirm_auto(SAM, aid), [])
+    check("confirm/twice is a no-op", await cog.confirm_auto(ROBIN), [])
+    check("confirm/it only ever confirms your own", await cog.confirm_auto(SAM), [])
+    await flush(cog)
 
 
 async def an_unconfirmed_assignment_is_chased_before_game_day():
     cog = make_cog()
     ch = Ch()
-    goto(cog, WILL, "Delaney")
+    goto(cog, ROBIN, "Ashby")
 
     async def resolve(cid):
         return ch
@@ -360,10 +376,11 @@ async def an_unconfirmed_assignment_is_chased_before_game_day():
     await cog._chase_unconfirmed(subs.club_now())
     check("chase/said out loud in the channel", len(ch.sent), 1)
     said = at(ch.sent, 0, "chase/there is a message to inspect")
-    check("chase/and it names the person", f"<@{WILL.id}>" in (said[0] if said else ""), True)
+    check("chase/and it names the person", f"<@{ROBIN.id}>" in (said[0] if said else ""), True)
     check("chase/the spot is NOT reopened — they're still the sub",
           store.open_spots(first), 0)
-    check("chase/they get a nudge too", any(d[0] == WILL.id for d in cog.dms[1:]), True)
+    check("chase/and no DM saying the same thing again — the @-mention IS the ping",
+          [d for d in cog.dms if d[0] == ROBIN.id and "\u23f0" in d[1]], [])
     ch.sent.clear()
     await cog._chase_unconfirmed(subs.club_now())
     check("chase/only once per request", ch.sent, [])
@@ -375,15 +392,190 @@ async def an_unconfirmed_assignment_is_chased_before_game_day():
     async def resolve2(cid):
         return ch2
     cog2._resolve_channel = resolve2
-    goto(cog2, WILL, "Delaney")
+    goto(cog2, ROBIN, "Ashby")
     await post(cog2, BRUCE, [night(1)], channel=ch2)
     req2 = at(cog2.state["requests"], 0, "chase/the second request exists")
     seat = at((req2 or {}).get("filled", []), 0, "chase/somebody was assigned to it")
     if seat is None:
         return
-    await cog2.confirm_auto(WILL, seat["auto"])
+    await cog2.confirm_auto(ROBIN)
     await cog2._chase_unconfirmed(subs.club_now())
     check("chase/a confirmed assignment is left alone", ch2.sent, [])
+
+
+
+# ── 4b. How many times does the bot buzz one person? ────────────────────────
+# A season's worth of dates going up used to produce NINE notifications for one
+# member. Nine dates posted one at a time are nine assignments and nine alerts, but
+# to the person on the other end they are ONE thing that happened, and a member who
+# mutes the bot is a member the board can no longer reach. Every count below is a
+# phone buzz: a DM is 1, a channel message carrying your @-mention is 1, an edit is 0.
+
+async def nine_postings_are_one_message():
+    cog = make_cog()
+    goto(cog, ROBIN, "Ashby")
+    for d in NINE:                     # a chair working through the season, one at a time
+        await post(cog, BRUCE, [d])
+    check("volume/nine postings, nine assignments",
+          sum(len(store.auto_entries(r)) for r in cog.state["requests"]), 9)
+    check("volume/and nothing sent while the window is open", cog.dms, [])
+    await flush(cog)
+    check("volume/ONE message, not nine", len(cog.dms), 1)
+    body = cog.dms[0][1] if cog.dms else ""
+    check("volume/that names every date", "9 dates" in body, True)
+    check("volume/with buttons covering all of them",
+          type(cog.dms[0][2]).__name__ if cog.dms else None, "AutoAssignView")
+    # And nothing is announced twice.
+    cog.dms.clear()
+    cog._queue_sub_notice(ROBIN.id)
+    await flush(cog)
+    check("volume/already-told dates are never re-announced", cog.dms, [])
+
+
+async def a_tenth_date_later_is_its_own_message():
+    cog = make_cog()
+    goto(cog, ROBIN, "Ashby")
+    await post(cog, BRUCE, THU[:3])
+    await flush(cog)
+    check("volume/first three", len(cog.dms), 1)
+    await post(cog, BRUCE, [THU[4]])      # a week later — genuinely new news
+    await flush(cog)
+    check("volume/a later posting is its own message", len(cog.dms), 2)
+    body = cog.dms[1][1] if len(cog.dms) > 1 else ""
+    check("volume/and only mentions the new date",
+          (subs.fmt_when(THU[4]) in body, subs.fmt_when(THU[0]) in body), (True, False))
+
+
+async def a_burst_of_alerts_pings_you_once():
+    """No super sub — just someone listed as available. This is the prod case."""
+    cog = make_cog()
+    ch = Ch()
+
+    async def resolve(cid):
+        return ch
+    cog._resolve_channel = resolve
+    cog.post_page = subs.Subs.post_page.__get__(cog)     # the REAL alert path
+    store.upsert_availability(cog.state, user_id=ROBIN.id, name="Robin Vale",
+                              league_id="555", league="Thursday League", games=[])
+    for d in NINE:
+        await post(cog, BRUCE, [d], team="Vance", channel=ch)
+    check("volume/nine asks means nine alerts", len(ch.sent), 9)
+    pinged = sum(1 for body, _ in ch.sent if f"<@{ROBIN.id}>" in body)
+    named = sum(1 for body, _ in ch.sent if "Robin" in body and f"<@{ROBIN.id}>" not in body)
+    check("volume/but he is @-mentioned ONCE", pinged, 1)
+    check("volume/and named without a ping on the rest", named, 8)
+    check("volume/the alert still reads right",
+          "tagged a moment ago" in (ch.sent[-1][0] if ch.sent else ""), True)
+
+
+async def the_chase_says_it_once_per_room():
+    cog = make_cog()
+    ch = Ch()
+
+    async def resolve(cid):
+        return ch
+    cog._resolve_channel = resolve
+    goto(cog, ROBIN, "Ashby")
+    await post(cog, BRUCE, [night(1, 19), night(1, 17), night(1, 15)], channel=ch)
+    await flush(cog)
+    cog.dms.clear()
+    ch.sent.clear()
+    await cog._chase_unconfirmed(subs.club_now())
+    check("volume/three unconfirmed dates, ONE message", len(ch.sent), 1)
+    body = ch.sent[0][0] if ch.sent else ""
+    check("volume/naming all three", body.count("·") >= 3, True)
+    check("volume/mentioning him once", body.count(f"<@{ROBIN.id}>"), 1)
+    check("volume/and no DM on top", cog.dms, [])
+
+
+async def someone_with_dms_closed_is_not_chased_forever():
+    cog = make_cog()
+
+    async def dead_dm(uid, text, view=None):
+        cog.dms.append((uid, text, view))
+        return False                      # their DMs are closed
+    cog._dm = dead_dm
+    goto(cog, ROBIN, "Ashby")
+    await post(cog, BRUCE, THU[:2])
+    await flush(cog)
+    check("volume/one attempt", len(cog.dms), 1)
+    cog._queue_sub_notice(ROBIN.id)
+    await flush(cog)
+    check("volume/not retried forever", len(cog.dms), 1)
+
+
+
+# ── 4c. One message means one MESSAGE, not two stuck together ───────────────
+# A single DM carrying two unrelated ⭐ announcements — an arrangement for one team,
+# then a date for a different one — reads as two messages. Both halves were correct;
+# the shape wasn't. The second half was there at all because its notice had been lost
+# to a restart hours earlier and nothing ever retried it.
+
+def a_notice_reads_as_one_thing():
+    TL = "Tuesday League 9/1 – 12/22"
+    one = subs.build_notice([], {(TL, "Ashby"): [THU[0]]})
+    check("shape/the everyday case is one sentence and a prompt",
+          one.count("⭐"), 1)
+    check("shape/and names the team and the date",
+          all(x in one for x in ("Ashby", subs.fmt_when(THU[0]))), True)
+
+    made = subs.build_notice([(TL, "Corwin", "Alex")], {})
+    check("shape/a bare arrangement says how it works",
+          "put on it automatically" in made, True)
+    check("shape/and doesn't offer a Confirm for dates that don't exist",
+          "Confirm so the team knows" in made, False)
+
+    # The reported case: an arrangement for one team, a date for another.
+    mixed = subs.build_notice([(TL, "Corwin", "Alex")], {(TL, "Ashby"): [THU[0]]})
+    check("shape/never two ⭐ announcements stacked", mixed.count("⭐"), 1)
+    check("shape/the dates are joined to the arrangement, not appended",
+          "**You're also down for:**" in mixed, True)
+    check("shape/and the other team is named on its own line",
+          "· **Ashby**" in mixed, True)
+
+    # An arrangement that sweeps up its OWN team's dates shouldn't repeat itself.
+    own = subs.build_notice([(TL, "Ashby", "Alex")], {(TL, "Ashby"): [THU[0], THU[1]]})
+    check("shape/its own team is named once, not three times", own.count("Ashby"), 1)
+    check("shape/and the dates still show", "**You're down for:**" in own, True)
+
+    two = subs.build_notice([], {(TL, "Ashby"): [THU[0]], (TL, "Corwin"): [THU[1]]})
+    check("shape/two teams get one list, not two announcements", two.count("⭐"), 1)
+    check("shape/naming both", ("Ashby" in two, "Corwin" in two), (True, True))
+    check("shape/nothing to say, nothing said", subs.build_notice([], {}), "")
+
+
+async def startup_is_what_retries_them():
+    """Wiring, not behaviour: the retry existing is worthless if (re)connect doesn't
+    run it. The chase taught this lesson once already."""
+    cog = make_cog()
+    ran = []
+    cog._requeue_unnotified = lambda: ran.append(1)
+    await cog.startup()
+    check("restart/startup is what re-queues them", len(ran), 1)
+
+
+async def a_notice_lost_to_a_restart_is_retried():
+    cog = make_cog()
+    goto(cog, ROBIN, "Ashby")
+    await post(cog, BRUCE, THU[:2])
+    check("restart/queued but not yet sent", cog.dms, [])
+
+    # The bot goes down mid-window: the task dies, the store keeps `notified: False`.
+    cog._notices.clear()
+    await flush(cog)
+    check("restart/so nothing was ever sent", cog.dms, [])
+    check("restart/and the store still says they're owed one",
+          len(store.auto_requests(cog.state, ROBIN.id, only_unnotified=True)), 2)
+
+    cog._requeue_unnotified()          # what startup() does on reconnect
+    await flush(cog)
+    check("restart/it goes out on the next start", len(cog.dms), 1)
+    check("restart/naming the dates",
+          "You're down for" in cog.dms[0][1] or "you're down for" in cog.dms[0][1], True)
+    cog.dms.clear()
+    cog._requeue_unnotified()
+    await flush(cog)
+    check("restart/and not again after that", cog.dms, [])
 
 
 # ── 5. Making and ending an arrangement ─────────────────────────────────────
@@ -400,30 +592,35 @@ async def the_reminder_loop_actually_runs_the_chase():
 
 async def a_new_arrangement_covers_what_is_already_asking():
     cog = make_cog()
-    await post(cog, BRUCE, THU[:2])                 # posted BEFORE Will was set up
+    await post(cog, BRUCE, THU[:2])                 # posted BEFORE the arrangement existed
     check("standing/those went to the room",
           len([c for c in cog.calls if c[0] == "page"]), 1)
     cog.calls.clear()
     result, isos = await cog.add_standing(
-        actor=LISA, member=WILL, league_id="555",
-        league=subs.league_label(TEAMED), team="Delaney", channel=Ch())
+        actor=ALEX, member=ROBIN, league_id="555",
+        league=subs.league_label(TEAMED), team="Ashby", channel=Ch())
     check("standing/added", result, "added")
     check("standing/and it swept up the open dates", len(isos), 2)
     check("standing/nothing is left asking",
           [store.open_spots(r) for r in cog.state["requests"]], [0, 0])
-    check("standing/Will hears it from the bot, not from the board",
-          any("go-to sub" in d[1] for d in cog.dms if d[0] == WILL.id), True)
+    await flush(cog)
+    told = [d for d in cog.dms if d[0] == ROBIN.id]
+    check("standing/they hear it from the bot, not from the board", len(told), 1)
+    check("standing/and the arrangement and the dates are ONE message",
+          all(x in told[0][1] for x in ("made you the **super sub**", "You're down for"))
+          if told else None, True)
 
 
 async def ending_an_arrangement_leaves_the_dates_alone():
     cog = make_cog()
-    goto(cog, WILL, "Delaney")
+    goto(cog, ROBIN, "Ashby")
     await post(cog, BRUCE, THU[:2])
-    removed = await cog.remove_standing(WILL.id, "555", "Delaney", actor=LISA)
+    removed = await cog.remove_standing(ROBIN.id, "555", "Ashby", actor=ALEX)
     check("standing/removed", removed, True)
     check("standing/the dates he's on stay his",
           [store.open_spots(r) for r in cog.state["requests"]], [0, 0])
-    check("standing/he's told", any("ended your go-to" in d[1] for d in cog.dms), True)
+    check("standing/he's told", any("ended your super sub" in d[1] for d in cog.dms), True)
+    await flush(cog)
     made, skipped, filled = await post(cog, BRUCE, [THU[3]])
     check("standing/but nothing new is assigned", filled, 0)
 
@@ -431,12 +628,12 @@ async def ending_an_arrangement_leaves_the_dates_alone():
 # ── 6. Teams posted after the fact ──────────────────────────────────────────
 async def attaching_a_team_warns_about_the_double_book():
     cog = make_cog()
-    # Bruce posted before the chair set teams; Lisa later posts for the same team+draw.
+    # Bruce posted before the chair set teams; Alex later posts for the same team+draw.
     await post(cog, BRUCE, [THU[0]], team="", league=UNTEAMED)
-    await post(cog, LISA, [THU[0]], team="Delaney", league=UNTEAMED)
+    await post(cog, ALEX, [THU[0]], team="Ashby", league=UNTEAMED)
     rid = cog.state["requests"][0]["id"]
-    done, clashes, assigned = await cog.set_team_for(BRUCE, [rid], "Delaney")
-    check("reconcile/the team is set", store.find_request(cog.state, rid)["team"], "Delaney")
+    done, clashes, assigned = await cog.set_team_for(BRUCE, [rid], "Ashby")
+    check("reconcile/the team is set", store.find_request(cog.state, rid)["team"], "Ashby")
     check("reconcile/one date done", len(done), 1)
     check("reconcile/and the clash is called out", len(clashes), 1)
 
@@ -444,41 +641,41 @@ async def attaching_a_team_warns_about_the_double_book():
     cog2 = make_cog()
     await post(cog2, BRUCE, [THU[0]], team="", league=UNTEAMED)
     rid2 = cog2.state["requests"][0]["id"]
-    done2, clashes2, _ = await cog2.set_team_for(BRUCE, [rid2], "Delaney")
+    done2, clashes2, _ = await cog2.set_team_for(BRUCE, [rid2], "Ashby")
     check("reconcile/no clash, no warning", (len(done2), clashes2), (1, []))
 
     # Only your own requests.
     cog3 = make_cog()
     await post(cog3, BRUCE, [THU[0]], team="", league=UNTEAMED)
     rid3 = cog3.state["requests"][0]["id"]
-    done3, _, _ = await cog3.set_team_for(LISA, [rid3], "Delaney")
+    done3, _, _ = await cog3.set_team_for(ALEX, [rid3], "Ashby")
     check("reconcile/you can only name the team on your own ask", done3, [])
 
 
 async def attaching_a_team_hands_it_to_the_goto():
     cog = make_cog()
     await post(cog, BRUCE, [THU[0]], team="", league=UNTEAMED)
-    store.add_standing(cog.state, user_id=WILL.id, name="Will Grant",
-                       league_id=str(UNTEAMED["id"]), league="Sunday league", team="Delaney")
+    store.add_standing(cog.state, user_id=ROBIN.id, name="Robin Vale",
+                       league_id=str(UNTEAMED["id"]), league="Sunday league", team="Ashby")
     rid = cog.state["requests"][0]["id"]
-    done, clashes, assigned = await cog.set_team_for(BRUCE, [rid], "Delaney")
-    check("reconcile/naming the team lets the go-to pick it up", assigned, 1)
+    done, clashes, assigned = await cog.set_team_for(BRUCE, [rid], "Ashby")
+    check("reconcile/naming the team lets the super sub pick it up", assigned, 1)
     check("reconcile/covered", store.open_spots(store.find_request(cog.state, rid)), 0)
 
 
 async def the_nudge_goes_out_once_per_person_per_league():
     cog = make_cog()
     await post(cog, BRUCE, THU[:3], team="", league=UNTEAMED)
-    await post(cog, LISA, [THU[0]], team="", league=UNTEAMED)
+    await post(cog, ALEX, [THU[0]], team="", league=UNTEAMED)
 
     async def leagues():
         # The chair has now posted teams for that league.
-        return [dict(UNTEAMED, team_names=["Delaney", "Okafor"])]
+        return [dict(UNTEAMED, team_names=["Ashby", "Vance"])]
     cog.get_leagues = leagues
     cog.dms.clear()
     await subs.Subs.team_reconcile_loop.coro(cog)
     check("nudge/one DM per person, not per request", sorted(d[0] for d in cog.dms),
-          sorted([BRUCE.id, LISA.id]))
+          sorted([BRUCE.id, ALEX.id]))
     first = next(iter(cog.dms), None)
     check("nudge/there is a DM to inspect", first is not None, True)
     check("nudge/it carries the button",
@@ -499,26 +696,29 @@ async def the_nudge_goes_out_once_per_person_per_league():
     check("nudge/nothing to attach yet, nothing said", cog2.dms, [])
 
 
-# ── 7. The alert tags the go-to first ───────────────────────────────────────
+# ── 7. The alert tags the super sub first ───────────────────────────────────────
 async def the_alert_puts_the_goto_line_first():
     cog = make_cog()
-    goto(cog, WILL, "Delaney")
-    goto(cog, SAM, "Delaney")
-    await post(cog, BRUCE, [THU[0]], spots=1)        # Will takes it, Sam does not
-    req = cog.state["requests"][0]
-    await cog.drop_auto(WILL, [req["id"]])            # now it's open again
-    store.upsert_availability(cog.state, user_id=LISA.id, name="Lisa Chen",
+    goto(cog, ROBIN, "Ashby")
+    goto(cog, SAM, "Ashby")
+    await post(cog, BRUCE, [THU[0]], spots=1)        # Robin takes it, Sam does not
+    await flush(cog)
+    req = at(cog.state["requests"], 0, "alert/the request exists")
+    if req is None:
+        return
+    await cog.drop_auto(ROBIN, [req["id"]])            # now it's open again
+    store.upsert_availability(cog.state, user_id=ALEX.id, name="Alex Reed",
                               league_id="555", league="Thursday League", games=[])
     body = cog._page_body(req, reason="bump")
     lines = [l for l in body.split("\n") if l.startswith("<@")]
     check("alert/two tag lines", len(lines), 2)
-    first_line, second_line = (at(lines, 0, "alert/a go-to line") or ""), (at(lines, 1, "alert/an availability line") or "")
-    check("alert/the go-to is tagged on the first line",
+    first_line, second_line = (at(lines, 0, "alert/a super sub line") or ""), (at(lines, 1, "alert/an availability line") or "")
+    check("alert/the super sub is tagged on the first line",
           first_line.startswith(f"<@{SAM.id}>"), True)
-    check("alert/and named as the go-to", "go-to sub for this team" in first_line, True)
-    check("alert/general availability comes after", f"<@{LISA.id}>" in second_line, True)
+    check("alert/and named as the super sub", "super sub for this team" in first_line, True)
+    check("alert/general availability comes after", f"<@{ALEX.id}>" in second_line, True)
     check("alert/someone who dropped this date is not tagged for it",
-          f"<@{WILL.id}>" in body, False)
+          f"<@{ROBIN.id}>" in body, False)
 
 
 # ── 8. The manager UI ───────────────────────────────────────────────────────
@@ -539,31 +739,31 @@ def the_manager_ui_holds_its_shape():
     submit = at(v.children, 3, "ui/there is a submit button")
     check("ui/the button is dead until every part is picked",
           submit.disabled if submit else None, True)
-    v.team, v.member = "Delaney", WILL
+    v.team, v.member = "Ashby", ROBIN
     v.build()
     submit = at(v.children, 3, "ui/still a submit button")
     check("ui/and live once they are", submit.disabled if submit else None, False)
     check("ui/it says what it will do",
-          ("Will" in submit.label and "Delaney" in submit.label) if submit else None, True)
+          ("Robin" in submit.label and "Ashby" in submit.label) if submit else None, True)
     check("ui/the prompt says the first one is the auto-assign",
           "auto-assigned" in v.prompt(), True)
 
     st = store.empty_state()
-    store.add_standing(st, user_id=WILL.id, name="Will Grant", league_id="555",
-                       league="Thursday League", team="Delaney")
+    store.add_standing(st, user_id=ROBIN.id, name="Robin Vale", league_id="555",
+                       league="Thursday League", team="Ashby")
     v2 = subs.StandingAddView([TEAMED], st)
-    v2.league_id, v2.team, v2.member = "555", "Delaney", SAM
+    v2.league_id, v2.team, v2.member = "555", "Ashby", SAM
     v2.build()
     check("ui/a second person is told they're #2 and why", "#2" in v2.prompt(), True)
-    check("ui/summary lists the arrangement", "Will Grant" in subs.standing_summary(st), True)
-    check("ui/empty summary says so", "No go-to subs" in subs.standing_summary(store.empty_state()), True)
+    check("ui/summary lists the arrangement", "Robin Vale" in subs.standing_summary(st), True)
+    check("ui/empty summary says so", "No super subs" in subs.standing_summary(store.empty_state()), True)
 
 
 # ── 9. Invariants that must survive this change ─────────────────────────────
 def a_select_never_mutates_shared_state():
-    """An ast walk over every *Select class's callback. Brian's rule: a select may
+    """An ast walk over every *Select class's callback. The rule: a select may
     only set view state or open a confirm view — a mis-tap has no undo. This is the
-    audit that used to be ad-hoc; three new selects arrived with go-to subs."""
+    audit that used to be ad-hoc; three new selects arrived with super subs."""
     MUTATORS = {
         "add_sub", "remove_sub", "toggle_spot", "new_request", "close_request",
         "set_spots", "upsert_availability", "remove_availability", "expire",
@@ -590,7 +790,7 @@ def a_select_never_mutates_shared_state():
                     and isinstance(sub_node.func, ast.Attribute)
                     and sub_node.func.attr in MUTATORS):
                 offenders.append(f"{node.name}.{sub_node.func.attr}")
-    # 10 before go-to subs, plus StandingMemberSelect and StandingRemoveSelect. The
+    # 10 before super subs, plus StandingMemberSelect and StandingRemoveSelect. The
     # count is asserted so a new select can't be added without landing in this audit.
     check("invariant/every select was audited", sorted(seen), sorted([
         "FillForPick", "FillForMemberSelect", "RemoveSubSelect", "CancelRequestSelect",
@@ -623,14 +823,14 @@ def one_picker_four_meanings_keeps_its_callers_words():
     check("invariant/and no two flows share a wording", len(set(words)), len(words))
 
     reqs = [{"id": "a", "game_ts": THU[0], "spots_needed": 1, "filled": [], "pending": [],
-             "team": "Delaney", "requester_name": "Bruce Iyer"}]
+             "team": "Ashby", "requester_name": "Bruce Iyer"}]
     check("invariant/the description is the caller's too",
           subs.NightSelect(reqs, [], placeholder="x",
                            description_of=lambda r: "mine").options[0].description, "mine")
 
 
 def dates_never_nights():
-    """Brian: "don't use 'nights' as some leagues are daytime hours." The rule is about
+    """Copy says "dates", never "nights" — some leagues are daytime hours. The rule is about
     what a member READS, so this looks at string literals only — docstrings and the old
     internal identifiers (NightSelect, claim_nights) are deliberately left alone."""
     NEW = {"AutoAssignView", "ConfirmAutoButton", "DropAutoButton", "AutoDropView",
@@ -669,6 +869,13 @@ async def main():
                confirming_clears_the_flag,
                an_unconfirmed_assignment_is_chased_before_game_day,
                the_reminder_loop_actually_runs_the_chase,
+               nine_postings_are_one_message,
+               a_tenth_date_later_is_its_own_message,
+               a_burst_of_alerts_pings_you_once,
+               the_chase_says_it_once_per_room,
+               someone_with_dms_closed_is_not_chased_forever,
+               a_notice_lost_to_a_restart_is_retried,
+               startup_is_what_retries_them,
                a_new_arrangement_covers_what_is_already_asking,
                ending_an_arrangement_leaves_the_dates_alone,
                attaching_a_team_warns_about_the_double_book,
@@ -678,7 +885,14 @@ async def main():
         await fn()
 
 
-asyncio.run(main())
+async def _main():
+    await main()
+    for c in COGS:
+        await c._flush_all_notices()
+
+
+asyncio.run(_main())
+a_notice_reads_as_one_thing()
 the_manager_ui_holds_its_shape()
 a_select_never_mutates_shared_state()
 one_picker_four_meanings_keeps_its_callers_words()
@@ -687,4 +901,4 @@ dates_never_nights()
 if FAILS:
     print("\n".join(f"FAIL: {f}" for f in FAILS))
     raise SystemExit(1)
-print("All go-to sub checks passed.")
+print("All super sub checks passed.")

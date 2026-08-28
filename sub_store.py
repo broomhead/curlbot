@@ -417,8 +417,40 @@ def assign_auto(req: dict, user_id: int, name: str, assign_id: str,
         "ts": _now_iso(now or datetime.now()),
         "auto": str(assign_id),
         "confirmed": False,
+        # Assignment and TELLING them are separate steps. Nine dates posted one at a
+        # time are nine assignments but must be one message, so the notice is queued
+        # and this flag is what stops the same date being announced twice.
+        "notified": False,
     })
     return "assigned"
+
+
+def auto_requests(state: dict, user_id: int, *, only_unnotified: bool = False,
+                  only_unconfirmed: bool = False) -> list[dict]:
+    """Requests this person has been auto-assigned to, soonest first."""
+    out = []
+    for r in requests_sorted(state):
+        entry = auto_entry(r, user_id)
+        if entry is None:
+            continue
+        if only_unnotified and entry.get("notified"):
+            continue
+        if only_unconfirmed and entry.get("confirmed"):
+            continue
+        out.append(r)
+    return out
+
+
+def mark_notified(state: dict, user_id: int, reqs: list[dict]) -> int:
+    """Record that these assignments have been announced to them."""
+    n = 0
+    for r in reqs:
+        live = find_request(state, r["id"]) or r
+        entry = auto_entry(live, user_id)
+        if entry is not None and not entry.get("notified"):
+            entry["notified"] = True
+            n += 1
+    return n
 
 
 def confirm_auto(req: dict, user_id: int) -> str:

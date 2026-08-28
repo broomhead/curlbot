@@ -58,21 +58,21 @@ def raises(label, fn, /, *a, **k):
 
 
 NOW = datetime(2026, 8, 20, 10, 0)          # Thu Aug 20, 10am
-SUN = datetime(2026, 8, 23, 13, 30)         # the Sunday Darin booked
+SUN = datetime(2026, 8, 23, 13, 30)         # the Sunday Dana booked
 
 
 # ── 1. Block store: add / release / expire ───────────────────────────────────
 
 st = bs.empty_state()
 b = bs.add(st, start=SUN, end=SUN + timedelta(hours=2, minutes=30), sheets=2,
-           user_id=42, name="Darin", reason="LTC (off the books)", now=NOW)
+           user_id=42, name="Dana", reason="LTC (off the books)", now=NOW)
 check("add/id", b["id"], "20260823T1330-1")
 check("add/sheets", b["sheets"], 2)
-check("add/who", (b["user_id"], b["name"]), (42, "Darin"))
+check("add/who", (b["user_id"], b["name"]), (42, "Dana"))
 
 # Two blocks on the same slot must not collide on id.
 b2 = bs.add(st, start=SUN, end=SUN + timedelta(hours=1), sheets=1,
-            user_id=7, name="Brian", now=NOW)
+            user_id=7, name="Kim", now=NOW)
 check("add/second id", b2["id"], "20260823T1330-2")
 check("add/both stored", len(st["blocks"]), 2)
 
@@ -194,7 +194,7 @@ def practice(h, m, eh, em=0, **kw):
 
 blk = bs.empty_state()
 bs.add(blk, start=SUN, end=datetime(2026, 8, 23, 15, 0), sheets=2,
-       user_id=42, name="Darin", reason="LTC", now=NOW)
+       user_id=42, name="Dana", reason="LTC", now=NOW)
 
 sessions = [practice(13, 30, 16)] + bs.as_sessions(blk)
 opps = pi.practice_opportunities(sessions, 4)
@@ -204,14 +204,14 @@ check("math/row knows its block", len(opps[0]["blocks"]), 1)
 
 icon, line = pi.format_opportunity(opps[0], 4)
 check("format/icon", icon, "🟢")
-check_true("format/names the blocker", "blocked by Darin" in line)
+check_true("format/names the blocker", "blocked by Dana" in line)
 check_true("format/gives the reason", "LTC" in line)
 check_true("format/spells out the partial window", "1:30–3:00 PM" in line)
 
 # Blocking everything closes the slot rather than hiding it.
 blk_all = bs.empty_state()
 bs.add(blk_all, start=SUN, end=datetime(2026, 8, 23, 16, 0), sheets=4,
-       user_id=42, name="Darin", now=NOW)
+       user_id=42, name="Dana", now=NOW)
 opps_full = pi.practice_opportunities([practice(13, 30, 16)] + bs.as_sessions(blk_all), 4)
 check("math/full block leaves zero", opps_full[0]["free"], 0)
 check("math/slot still listed", opps_full[0]["type"], "Practice")
@@ -250,12 +250,12 @@ draw = {"start": datetime(2026, 8, 20, 19, 45), "end": datetime(2026, 8, 20, 22,
         "type": "League", "title": "Thursday League", "sheets_used": 3}
 lg = bs.empty_state()
 bs.add(lg, start=draw["start"], end=draw["end"], sheets=1, user_id=1,
-       name="Darin", reason="LTC", now=NOW)
+       name="Dana", reason="LTC", now=NOW)
 blocked_league = pi.practice_opportunities([draw] + bs.as_sessions(lg), 4)
 check("math/blocked league keeps its row", [o["type"] for o in blocked_league], ["League"])
 check("math/blocked league at zero", blocked_league[0]["free"], 0)
 check_true("math/and still explains itself",
-           "blocked by Darin" in pi.format_opportunity(blocked_league[0], 4)[1])
+           "blocked by Dana" in pi.format_opportunity(blocked_league[0], 4)[1])
 # ...but an unblocked full league is still hidden, as before.
 check("math/full league with no block stays hidden",
       pi.practice_opportunities([{**draw, "sheets_used": 4}], 4), [])
@@ -287,7 +287,7 @@ evening = {"start": datetime(2026, 8, 20, 18, 0), "end": datetime(2026, 8, 20, 1
            "type": "Practice", "title": "Practice", "sheets_used": 0}
 spanning = bs.empty_state()
 bs.add(spanning, start=datetime(2026, 8, 20, 18, 0), end=datetime(2026, 8, 20, 20, 0),
-       sheets=1, user_id=1, name="Darin", reason="LTC", now=NOW)
+       sheets=1, user_id=1, name="Dana", reason="LTC", now=NOW)
 mixed = pi.practice_opportunities([evening, full_draw] + bs.as_sessions(spanning), 4)
 check("math/already-full league stays hidden", [o["type"] for o in mixed], ["Practice"])
 check("math/the row it did touch is right", mixed[0]["free"], 3)
@@ -305,7 +305,7 @@ check("format/window spanning midnight names both days",
 
 live = bs.empty_state()
 held = bs.add(live, start=SUN, end=datetime(2026, 8, 23, 16, 0), sheets=2,
-              user_id=42, name="Darin", reason="LTC", now=NOW)
+              user_id=42, name="Dana", reason="LTC", now=NOW)
 rows = pi.practice_opportunities([practice(13, 30, 16), practice(19, 45, 22)]
                                  + bs.as_sessions(live), 4)
 
@@ -331,7 +331,7 @@ check("view/one count option per sheet", [o.value for o in count_select.options]
 check_true("view/count options show what's left", "leaves 1 free" in
            [o.description for o in count_select.options][0])
 check_true("view/prompt names the slot", "Sun Aug 23" in flow.prompt())
-check_true("view/prompt shows the blocker", "Darin" in flow.prompt())
+check_true("view/prompt shows the blocker", "Dana" in flow.prompt())
 
 # Every select stays inside Discord's limits, and rows never double up.
 for child in flow.children:
@@ -416,7 +416,7 @@ async def _retire_cases():
     botmod.BLOCK_STORE_PATH = "/tmp/test_blocks_store.json"
     botmod.now_club = lambda: NOW
     bs.add(botmod._block_state, start=SUN, end=datetime(2026, 8, 23, 16, 0),
-           sheets=2, user_id=42, name="Darin", reason="LTC", now=NOW)
+           sheets=2, user_id=42, name="Dana", reason="LTC", now=NOW)
     # NB: View.stop() only takes effect inside a running loop (the stop future is
     # loop-bound), so both views are built AND stopped in here — doing it at module
     # scope silently tests nothing.

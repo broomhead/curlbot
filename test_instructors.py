@@ -90,7 +90,7 @@ check("staff/9 attendees is two sheets", staffing(9), (2, 4, 2, 4, True))
 check("staff/20 attendees is three sheets", staffing(20), (3, 6, 3, 6, True))
 check("staff/32 attendees is four sheets", staffing(32), (4, 8, 4, 8, True))
 check("staff/capped at the facility's sheets", staffing(400)[0], 4)
-# Brian's stretch cases: workable but under target, NOT short-handed.
+# Stretch cases: workable but under target, NOT short-handed.
 check("staff/3 instructors across 2 sheets", staffing(16, 3), (2, 4, 2, 1, False))
 check("staff/3 instructors across 3 sheets", staffing(24, 3), (3, 6, 3, 3, False))
 # One under the floor is short-handed.
@@ -301,11 +301,20 @@ instructor_sheet.SHEET_ID = _saved
 check("url/edit link", instructor_sheet.edit_url(),
       "https://docs.google.com/spreadsheets/d/TEST_SHEET_ID/edit")
 
-# The fixture must not carry real member names: this repo is public.
-_REAL = ("landon", "larry", "shravik", "darin", "alyssa", "roetheli", "feldman",
-         "russell", "broek", "guydosh", "poklitar", "cavallario", "slager")
-check("fixture/no real names in a public repo",
-      [w for w in _REAL if w in CSV.casefold()], [])
+# The fixture must not carry real member names: this repo is public. Checked by
+# SHAPE rather than against a list of the real ones — a denylist of real names in a
+# public repo leaks exactly what it is meant to protect. Every fixture instructor is
+# alliterative ("Ann Adams", "Bo Brooks"), which no real roster is.
+_names = [c.strip() for row in CSV.splitlines()[1:] for c in row.split(",")[5:] if c.strip()]
+check("fixture/has names to check at all", len(_names) > 10, True)
+def _alliterative(cell: str) -> bool:
+    # "Jo James (if needed)" — the sheet carries notes beside names; judge the name.
+    parts = cell.split("(")[0].split()
+    return len(parts) >= 2 and parts[0][:1].casefold() == parts[1][:1].casefold()
+
+
+check("fixture/every name is a synthetic alliterative pair",
+      [n for n in _names if not _alliterative(n)], [])
 
 print("\n".join("FAIL: " + f for f in FAILS) or f"All checks passed.")
 raise SystemExit(1 if FAILS else 0)

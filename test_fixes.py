@@ -1,4 +1,4 @@
-"""Unit tests for the sub-board / streak fixes (2026-08-16).
+"""Unit tests for the sub-board / streak fixes.
 
 Run:  python3 test_fixes.py
 Covers: league labelling, league ordering (day of week then start date), the
@@ -135,7 +135,7 @@ check("over/no schedule yet is not over",
 check("over/last draw today still counts as live",
       subs.league_is_over({"draws": [{"date": NOW.date().isoformat()}]}, NOW), False)
 
-# The case Brian hit: teams AND schedule not set yet — the picker still offers
+# The reported case: teams AND schedule not set yet — the picker still offers
 # dates, and every one of them is the league's own night at its start time.
 UNSCHEDULED = {"id": 7, "title": "Sunday Rise & Shine League 4", "day": "Sunday",
                "time": "9:00 am", "draws": []}
@@ -435,7 +435,7 @@ def rows(*pairs):
     return [{"name": n, "streak": w} for n, w in pairs]
 
 
-# Brian's case: the tied group is one gold line, and the group under it is SILVER.
+# The reported case: the tied group is one gold line, and the group under it is SILVER.
 out = botmod._streak_rows(rows(("Ann", 2), ("Bo", 2), ("Cy", 2), ("Di", 1)), "streak")
 check("board/3-way tie is one gold line", out.splitlines(),
       ["🥇  **2 wks** — Ann, Bo, Cy", "🥈  **1 wk** — Di"])

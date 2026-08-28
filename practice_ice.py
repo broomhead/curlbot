@@ -118,7 +118,7 @@ def annotate(sessions: list[dict], total: int = TOTAL_SHEETS) -> list[dict]:
         # between the two is the ONLY honest test of whether a block affected
         # this row — merely overlapping it isn't enough. A league already booked
         # solid on its own is at 0 free before and after any block, and tagging
-        # it "2 sheets blocked by Darin" would blame him for ice he never took.
+        # it "2 sheets blocked by Dana" would blame them for ice they never took.
         free_open, _ = free_sheets_during(s, unblocked, total)
         took_ice = free < free_open
         out.append({**s, "free": free, "has_unknown": has_unknown,

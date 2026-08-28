@@ -70,7 +70,7 @@ on every report subtracts those sheets and shows a line naming who blocked them:
 ```
 🟡  Sun Aug 23 · 1:30 PM · Practice · 1 sheet free
     Sunday Practice
-    🚫 2 sheets blocked by Darin — Learn-to-Curl (1:30–3:00 PM)
+    🚫 2 sheets blocked by Dana — Learn-to-Curl (1:30–3:00 PM)
 ```
 
 Notes on how it behaves:
@@ -117,7 +117,7 @@ board refreshes it in place. The buttons:
   "no team" disappears from the picker. A teamless record can't be matched against
   anything: the duplicate guard has nothing to compare, so the same spot posted twice
   reads as two different asks and two subs turn up. Requests posted before the teams
-  went up are chased down by DM (see **Go-to subs** below).
+  went up are chased down by DM (see **Super subs** below).
   Leagues are shown by name and run dates ("Thursday League 8/6 – 8/27") rather
   than the admin's "Summer 2026 League 3", and are listed by night of the week
   (Sunday → Saturday) then by start date, so the leagues on one night sit
@@ -152,6 +152,11 @@ board refreshes it in place. The buttons:
   posted it can lower it, and never below the people already on it.
 - One **🙋 button per open night** appears below the verbs, matching the board text
   line for line. One tap takes the spot; the requester is notified of every change.
+- **Nobody is tagged twice for the same burst.** An alert @-mentions the people who
+  could cover it, and nine separate postings used to mean nine pings each. Within
+  `SUBS_NOTIFY_WINDOW` (default 180s) each person is @-mentioned on the first alert
+  only; on the rest they're named in plain text as "tagged a moment ago", so the alert
+  still reads correctly and their phone stays quiet.
 - **📋 Show all** appears whenever there are games the board isn't listing. The board
   shows only the next **`SUBS_BOARD_DAYS`** (default 14) days — a Discord embed can't
   scroll, and a 16-night league season would bury the games people can still act on.
@@ -200,11 +205,11 @@ and the buttons survive bot restarts. The board is generic by design (each
 request has a `kind` field), so the same machinery can later back pickup games,
 team-building, etc.
 
-### Go-to subs (auto-assignment)
+### Super subs (auto-assignment)
 
-**`/gotosub`** shows who the club's go-to subs are and lets you set one up: pick the
+**`/supersub`** shows who the club's super subs are and lets you set one up: pick the
 league, the team, and the person. From then on, whenever that team posts a sub
-request, the go-to is **put on the spot as the request is made** and the room is
+request, the super sub is **put on the spot as the request is made** and the room is
 never asked — no alert goes up at all for a date they cover.
 
 - An arrangement is bound to a **league and a team**, never to a weekday. Whoever
@@ -218,24 +223,39 @@ never asked — no alert goes up at all for a date they cover.
   doesn't change who's on the spot — they're already on it — it stops the chase.
   Dropping reopens exactly those dates, alerts the room, and is remembered per date,
   so nothing puts them back on that one. The arrangement itself stands.
-- Eight dates posted at once are **one DM**, not eight — but still eight separate
-  assignments underneath, per the no-runs rule above.
+- **One message, not one per date.** Whether nine dates go up in one posting or one
+  at a time over an afternoon, the super sub gets a single DM listing all of them —
+  outbound news is held for `SUBS_NOTIFY_WINDOW` seconds (default 180) and folded
+  together, rebuilt from the board when it goes out. Underneath they're still nine
+  separate assignments, per the no-runs rule above; **Confirm** covers everything
+  they're down for and names back exactly what it confirmed. A date assigned an hour
+  later is genuinely new news and gets its own message.
+  A message is **one message**, not several announcements stacked: making an
+  arrangement often sweeps up dates that team already has open, so the arrangement and
+  the dates are joined ("You're also down for…") rather than appended as a second ⭐
+  paragraph about a different team.
+- **A notice lost to a restart is retried, not forgotten.** Whether someone has been
+  told lives in the store, so a bot restart inside the notify window doesn't swallow
+  the message — it goes out on the next connect. (Without this an unannounced
+  assignment sat silent and then turned up glued to an unrelated message hours later.)
 - Until they confirm, the board shows them as **"(unconfirmed)"**, and if the game
   gets within `SUBS_ACK_HOURS` (default 48) with no answer, the bot says so once in
-  the channel the request came from. This is the one case where the board can read as
+  the channel the request came from — one message per room naming every unconfirmed
+  date in it, and no DM on top, because the @-mention is already the notification. This is the one case where the board can read as
   covered and not be, so it surfaces while there's still time to find someone else.
   The spot is never reopened by the chase — they're the sub until they say otherwise.
 - A team can have **more than one**. The first is the one who gets auto-assigned; the
   rest fill any extra spots, and are tagged ahead of everyone else on the alert if a
   date does reach the room. That's the whole of "priority".
-- Setting one up mid-season sweeps up whatever that team already has open. Ending one
-  leaves the dates they're already on alone — someone is counting on those.
+- Setting one up mid-season sweeps up whatever that team already has open — and that
+  arrangement notice and the dates it swept up arrive as **one** message. Ending an
+  arrangement leaves the dates they're already on alone: someone is counting on those.
 
 **Teams posted after the fact.** Once a league that had no teams gets them, anyone
 with teamless requests still open on it gets a DM with a **Set my team** button:
 pick the team, untick any dates that are a different one, press the button. Naming
 the team closes the double-book hole, warns you if someone else already has a
-request for that team on the same draw, and lets that team's go-to sub pick it up.
+request for that team on the same draw, and lets that team's super sub pick it up.
 
 > Requires `discord.py >= 2.4` (persistent per-request buttons). For pinning,
 > invite the bot with the **Manage Messages** permission; without it the board
