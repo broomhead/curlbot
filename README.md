@@ -154,7 +154,7 @@ board refreshes it in place. The buttons:
   line for line. One tap takes the spot; the requester is notified of every change.
 - **Nobody is tagged twice for the same burst.** An alert @-mentions the people who
   could cover it, and nine separate postings used to mean nine pings each. Within
-  `SUBS_NOTIFY_WINDOW` (default 180s) each person is @-mentioned on the first alert
+  `SUBS_MENTION_WINDOW` (default 180s) each person is @-mentioned on the first alert
   only; on the rest they're named in plain text as "tagged a moment ago", so the alert
   still reads correctly and their phone stays quiet.
 - **📋 Show all** appears whenever there are games the board isn't listing. The board
@@ -208,9 +208,15 @@ team-building, etc.
 ### Super subs (auto-assignment)
 
 **`/supersub`** shows who the club's super subs are and lets you set one up: pick the
-league, the team, and the person. From then on, whenever that team posts a sub
+league, what they cover, and the person. From then on, when a covered team posts a sub
 request, the super sub is **put on the spot as the request is made** and the room is
 never asked — no alert goes up at all for a date they cover.
+
+**Two reaches.** *Any team — the whole league* is the usual one: they sign up for the
+league and **the first team to need someone gets them**. Nobody plays two games at
+once, so a second team asking for that same draw falls through to the room as an
+ordinary request. *One team* narrows it to a single side, and that team's own super sub
+is offered before the league's.
 
 - An arrangement is bound to a **league and a team**, never to a weekday. Whoever
   sets it up picks both from the same pickers everyone else uses, so nothing has to
@@ -223,10 +229,12 @@ never asked — no alert goes up at all for a date they cover.
   doesn't change who's on the spot — they're already on it — it stops the chase.
   Dropping reopens exactly those dates, alerts the room, and is remembered per date,
   so nothing puts them back on that one. The arrangement itself stands.
-- **One message, not one per date.** Whether nine dates go up in one posting or one
-  at a time over an afternoon, the super sub gets a single DM listing all of them —
-  outbound news is held for `SUBS_NOTIFY_WINDOW` seconds (default 180) and folded
-  together, rebuilt from the board when it goes out. Underneath they're still nine
+- **One message per thing that happened.** Nine dates in one posting are one DM, not
+  nine: news is held for `SUBS_NOTIFY_SETTLE` seconds (3) — just long enough for the
+  action that triggered it to finish — and folded together, rebuilt from the board when
+  it goes out. Nothing is delayed beyond that. (There is a `SUBS_NOTIFY_WINDOW` rate
+  limit for flooding, **off by default**: at 180s it meant a super sub who had just
+  been set up heard nothing about their first assignment for minutes.) Underneath they're still nine
   separate assignments, per the no-runs rule above; **Confirm** covers everything
   they're down for and names back exactly what it confirmed. A date assigned an hour
   later is genuinely new news and gets its own message.
@@ -244,9 +252,22 @@ never asked — no alert goes up at all for a date they cover.
   date in it, and no DM on top, because the @-mention is already the notification. This is the one case where the board can read as
   covered and not be, so it surfaces while there's still time to find someone else.
   The spot is never reopened by the chase — they're the sub until they say otherwise.
-- A team can have **more than one**. The first is the one who gets auto-assigned; the
-  rest fill any extra spots, and are tagged ahead of everyone else on the alert if a
-  date does reach the room. That's the whole of "priority".
+- A team can have **more than one** super sub. The first is the one who gets
+  auto-assigned; the rest fill any extra spots, and are tagged ahead of everyone else
+  on the alert if a date does reach the room. That's the whole of "priority".
+- **One arrangement each per league** — the whole league, or one team, never several.
+  Signing someone up for every team individually looks like the whole-league option but
+  isn't: the two teams that both need someone for the same draw would each get them, on
+  different sheets at the same time. A nine-team league is up to four of those a week.
+  The picker says so and won't let you press the button; changing what someone covers
+  means ending the first arrangement with **➖ Remove one**.
+- **Never two games at once.** With a whole-league arrangement this comes up every time
+  two of its teams need someone for the same draw — and it can also happen across two
+  leagues sharing a time, or against a spot they took by hand. Auto-assignment checks
+  and steps aside: the clashing date goes to the room like any other request, and
+  everything else still goes to them. The alert for it **doesn't tag them either** —
+  asking someone to cover a game they're already playing is worse than not asking. (A person can still choose to double-book
+  themselves by tapping; this guard is only on the assignment nobody chose.)
 - Setting one up mid-season sweeps up whatever that team already has open — and that
   arrangement notice and the dates it swept up arrive as **one** message. Ending an
   arrangement leaves the dates they're already on alone: someone is counting on those.

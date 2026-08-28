@@ -508,30 +508,78 @@ def standing_sorted(state: dict) -> list[dict]:
 
 
 def standing_for(state: dict, league_id, team: str) -> list[dict]:
-    """Go-to subs for this league + team, first up first. A team with no team named
-    has none: an arrangement always names the team it covers."""
+    """Super subs who cover this request, first up first.
+
+    An arrangement is scoped to a LEAGUE, and optionally narrowed to one team:
+      team ""  — the whole league. Whoever needs a sub first gets them (they can only
+                 be in one place, so the same draw's second asker falls through to the
+                 room — see busy_at).
+      team "X" — that team only.
+    A team's own super sub is offered before the league's, then priority order within
+    each: the specific arrangement is the more deliberate one."""
     lid = str(league_id or "")
     tk = _team_key(team)
-    if not tk:
-        return []
-    return [g for g in standing_sorted(state)
-            if str(g.get("league_id") or "") == lid and _team_key(g.get("team", "")) == tk]
+    here = [g for g in standing_sorted(state) if str(g.get("league_id") or "") == lid]
+    specific = [g for g in here if tk and _team_key(g.get("team", "")) == tk]
+    league_wide = [g for g in here if not _team_key(g.get("team", ""))]
+    return specific + league_wide
 
 
 def standing_for_user(state: dict, user_id: int) -> list[dict]:
     return [g for g in standing_sorted(state) if g["user_id"] == user_id]
 
 
+def standing_conflict(state: dict, user_id: int, league_id, team: str) -> Optional[dict]:
+    """A different arrangement in the same league this person already holds.
+
+    One person, ONE arrangement per league: the whole league, or one team, never
+    several. Holding several teams in a league is how someone ends up on two sheets at
+    the same time when two of them need a sub for the same draw — and "I cover this
+    whole league" now has its own honest expression instead."""
+    lid = str(league_id or "")
+    tk = _team_key(team)
+    return next((g for g in standing_sorted(state)
+                 if g["user_id"] == user_id
+                 and str(g.get("league_id") or "") == lid
+                 and _team_key(g.get("team", "")) != tk), None)
+
+
+def busy_at(state: dict, user_id: int, game_ts: str,
+            *, exclude_rid: str = "") -> Optional[dict]:
+    """Another request starting at the same minute that this person is already on.
+
+    Nobody plays two games at once, so this is the backstop against auto-assignment
+    booking someone twice — across teams, and across leagues that share a slot.
+    A time-TBC request (parked at 23:59) clashes with another TBC on the same day:
+    when the start times aren't known, assuming they don't collide is the riskier
+    guess."""
+    when = _norm_min(game_ts)
+    if not when:
+        return None
+    for r in state.get("requests", []):
+        if r["id"] == exclude_rid:
+            continue
+        if _norm_min(r.get("game_ts", "")) != when:
+            continue
+        if is_involved(r, user_id):
+            return r
+    return None
+
+
 def add_standing(state: dict, *, user_id: int, name: str, league_id, league: str,
                  team: str, created_by=None, now: Optional[datetime] = None) -> str:
-    """Make someone a go-to sub for a league + team. Returns "added" | "already".
-    Priority is order of arrangement: the first person added is the one who gets
-    auto-assigned, the rest are the queue behind them."""
-    if not _team_key(team):
-        return "no_team"
+    """Make someone a super sub for a league, optionally narrowed to one team.
+    Returns "added" | "already" | "other_team".
+
+    An empty `team` means the whole league (see standing_for). Priority is order of
+    arrangement: the first person added is the one who gets auto-assigned, the rest are
+    the queue behind them. One person may hold only ONE arrangement per league —
+    whole-league or a single team, never several — see standing_conflict."""
     existing = find_standing(state, user_id, league_id, team)
     if existing is not None:
         return "already"
+    if standing_conflict(state, user_id, league_id, team) is not None:
+        return "other_team"
     rank = len(standing_for(state, league_id, team)) + 1
     state.setdefault("standing", []).append({
         "user_id": user_id,

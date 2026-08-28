@@ -21,6 +21,7 @@ import ast
 import asyncio
 import os
 import tempfile
+import time
 from datetime import datetime, timedelta
 
 import discord
@@ -168,9 +169,32 @@ st = store.empty_state()
 check("store/new state has a standing list", st["standing"], [])
 check("store/add", store.add_standing(st, user_id=ROBIN.id, name="Robin Vale", league_id="555",
                                       league="Thursday League", team="Ashby"), "added")
-check("store/no team is not an arrangement",
-      store.add_standing(st, user_id=ROBIN.id, name="Robin Vale", league_id="555",
-                         league="Thursday League", team=""), "no_team")
+# An empty team is the WHOLE LEAGUE, not a malformed arrangement — that's the shape
+# the club actually asked for: sign up for the league, first team to need someone
+# gets you.
+st_lg = store.empty_state()
+check("league/an empty team means the whole league",
+      store.add_standing(st_lg, user_id=ROBIN.id, name="Robin Vale", league_id="555",
+                         league="Thursday League", team=""), "added")
+check("league/it covers a team it never named",
+      [g["name"] for g in store.standing_for(st_lg, "555", "Ashby")], ["Robin Vale"])
+check("league/and any other team in that league",
+      [g["name"] for g in store.standing_for(st_lg, "555", "Vance")], ["Robin Vale"])
+check("league/but not another league",
+      store.standing_for(st_lg, "777", "Ashby"), [])
+check("league/a team's own super sub is offered first",
+      (store.add_standing(st_lg, user_id=SAM.id, name="Sam Ortiz", league_id="555",
+                          league="Thursday League", team="Ashby"),
+       [g["name"] for g in store.standing_for(st_lg, "555", "Ashby")]),
+      ("added", ["Sam Ortiz", "Robin Vale"]))
+check("league/on a team they don't cover, the league's is alone",
+      [g["name"] for g in store.standing_for(st_lg, "555", "Vance")], ["Robin Vale"])
+check("league/one arrangement each: no team on top of the league",
+      store.add_standing(st_lg, user_id=ROBIN.id, name="Robin Vale", league_id="555",
+                         league="Thursday League", team="Vance"), "other_team")
+check("league/nor the league on top of a team",
+      store.add_standing(st_lg, user_id=SAM.id, name="Sam Ortiz", league_id="555",
+                         league="Thursday League", team=""), "other_team")
 check("store/same person twice",
       store.add_standing(st, user_id=ROBIN.id, name="Robin Vale", league_id="555",
                          league="Thursday League", team="Ashby"), "already")
@@ -198,6 +222,55 @@ store.upsert_availability(st2, user_id=SAM.id, name="Sam Ortiz", league_id="555"
 store.expire(st2, subs.club_now(), 3)
 check("store/expire ages out a 90-day-old availability", st2["availability"], [])
 check("store/expire NEVER ages out an arrangement", len(st2["standing"]), 1)
+
+
+
+# ── 1b. One team each, and never two games at once ──────────────────────────
+# Someone was made the super sub for ALL NINE teams of one league — nothing stopped
+# it, and it sounds like "he covers the whole night". It isn't: the two teams that
+# both need someone for the same draw then BOTH get him, on different sheets at the
+# same time. Nine teams is up to four of those a week.
+st4 = store.empty_state()
+check("oneteam/first team is fine",
+      store.add_standing(st4, user_id=ROBIN.id, name="Robin Vale", league_id="555",
+                         league="Thursday League", team="Ashby"), "added")
+check("oneteam/a second team in the SAME league is refused",
+      store.add_standing(st4, user_id=ROBIN.id, name="Robin Vale", league_id="555",
+                         league="Thursday League", team="Vance"), "other_team")
+check("oneteam/and nothing was written",
+      [g["team"] for g in st4["standing"]], ["Ashby"])
+check("oneteam/the same team again is 'already', not a clash",
+      store.add_standing(st4, user_id=ROBIN.id, name="Robin Vale", league_id="555",
+                         league="Thursday League", team="Ashby"), "already")
+check("oneteam/another league is a different arrangement",
+      store.add_standing(st4, user_id=ROBIN.id, name="Robin Vale", league_id="777",
+                         league="Sunday League", team="Vance"), "added")
+check("oneteam/somebody else can hold that team",
+      store.add_standing(st4, user_id=SAM.id, name="Sam Ortiz", league_id="555",
+                         league="Thursday League", team="Vance"), "added")
+check("oneteam/conflict names the team they already hold",
+      (store.standing_conflict(st4, ROBIN.id, "555", "Vance") or {}).get("team"), "Ashby")
+check("oneteam/no conflict with the team they hold",
+      store.standing_conflict(st4, ROBIN.id, "555", "Ashby"), None)
+
+# busy_at: the backstop, for the clashes one-team-per-league can't see (two leagues
+# sharing a slot, or a spot they took by hand).
+st5 = store.empty_state()
+r_a = store.new_request(st5, requester_id=99, requester_name="A", spots_needed=1,
+                        game_ts=THU[0], league_id="555", team="Ashby")
+r_b = store.new_request(st5, requester_id=98, requester_name="B", spots_needed=1,
+                        game_ts=THU[0], league_id="777", team="Vance")
+r_c = store.new_request(st5, requester_id=97, requester_name="C", spots_needed=1,
+                        game_ts=THU[1], league_id="777", team="Vance")
+store.add_sub(r_a, ROBIN.id, "Robin Vale")
+check("busy/finds the game they're already on at that time",
+      (store.busy_at(st5, ROBIN.id, THU[0]) or {})["id"], r_a["id"])
+check("busy/ignores the request being asked about",
+      store.busy_at(st5, ROBIN.id, THU[0], exclude_rid=r_a["id"]), None)
+check("busy/a different time is not a clash", store.busy_at(st5, ROBIN.id, THU[1]), None)
+check("busy/someone else's game is not their clash",
+      store.busy_at(st5, SAM.id, THU[0]), None)
+check("busy/no timestamp, no opinion", store.busy_at(st5, ROBIN.id, ""), None)
 
 
 # ── 2. Assignment mechanics ─────────────────────────────────────────────────
@@ -315,6 +388,170 @@ async def the_requesters_own_arrangement_doesnt_cover_them():
 
 
 # ── 4. Dropping and confirming ──────────────────────────────────────────────
+async def a_league_wide_super_sub_goes_to_whoever_asks_first():
+    """What the club actually wanted: sign up for the LEAGUE, and the first team that
+    needs someone gets you. Two teams asking for the same draw is the interesting
+    case — nobody plays two games at once, so the second falls through to the room."""
+    cog = make_cog()
+    store.add_standing(cog.state, user_id=ROBIN.id, name="Robin Vale", league_id="555",
+                       league=subs.league_label(TEAMED), team="")      # whole league
+    await post(cog, BRUCE, [THU[0]], team="Ashby")
+    first = at(cog.state["requests"], 0, "league/the first ask exists")
+    if first is None:
+        return
+    check("league/the first team to ask gets them", store.open_spots(first), 0)
+    check("league/on a team the arrangement never named",
+          (store.auto_entry(first, ROBIN.id) or {}).get("name"), "Robin Vale")
+
+    cog.calls.clear()
+    await cog.add_series(requester=ALEX, league_id="555", league=subs.league_label(TEAMED),
+                         team="Vance", game_isos=[THU[0]], spots=1, channel=Ch())
+    second = at(cog.state["requests"], 1, "league/the second ask exists")
+    if second is None:
+        return
+    check("league/the second team on the same draw does NOT", store.open_spots(second), 1)
+    check("league/so that one goes to the room",
+          [c[1] for c in cog.calls if c[0] == "page"], ["new"])
+
+    # A different week is a different question.
+    await cog.add_series(requester=ALEX, league_id="555", league=subs.league_label(TEAMED),
+                         team="Vance", game_isos=[THU[1]], spots=1, channel=Ch())
+    third = at(cog.state["requests"], 2, "league/the third ask exists")
+    check("league/another draw is theirs again",
+          store.open_spots(third) if third else None, 0)
+
+
+async def a_team_super_sub_is_asked_before_the_league_one():
+    cog = make_cog()
+    store.add_standing(cog.state, user_id=ROBIN.id, name="Robin Vale", league_id="555",
+                       league=subs.league_label(TEAMED), team="")      # whole league
+    goto(cog, SAM, "Ashby")                                            # that team's own
+    await post(cog, BRUCE, [THU[0]], team="Ashby")
+    got = at(cog.state["requests"], 0, "league/a request exists")
+    check("league/the team's own super sub takes it",
+          [f["name"] for f in (got or {}).get("filled", [])], ["Sam Ortiz"])
+    # …and the league-wide one is still free for another team on that draw.
+    await cog.add_series(requester=ALEX, league_id="555", league=subs.league_label(TEAMED),
+                         team="Vance", game_isos=[THU[0]], spots=1, channel=Ch())
+    other = at(cog.state["requests"], 1, "league/the other request exists")
+    check("league/and the league's covers the other team",
+          [f["name"] for f in (other or {}).get("filled", [])], ["Robin Vale"])
+
+
+async def a_new_league_arrangement_sweeps_the_whole_league():
+    """Found in a live store: a whole-league arrangement was made while three of that
+    league's requests were open, and picked up none of them. The retroactive sweep was
+    matching the arrangement's team against the request's team — and a whole-league
+    arrangement has no team, so it only ever matched the team-LESS requests."""
+    cog = make_cog()
+    await post(cog, BRUCE, [THU[0]], team="Ashby")
+    await post(cog, ALEX, [THU[1]], team="Vance")
+    check("sweep/both are open to begin with",
+          [store.open_spots(r) for r in cog.state["requests"]], [1, 1])
+    result, isos = await cog.add_standing(
+        actor=ALEX, member=ROBIN, league_id="555",
+        league=subs.league_label(TEAMED), team="", channel=Ch())
+    check("sweep/added", result, "added")
+    check("sweep/it takes the league's open dates, whatever the team", len(isos), 2)
+    check("sweep/nothing left asking",
+          [store.open_spots(r) for r in cog.state["requests"]], [0, 0])
+
+    # A one-team arrangement still only sweeps its own team.
+    cog2 = make_cog()
+    await post(cog2, BRUCE, [THU[0]], team="Ashby")
+    await post(cog2, ALEX, [THU[1]], team="Vance")
+    _r, isos2 = await cog2.add_standing(actor=ALEX, member=ROBIN, league_id="555",
+                                        league=subs.league_label(TEAMED), team="Ashby",
+                                        channel=Ch())
+    check("sweep/a team arrangement takes only that team's", len(isos2), 1)
+    check("sweep/leaving the other team's open",
+          store.open_spots(cog2.state["requests"][1]), 1)
+
+
+async def nobody_is_tagged_for_a_slot_they_are_already_playing():
+    """Also found live: the alert for the second team needing someone on a draw tagged
+    the league's super sub — who was already down for the first team, same time. The
+    assignment guard knew; the alert didn't, and invited them to be in two places."""
+    cog = make_cog()
+    store.add_standing(cog.state, user_id=ROBIN.id, name="Robin Vale", league_id="555",
+                       league=subs.league_label(TEAMED), team="")
+    store.upsert_availability(cog.state, user_id=SAM.id, name="Sam Ortiz",
+                              league_id="555", league="Thursday League", games=[])
+    await post(cog, BRUCE, [THU[0]], team="Ashby")           # Robin takes this one
+    await cog.add_series(requester=ALEX, league_id="555", league=subs.league_label(TEAMED),
+                         team="Vance", game_isos=[THU[0]], spots=1, channel=Ch())
+    second = at(cog.state["requests"], 1, "tag/the second request exists")
+    if second is None:
+        return
+    body = cog._page_body(second, reason="new")
+    check("tag/the super sub is not tagged for a game they're already playing",
+          f"<@{ROBIN.id}>" in body, False)
+    check("tag/but someone free still is", f"<@{SAM.id}>" in body, True)
+
+    # Take Sam elsewhere at that time too, and the alert stops pretending.
+    # (Not onto request[0] — that one is full, so add_sub would be a no-op and the
+    # check would pass for the wrong reason.)
+    elsewhere = store.new_request(cog.state, requester_id=77, requester_name="Someone",
+                                  spots_needed=1, game_ts=THU[0], league_id="999",
+                                  team="Corwin")
+    check("tag/Sam really is booked elsewhere",
+          store.add_sub(elsewhere, SAM.id, "Sam Ortiz"), "added")
+    body2 = cog._page_body(second, reason="new")
+    check("tag/availability is filtered the same way",
+          f"<@{SAM.id}>" in body2, False)
+    check("tag/and it says nobody is listed",
+          "No one's listed as available" in body2, True)
+
+
+async def never_assigned_to_two_games_at_once():
+    """The backstop for the clash one-team-per-league can't prevent: two leagues that
+    play the same slot. An arrangement is a standing yes, not a promise to be in two
+    places — so the clashing date goes to the room like any other."""
+    cog = make_cog()
+    goto(cog, ROBIN, "Ashby")                                    # league 555
+    store.add_standing(cog.state, user_id=ROBIN.id, name="Robin Vale",
+                       league_id="777", league="Sunday League", team="Vance")
+    await post(cog, BRUCE, [THU[0]])                             # 555 · Ashby
+    check("clash/the first one is theirs",
+          store.open_spots(cog.state["requests"][0]), 0)
+    cog.calls.clear()
+    await cog.add_series(requester=ALEX, league_id="777", league="Sunday League",
+                         team="Vance", game_isos=[THU[0]], spots=1, channel=Ch())
+    second = at(cog.state["requests"], 1, "clash/the second request exists")
+    if second is None:
+        return
+    check("clash/the same slot is NOT auto-filled", store.open_spots(second), 1)
+    check("clash/so the room is asked for it",
+          [c[1] for c in cog.calls if c[0] == "page"], ["new"])
+    check("clash/and they aren't on it", store.auto_entry(second, ROBIN.id), None)
+
+    # A different slot in that same league is still theirs.
+    await cog.add_series(requester=ALEX, league_id="777", league="Sunday League",
+                         team="Vance", game_isos=[THU[1]], spots=1, channel=Ch())
+    third = at(cog.state["requests"], 2, "clash/the third request exists")
+    check("clash/a clear slot is still auto-filled",
+          store.open_spots(third) if third else None, 0)
+
+
+async def the_ui_says_no_before_the_button_is_pressed():
+    cog = make_cog()
+    goto(cog, ROBIN, "Ashby")
+    v = subs.StandingAddView([TEAMED], cog.state)
+    v.league_id, v.team, v.team_raw, v.member = "555", "Vance", "Vance", ROBIN
+    v.build()
+    check("oneteam/the flow knows about the clash",
+          (v.conflict() or {}).get("team"), "Ashby")
+    check("oneteam/so it isn't ready", v.ready(), False)
+    check("oneteam/the button is dead",
+          at(v.children, 3, "oneteam/submit button").disabled
+          if at(v.children, 3, "oneteam/submit button") else None, True)
+    check("oneteam/and it says which team they already have",
+          "Ashby" in v.prompt() and "One team each" in v.prompt(), True)
+    v.member = SAM
+    v.build()
+    check("oneteam/somebody else is fine", v.ready(), True)
+
+
 async def dropping_one_date_leaves_the_rest():
     cog = make_cog()
     goto(cog, ROBIN, "Ashby")
@@ -570,12 +807,63 @@ async def a_notice_lost_to_a_restart_is_retried():
     cog._requeue_unnotified()          # what startup() does on reconnect
     await flush(cog)
     check("restart/it goes out on the next start", len(cog.dms), 1)
+    sent = at(cog.dms, 0, "restart/there is a message to inspect")
     check("restart/naming the dates",
-          "You're down for" in cog.dms[0][1] or "you're down for" in cog.dms[0][1], True)
+          "own for" in (sent[1] if sent else ""), True)
     cog.dms.clear()
     cog._requeue_unnotified()
     await flush(cog)
     check("restart/and not again after that", cog.dms, [])
+
+
+
+# ── 4d. Notices are not delayed ─────────────────────────────────────────────
+# There WAS a 180s hold folding messages together. It meant a super sub who had just
+# been set up heard nothing about their first assignment for minutes, because the
+# arrangement DM had started the clock. It is off by default now; only the settle
+# remains, which is what makes one action produce one message rather than several.
+
+def notices_are_not_rate_limited_by_default():
+    cog = make_cog()
+    check("timing/off by default", subs.NOTIFY_WINDOW, 0)
+    check("timing/nothing waits longer than the settle",
+          cog._notice_delay(ROBIN.id), subs.NOTIFY_SETTLE)
+    check("timing/but the settle is real — one action, one message",
+          cog._notice_delay(ROBIN.id) > 0, True)
+    cog._notice_sent_at[ROBIN.id] = time.monotonic()
+    check("timing/and a second message is not held back either",
+          cog._notice_delay(ROBIN.id), subs.NOTIFY_SETTLE)
+
+
+def the_rate_limit_still_works_if_it_is_turned_back_on():
+    """The mechanism is kept, off, for the day someone is genuinely flooded."""
+    cog = make_cog()
+    saved = subs.NOTIFY_WINDOW
+    subs.NOTIFY_WINDOW = 120
+    try:
+        check("timing/first is still immediate",
+              cog._notice_delay(ROBIN.id) <= subs.NOTIFY_SETTLE, True)
+        cog._notice_sent_at[ROBIN.id] = time.monotonic()
+        d = cog._notice_delay(ROBIN.id)
+        check("timing/a second inside the window waits",
+              subs.NOTIFY_WINDOW - 5 <= d <= subs.NOTIFY_WINDOW, True)
+        check("timing/the gap is per person, not global",
+              cog._notice_delay(SAM.id) <= subs.NOTIFY_SETTLE, True)
+        cog._notice_sent_at[ROBIN.id] = time.monotonic() - subs.NOTIFY_WINDOW - 1
+        check("timing/once it has passed, immediate again",
+              cog._notice_delay(ROBIN.id) <= subs.NOTIFY_SETTLE, True)
+    finally:
+        subs.NOTIFY_WINDOW = saved
+
+
+async def sending_starts_the_clock():
+    cog = make_cog()
+    goto(cog, ROBIN, "Ashby")
+    await post(cog, BRUCE, [THU[0]])
+    check("timing/nothing sent yet, so nothing to wait for",
+          ROBIN.id in cog._notice_sent_at, False)
+    await flush(cog)
+    check("timing/sending records when", ROBIN.id in cog._notice_sent_at, True)
 
 
 # ── 5. Making and ending an arrangement ─────────────────────────────────────
@@ -734,12 +1022,17 @@ def the_manager_ui_holds_its_shape():
           [type(c).__name__ for c in v.children],
           ["LeagueSelect", "TeamSelect", "StandingMemberSelect", "StandingSubmitButton"])
     tsel = at(v.children, 1, "ui/there is a team select")
-    check("ui/no teamless option here — an arrangement is per team",
-          subs.NO_TEAM in [o.value for o in (tsel.options if tsel else [])], False)
+    vals = [o.value for o in (tsel.options if tsel else [])]
+    check("ui/no 'teams aren't set' option here — that's the requester's escape hatch",
+          subs.NO_TEAM in vals, False)
+    check("ui/the whole league is offered, and offered first",
+          vals[:1], [subs.ANY_TEAM])
+    check("ui/the need-a-sub flow is not offered a league-wide option",
+          subs.ANY_TEAM in [o.value for o in subs.TeamSelect(["Ashby"], None).options], False)
     submit = at(v.children, 3, "ui/there is a submit button")
     check("ui/the button is dead until every part is picked",
           submit.disabled if submit else None, True)
-    v.team, v.member = "Ashby", ROBIN
+    v.team, v.team_raw, v.member = "Ashby", "Ashby", ROBIN
     v.build()
     submit = at(v.children, 3, "ui/still a submit button")
     check("ui/and live once they are", submit.disabled if submit else None, False)
@@ -748,11 +1041,27 @@ def the_manager_ui_holds_its_shape():
     check("ui/the prompt says the first one is the auto-assign",
           "auto-assigned" in v.prompt(), True)
 
+    # Picking "any team" is a real answer, not an empty one: the resolved team is ""
+    # and only the raw pick separates it from nothing chosen yet.
+    w = subs.StandingAddView([TEAMED], store.empty_state())
+    w.league_id, w.member = "555", ROBIN
+    w.build()
+    check("ui/nothing picked yet is not ready", w.ready(), False)
+    w.team_raw, w.team = subs.ANY_TEAM, ""
+    w.build()
+    check("ui/the whole league IS ready", w.ready(), True)
+    wbtn = at(w.children, 3, "ui/league-wide submit button")
+    check("ui/its button is live", wbtn.disabled if wbtn else None, False)
+    check("ui/and says it's the league, not a team",
+          "league's super sub" in wbtn.label if wbtn else None, True)
+    check("ui/the prompt explains first-come",
+          "first team that needs a sub" in w.prompt(), True)
+
     st = store.empty_state()
     store.add_standing(st, user_id=ROBIN.id, name="Robin Vale", league_id="555",
                        league="Thursday League", team="Ashby")
     v2 = subs.StandingAddView([TEAMED], st)
-    v2.league_id, v2.team, v2.member = "555", "Ashby", SAM
+    v2.league_id, v2.team, v2.team_raw, v2.member = "555", "Ashby", "Ashby", SAM
     v2.build()
     check("ui/a second person is told they're #2 and why", "#2" in v2.prompt(), True)
     check("ui/summary lists the arrangement", "Robin Vale" in subs.standing_summary(st), True)
@@ -865,6 +1174,12 @@ async def main():
                six_dates_are_one_dm_but_six_assignments,
                priority_fills_the_second_spot_not_a_spare,
                the_requesters_own_arrangement_doesnt_cover_them,
+               a_league_wide_super_sub_goes_to_whoever_asks_first,
+               a_team_super_sub_is_asked_before_the_league_one,
+               a_new_league_arrangement_sweeps_the_whole_league,
+               nobody_is_tagged_for_a_slot_they_are_already_playing,
+               never_assigned_to_two_games_at_once,
+               the_ui_says_no_before_the_button_is_pressed,
                dropping_one_date_leaves_the_rest,
                confirming_clears_the_flag,
                an_unconfirmed_assignment_is_chased_before_game_day,
@@ -875,6 +1190,7 @@ async def main():
                the_chase_says_it_once_per_room,
                someone_with_dms_closed_is_not_chased_forever,
                a_notice_lost_to_a_restart_is_retried,
+               sending_starts_the_clock,
                startup_is_what_retries_them,
                a_new_arrangement_covers_what_is_already_asking,
                ending_an_arrangement_leaves_the_dates_alone,
@@ -893,6 +1209,8 @@ async def _main():
 
 asyncio.run(_main())
 a_notice_reads_as_one_thing()
+notices_are_not_rate_limited_by_default()
+the_rate_limit_still_works_if_it_is_turned_back_on()
 the_manager_ui_holds_its_shape()
 a_select_never_mutates_shared_state()
 one_picker_four_meanings_keeps_its_callers_words()

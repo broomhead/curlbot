@@ -108,12 +108,22 @@ LOCK_MINUTES    = int(os.environ.get("SUBS_LOCK_MINUTES", "30"))
 # is the one case where the board looks covered and might not be, so it needs to
 # surface while there is still time to find someone else.
 ACK_HOURS       = int(os.environ.get("SUBS_ACK_HOURS", "48"))
-# How long outbound notices to ONE person are held so they arrive as one message.
-# A chair posting nine dates one at a time is nine separate assignments, but it is
-# ONE thing that happened to the super sub — and nine DMs (or nine @-mentions on
-# nine alerts) is how a person mutes the bot. Everything inside this window folds
-# into a single message, rebuilt from the store when it goes out. 0 = send at once.
-NOTIFY_WINDOW   = int(os.environ.get("SUBS_NOTIFY_WINDOW", "180"))
+# OFF by default: a minimum gap between notice DMs to one person. It was 180s, and
+# it meant a super sub who had just been set up waited minutes to hear about their
+# first assignment, because the arrangement DM had started the clock. The burst it
+# was guarding against is handled better elsewhere now — one arrangement per person
+# per league, one assignment per draw (busy_at), and a multi-date posting being a
+# single action — so the cost outweighs it. Set a value to turn it back on if
+# someone is ever genuinely flooded.
+NOTIFY_WINDOW   = int(os.environ.get("SUBS_NOTIFY_WINDOW", "0"))
+# How long a burst of ALERTS may @-mention the same person only once. Separate from
+# the above on purpose: this one costs nobody anything — the first alert still pings
+# immediately, later ones just name them in plain text.
+MENTION_WINDOW  = int(os.environ.get("SUBS_MENTION_WINDOW", "180"))
+# The pause before a first notice goes out. Only long enough for the action that
+# queued it to finish queueing — add_standing records the arrangement and THEN
+# auto-assigns, and both belong in one message — so it is seconds, not minutes.
+NOTIFY_SETTLE   = int(os.environ.get("SUBS_NOTIFY_SETTLE", "3"))
 # Discord caps a message at 25 components: row 0 holds the four verbs, leaving 20
 # slots for the game buttons below. A RUN spends only one of them (see open_units),
 # so these two caps are no longer the same number — the embed can list far more
@@ -1364,6 +1374,9 @@ class LeagueSelect(discord.ui.Select):
 
 
 NO_TEAM = "__noteam__"
+# "the whole league" in the super sub flow. A different thing from NO_TEAM, which
+# means "this league hasn't got teams yet" — hence its own value.
+ANY_TEAM = "__anyteam__"
 
 
 class TeamSelect(discord.ui.Select):
@@ -1378,13 +1391,23 @@ class TeamSelect(discord.ui.Select):
     two subs turn up. (Teamless ones already posted are reconciled by the nudge in
     Subs.team_reconcile_loop.)"""
 
-    def __init__(self, names: list[str], selected, row: int = 1):
+    def __init__(self, names: list[str], selected, row: int = 1, *,
+                 extra_option: tuple | None = None, placeholder: str | None = None):
+        # An extra choice above the teams, when the CALLER has one that isn't a team —
+        # "the whole league" for a super sub. Given as (value, label, description) so
+        # the wording belongs to the flow using it, not to this component.
+        opts = []
+        if extra_option is not None:
+            val, label, desc = extra_option
+            opts.append(discord.SelectOption(label=_truncate(label, 100), value=val,
+                                             description=_truncate(desc, 100) or None,
+                                             default=(selected == val)))
         # Only teams the system knows about — no free-typing. Alphabetized.
-        opts = _unique_options([
+        opts += _unique_options([
             discord.SelectOption(label=_truncate(n, 100), value=_truncate(n, 100), default=(n == selected))
             for n in sorted(names, key=str.casefold)[:24]
         ])
-        no_teams_yet = not opts
+        no_teams_yet = not names
         if no_teams_yet:
             opts.append(discord.SelectOption(
                 label="Teams aren't set yet — post without one",
@@ -1393,11 +1416,16 @@ class TeamSelect(discord.ui.Select):
                 default=(selected == ""),
             ))
         super().__init__(
-            placeholder=("Teams aren't set yet — optional" if no_teams_yet else "Which team…"),
+            placeholder=(placeholder or
+                         ("Teams aren't set yet — optional" if no_teams_yet else "Which team…")),
             min_values=1, max_values=1, options=opts, row=row)
 
     async def callback(self, interaction: discord.Interaction):
-        self.view.team = "" if self.values[0] == NO_TEAM else self.values[0]
+        # `team` is the resolved name ("" for both sentinels); `team_raw` is what they
+        # actually picked, which is the only way to tell "the whole league" apart from
+        # "not chosen yet". Flows that don't care simply ignore team_raw.
+        self.view.team_raw = self.values[0]
+        self.view.team = "" if self.values[0] in (NO_TEAM, ANY_TEAM) else self.values[0]
         await self.view.refresh(interaction)
 
 
@@ -1835,6 +1863,8 @@ def _availability_for_request(state: dict, req: dict | None) -> list[dict]:
         games = a.get("games") or []
         if games and game and not any(_same_game(game, g) for g in games):
             continue  # available in this league, but not for this game time
+        if store.busy_at(state, uid, game, exclude_rid=req["id"]) is not None:
+            continue  # already playing at that time — don't ask them to be in two
         seen.add(uid)
         out.append(a)
     return out
@@ -1846,14 +1876,20 @@ def _standing_for_request(state: dict, req: dict | None) -> list[dict]:
 
     Excludes anyone already on it (the first super sub is normally auto-assigned, so an
     alert usually only exists because they dropped it or the team needs more than
-    one), the requester, and anyone who has already declined this particular date."""
+    one), the requester, anyone who has already declined this particular date — and
+    anyone already playing at that time. That last one matters most for a whole-league
+    arrangement: two of its teams needing someone for the same draw is ordinary, the
+    second one goes to the room, and tagging the super sub on it would be asking them
+    to be in two places."""
     if not req:
         return []
     declined = set(req.get("auto_declined") or [])
     return [g for g in store.standing_for(state, req.get("league_id", ""), req.get("team", ""))
             if g["user_id"] not in declined
             and g["user_id"] != req.get("requester_id")
-            and not store.is_involved(req, g["user_id"])]
+            and not store.is_involved(req, g["user_id"])
+            and store.busy_at(state, g["user_id"], req.get("game_ts", ""),
+                              exclude_rid=req["id"]) is None]
 
 
 def _my_requests(state: dict, uid: int) -> list[dict]:
@@ -2417,8 +2453,23 @@ def leagues_with_teams(leagues: list[dict]) -> list[dict]:
     return [l for l in leagues if (l.get("team_names") or [])]
 
 
+def scope_label(team: str) -> str:
+    """An arrangement's reach in a list or a picker, where the league is already
+    obvious from the context."""
+    return team.strip() if (team or "").strip() else "any team"
+
+
+def scope_phrase(league: str, team: str) -> str:
+    """The same thing inside a sentence. "the super sub for **any team** in **X**"
+    reads like a shrug; a whole-league arrangement is for the LEAGUE, and covering
+    any team is the detail."""
+    if (team or "").strip():
+        return f"**{team.strip()}** in **{league}**"
+    return f"**{league}** \u2014 any team that needs one"
+
+
 def standing_summary(state: dict) -> str:
-    """Every super sub arrangement, grouped by league and team, in priority order."""
+    """Every super sub arrangement, grouped by league and scope, in priority order."""
     groups: dict[tuple, list[dict]] = {}
     for g in store.standing_sorted(state):
         groups.setdefault((str(g.get("league_id") or ""), g.get("team", "")), []).append(g)
@@ -2428,7 +2479,7 @@ def standing_summary(state: dict) -> str:
     for (_lid, team), members in groups.items():
         league = stored_league(members[0].get("league", "")) or "League"
         who = " \u00b7 ".join(f"{i}. {m['name']}" for i, m in enumerate(members, 1))
-        lines.append(f"\u2022 **{league}** \u00b7 {team} \u2014 {who}")
+        lines.append(f"\u2022 **{league}** \u00b7 {scope_label(team)} \u2014 {who}")
     return "\n".join(lines)
 
 
@@ -2444,14 +2495,18 @@ def build_notice(news: list[tuple], groups: dict) -> str:
     joined by "You're also down for" rather than stacked."""
     lines = []
     for league, team, actor in news:
-        lines.append(f"\u2b50  {actor} made you the **super sub** for **{team}** in "
-                     f"**{league}**.")
+        lines.append(f"\u2b50  {actor} made you the **super sub** for "
+                     f"{scope_phrase(league, team)}.")
     if news:
+        # A whole-league arrangement isn't "that team" — it's whoever asks first.
+        whole = any(not (t or "").strip() for _lg, t, _a in news)
+        subject = ("a team in that league needs" if whole and len(news) == 1
+                   else "one of those needs" if whole
+                   else "that team needs" if len(news) == 1 else "those teams need")
         lines.append(
-            f"Whenever {'that team needs' if len(news) == 1 else 'those teams need'} a "
-            "sub, you'll be put on it automatically and DM'd to confirm \u2014 you can "
-            "drop any date you can't make, and it goes back on the board. An organiser "
-            "can end the arrangement any time.")
+            f"Whenever {subject} a sub, you'll be put on it automatically and DM'd to "
+            "confirm \u2014 you can drop any date you can't make, and it goes back on the "
+            "board. An organiser can end the arrangement any time.")
     rest = list(groups.items())
     if rest:
         new_keys = {(lg, tm) for lg, tm, _a in news}
@@ -2467,7 +2522,9 @@ def build_notice(news: list[tuple], groups: dict) -> str:
                       for (lg, tm), iso in rest]
         elif len(rest) == 1:
             (lg, tm), iso = rest[0]
-            lines.append(f"\u2b50  You're the super sub for **{tm}** in **{lg}** \u2014 "
+            # "covering X", not "the super sub for X": a whole-league arrangement
+            # lands them on a team they aren't specifically the super sub for.
+            lines.append(f"\u2b50  You're covering **{tm}** in **{lg}** \u2014 "
                          f"you're down for **{fmt_run(sorted(iso))}**.")
         else:
             lines.append("\u2b50  You're down for:")
@@ -2529,7 +2586,8 @@ class StandingAddView(discord.ui.View):
         self.leagues = leagues
         self.state = state
         self.league_id = None
-        self.team = None
+        self.team = None          # resolved: "" = whole league
+        self.team_raw = None      # what they actually picked (None = nothing yet)
         self.member = None
         self.submitted = False
         self.build()
@@ -2539,16 +2597,30 @@ class StandingAddView(discord.ui.View):
 
     def on_league_change(self):
         self.team = None
+        self.team_raw = None
+
+    def conflict(self) -> dict | None:
+        """Another arrangement in this league they already hold."""
+        if not (self.member and self.league_id and self.team_raw):
+            return None
+        return store.standing_conflict(self.state, self.member.id, self.league_id, self.team)
 
     def ready(self) -> bool:
-        return bool(self.league() and self.team and self.member)
+        # team_raw, not team: "" is a real answer here (the whole league), and only the
+        # raw pick can tell it apart from nothing chosen yet.
+        return bool(self.league() and self.team_raw and self.member
+                    and self.conflict() is None)
 
     def build(self) -> "StandingAddView":
         self.clear_items()
         self.add_item(LeagueSelect(self.leagues, self.league_id, row=0))
         lg = self.league()
         if lg:
-            self.add_item(TeamSelect(lg.get("team_names") or [], self.team, row=1))
+            self.add_item(TeamSelect(
+                lg.get("team_names") or [], self.team_raw, row=1,
+                placeholder="The whole league, or one team\u2026",
+                extra_option=(ANY_TEAM, "Any team \u2014 the whole league",
+                              "First to need a sub gets them")))
             self.add_item(StandingMemberSelect(self.member, row=2))
             self.add_item(StandingSubmitButton(self.member, self.team,
                                                disabled=not self.ready(), row=3))
@@ -2559,20 +2631,37 @@ class StandingAddView(discord.ui.View):
         if not lg:
             return ("**Super sub** \u2014 pick the league. Only leagues with teams posted "
                     "can have one: the arrangement is per team.")
+        scope = ("**any team**" if self.team_raw == ANY_TEAM
+                 else f"**{self.team}**" if self.team else "**not set**")
         parts = [f"League: **{league_label(lg)}**",
-                 f"Team: **{self.team}**" if self.team else "Team: **not set**",
+                 f"Covers: {scope}",
                  f"Sub: **{self.member.display_name}**" if self.member else "Sub: **not set**"]
         head = "**Super sub** \u2014 " + " \u00b7 ".join(parts)
+        clash = self.conflict()
+        if clash is not None:
+            return (head + f"\n\u26a0\ufe0f  {self.member.display_name} is already the super "
+                           f"sub for **{clash.get('team')}** in this league. One team each: "
+                           f"otherwise both teams needing someone for the same draw would "
+                           f"put them on two games at once. End that arrangement first "
+                           f"(**\u2796 Remove one**) if they're moving teams.")
         if not self.ready():
-            return head + "\nPick the team and the person."
-        current = store.standing_for(self.state, self.league_id, self.team)
+            return head + "\nPick what they cover and who they are."
+        whole = not self.team
+        current = [g for g in store.standing_for(self.state, self.league_id, self.team)
+                   if not whole or not (g.get("team") or "").strip()]
         rank = len(current) + 1
+        who = self.member.display_name
+        if rank == 1 and whole:
+            return (head + f"\n{who} will be **auto-assigned** to the first team that needs "
+                           f"a sub in this league, and DM'd to confirm. They can only be in "
+                           f"one place, so a second team asking for the same draw still goes "
+                           f"to the room.")
         if rank == 1:
-            return (head + f"\n{self.member.display_name} will be **auto-assigned** whenever "
-                           f"{self.team} needs a sub in this league, and DM'd to confirm.")
-        return (head + f"\n{self.member.display_name} would be **#{rank}** for {self.team} \u2014 "
-                       f"{current[0]['name']} is auto-assigned first; the rest get tagged "
-                       f"ahead of everyone else on the alert.")
+            return (head + f"\n{who} will be **auto-assigned** whenever {self.team} needs a "
+                           f"sub in this league, and DM'd to confirm.")
+        return (head + f"\n{who} would be **#{rank}** \u2014 {current[0]['name']} is "
+                       f"auto-assigned first; the rest get tagged ahead of everyone else "
+                       f"on the alert.")
 
     async def refresh(self, interaction: discord.Interaction):
         await interaction.response.edit_message(content=self.prompt(), view=self.build())
@@ -2596,8 +2685,12 @@ class StandingMemberSelect(discord.ui.UserSelect):
 
 class StandingSubmitButton(discord.ui.Button):
     def __init__(self, member=None, team=None, *, disabled: bool, row: int = 3):
+        # `team` is "" for a whole-league arrangement — the label says so rather than
+        # naming a team that isn't there.
         label = (f"Make {first_name(member.display_name)} the super sub for {team}"
-                 if member is not None and team else "Make them the super sub")
+                 if member is not None and team else
+                 f"Make {first_name(member.display_name)} the league's super sub"
+                 if member is not None else "Make them the super sub")
         super().__init__(label=_truncate(label, 80), emoji="\u2b50",
                          style=discord.ButtonStyle.success, row=row, disabled=disabled)
 
@@ -2617,15 +2710,20 @@ class StandingSubmitButton(discord.ui.Button):
             actor=interaction.user, member=view.member, league_id=view.league_id or "",
             league=league_label(lg) if lg else "", team=view.team or "",
             channel=interaction.channel)
-        if result == "already":
+        if result != "added":
             view.submitted = False
+            msgs = {
+                "already": (f"{view.member.display_name} already covers "
+                            f"**{scope_label(view.team)}** there."),
+                "other_team": (f"{view.member.display_name} already has an arrangement in "
+                               f"that league. One each \u2014 end that one first."),
+            }
             await interaction.edit_original_response(
-                content=(f"{view.member.display_name} is already a super sub for "
-                         f"**{view.team}** in that league.\n\n" + view.prompt()),
+                content=msgs.get(result, "Nothing changed.") + "\n\n" + view.prompt(),
                 view=view.build())
             return
-        bits = [f"\u2b50  **{view.member.display_name}** is the super sub for **{view.team}** "
-                f"in **{league_label(lg) if lg else 'that league'}**."]
+        bits = [f"\u2b50  **{view.member.display_name}** is the super sub for "
+                f"{scope_phrase(league_label(lg) if lg else 'that league', view.team)}."]
         bits.append("They've been DM'd." if result == "added" else "")
         if assigned:
             bits.append(f"**{len(assigned)}** open request{'s' if len(assigned) != 1 else ''} "
@@ -2641,7 +2739,7 @@ class StandingRemoveSelect(discord.ui.Select):
         self.entries = entries
         opts = _unique_options([
             discord.SelectOption(
-                label=_truncate(f"{g['name']} \u2014 {g.get('team','')}", 100),
+                label=_truncate(f"{g['name']} \u2014 {scope_label(g.get('team',''))}", 100),
                 value=f"{g['user_id']}|{g.get('league_id','')}|{g.get('team','')}"[:100],
                 description=_truncate(stored_league(g.get("league", "")), 100) or None,
             )
@@ -2661,8 +2759,8 @@ class StandingRemoveSelect(discord.ui.Select):
                 content="That arrangement is already gone.", view=None)
             return
         await interaction.response.edit_message(
-            content=(f"End **{entry['name']}**'s super sub arrangement for **{team}** in "
-                     f"**{stored_league(entry.get('league',''))}**? Dates they're already "
+            content=(f"End **{entry['name']}**'s super sub arrangement for "
+                     f"{scope_phrase(stored_league(entry.get('league','')), team)}? Dates they're already "
                      f"on stay theirs \u2014 this only stops future ones."),
             view=ConfirmRemoveStandingView(int(uid), lid, team, entry["name"]))
 
@@ -2685,7 +2783,8 @@ class ConfirmRemoveStandingView(discord.ui.View):
             return
         removed = await cog.remove_standing(self.user_id, self.league_id, self.team,
                                             actor=interaction.user)
-        msg = (f"\U0001f5d1\ufe0f  **{self.name}** is no longer the super sub for **{self.team}**."
+        msg = (f"\U0001f5d1\ufe0f  **{self.name}** is no longer the super sub for "
+               f"**{scope_label(self.team)}**."
                if removed else "That arrangement was already gone.")
         await interaction.edit_original_response(content=msg, view=None)
 
@@ -2704,9 +2803,12 @@ class Subs(commands.Cog):
         # double-taps across all buttons. Keys are tagged tuples, e.g.
         # ("take", user_id, rid) or ("manage_add", user_id, rid, member_id).
         self._click_cooldown: dict[tuple, float] = {}
-        # user id -> {"preambles": [...], "task": Task}: assignment news waiting to be
+        # user id -> {"new": [...], "task": Task}: assignment news waiting to be
         # folded into one DM. See _queue_sub_notice.
         self._notices: dict[int, dict] = {}
+        # user id -> monotonic time of their last notice DM, so the FIRST one is
+        # immediate and only a follow-up inside the window waits.
+        self._notice_sent_at: dict[int, float] = {}
         # user id -> monotonic time we last @-mentioned them on an alert, so a burst
         # of separate postings pings each person once instead of once per posting.
         self._mention_cooldown: dict[int, float] = {}
@@ -2876,26 +2978,26 @@ class Subs(commands.Cog):
 
     def _quiet_recipients(self, req: dict) -> set:
         """Who to name WITHOUT an @ on this alert, because we pinged them within the
-        last NOTIFY_WINDOW seconds.
+        last MENTION_WINDOW seconds.
 
         A chair posting nine dates one at a time puts up nine alerts, and each one
         tagging the same two available members is nine phone buzzes each — the thing
         people actually complain about. They're still named, so the alert reads the
         same; they just aren't pinged nine times about the same league."""
-        if NOTIFY_WINDOW <= 0:
+        if MENTION_WINDOW <= 0:
             return set()
         now_m = time.monotonic()
         goto, subs = self._alert_recipients(req)
         quiet = set()
         for who in [g["user_id"] for g in goto] + [a["user_id"] for a in subs]:
             last = self._mention_cooldown.get(who)
-            if last is not None and now_m - last < NOTIFY_WINDOW:
+            if last is not None and now_m - last < MENTION_WINDOW:
                 quiet.add(who)
             else:
                 self._mention_cooldown[who] = now_m
         if len(self._mention_cooldown) > 256:
             for k in [k for k, t in self._mention_cooldown.items()
-                      if now_m - t >= NOTIFY_WINDOW]:
+                      if now_m - t >= MENTION_WINDOW]:
                 del self._mention_cooldown[k]
         return quiet
 
@@ -3421,6 +3523,14 @@ class Subs(commands.Cog):
                                             live.get("team", "")):
                     # Priority order, and as many as the request has spots for: the
                     # second super sub isn't a spare, they're the second spot's answer.
+                    #
+                    # Never into a slot they're already playing. An arrangement is a
+                    # standing yes, not a promise to be in two places — so a clash
+                    # means this date goes to the room like any other, rather than
+                    # quietly booking someone twice.
+                    if store.busy_at(self.state, g["user_id"], live.get("game_ts", ""),
+                                     exclude_rid=live["id"]) is not None:
+                        continue
                     if store.assign_auto(live, g["user_id"], g["name"], aid,
                                          now=club_now()) != "assigned":
                         continue
@@ -3454,6 +3564,8 @@ class Subs(commands.Cog):
         flush time, not from whatever triggered the queueing, so anything that lands
         during the window is simply included.
 
+        The wait is NOT a delay on the first message — see _notice_delay.
+
         A message lost to a restart is NOT lost for good: `notified` lives in the
         store, so startup re-queues anyone still owed one (see _requeue_unnotified).
         Without that, an assignment made moments before a restart went unannounced and
@@ -3464,12 +3576,33 @@ class Subs(commands.Cog):
             slot["new"].append(new_arrangement)
         task = slot.get("task")
         if task is None or task.done():
-            slot["task"] = asyncio.create_task(self._flush_notice_later(user_id))
+            slot["task"] = asyncio.create_task(
+                self._flush_notice_later(user_id, self._notice_delay(user_id)))
 
-    async def _flush_notice_later(self, user_id: int):
+    def _notice_delay(self, user_id: int) -> float:
+        """Seconds to wait before sending this person their notice.
+
+        Leading edge: if we haven't messaged them inside the window, they get it
+        straight away (bar the settle pause) — a delayed DM reads as a broken bot to
+        whoever is standing there watching for it. Only a SECOND message inside the
+        window waits, and it waits just long enough to be one message rather than
+        several."""
+        if NOTIFY_WINDOW <= 0:
+            # The settle still applies: it's what makes one action produce one
+            # message, not a rate limit.
+            return NOTIFY_SETTLE
+        last = self._notice_sent_at.get(user_id)
+        if last is None:
+            return NOTIFY_SETTLE
+        since = time.monotonic() - last
+        if since >= NOTIFY_WINDOW:
+            return NOTIFY_SETTLE
+        return max(NOTIFY_SETTLE, NOTIFY_WINDOW - since)
+
+    async def _flush_notice_later(self, user_id: int, delay: float = 0):
         try:
-            if NOTIFY_WINDOW > 0:
-                await asyncio.sleep(NOTIFY_WINDOW)
+            if delay > 0:
+                await asyncio.sleep(delay)
             await self._flush_notice(user_id)
         except asyncio.CancelledError:
             raise
@@ -3491,6 +3624,7 @@ class Subs(commands.Cog):
             groups.setdefault(key, []).append(r["game_ts"])
         await self._dm(user_id, build_notice(news, groups),
                        view=AutoAssignView(len(reqs)) if reqs else None)
+        self._notice_sent_at[user_id] = time.monotonic()
         # Marked whether or not the DM landed: someone with DMs closed can't be reached
         # by re-queuing forever, and the board and the chase both still cover them.
         async with self._lock:
@@ -3524,11 +3658,16 @@ class Subs(commands.Cog):
         # up dates that are already open, that news belongs in the SAME message.
         self._queue_sub_notice(
             member.id, (stored_league(league), team.strip(), actor.display_name))
-        tk = (team or "").strip().casefold()
+        # Whatever this new arrangement covers — which for a whole-league one is every
+        # open request in it, not just the team-less ones. Asking standing_for keeps
+        # that in ONE place instead of re-deriving "covers" here and getting it wrong.
         targets = [r for r in store.requests_sorted(self.state)
                    if str(r.get("league_id") or "") == str(league_id or "")
-                   and (r.get("team") or "").strip().casefold() == tk
-                   and store.open_spots(r) > 0 and not is_locked(r)]
+                   and store.open_spots(r) > 0 and not is_locked(r)
+                   and any(g["user_id"] == member.id
+                           for g in store.standing_for(self.state,
+                                                       r.get("league_id", ""),
+                                                       r.get("team", "")))]
         assigned = await self._auto_assign(targets, actor_id=actor.id, channel=channel)
         if assigned:
             await self.render_board(self._guild_id(channel), fallback_channel=channel)
