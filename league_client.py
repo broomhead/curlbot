@@ -164,6 +164,43 @@ def _parse_draw_heading(text: str, today) -> dict | None:
     }
 
 
+# ── Start time from the Details prose ────────────────────────────────────────
+# A league whose schedule isn't posted has no draw headings to read a time off,
+# but the Details paragraph always states the run the same way:
+#   "...from September 6 through October 25 from 7pm to 9:15pm."
+#   "...from September 4 through October 16, from 8:30-10:45pm."
+# Only a "from" sitting immediately before a clock time is a start time, which
+# is what keeps registration deadlines and other stray times out of this. The
+# opening time often omits its am/pm and borrows the closing one ("8:30-10:45pm"),
+# so the opening meridiem is optional.
+_PROSE_TIME_RE = re.compile(
+    r"\bfrom\s+(\d{1,2})(?::(\d{2}))?\s*(?:([ap])\.?m\.?)?\s*"
+    r"(?:-|\u2013|\u2014|to)\s*"
+    r"(\d{1,2})(?::\d{2})?\s*([ap])\.?m\.?",
+    re.IGNORECASE,
+)
+
+
+def _prose_start_time(text: str) -> str | None:
+    """A league's start time as written in its Details prose, formatted like a
+    parsed draw's ('7:00 pm'). None when the prose doesn't state one."""
+    m = _PROSE_TIME_RE.search(text or "")
+    if not m:
+        return None
+    hour = int(m.group(1))
+    if not 1 <= hour <= 12:
+        return None
+    minute = int(m.group(2) or 0)
+    start_mer, end_mer = m.group(3), m.group(5)
+    mer = (start_mer or end_mer).lower()
+    h12, end_h12 = hour % 12, int(m.group(4)) % 12
+    if start_mer is None and h12 > end_h12:
+        # "11:30-1pm" opens in the morning: an unmarked opening time can only
+        # borrow the closing meridiem when it actually precedes it on the clock.
+        mer = "a" if mer == "p" else "p"
+    return f"{h12 or 12}:{minute:02d} {mer}m"
+
+
 def parse_league_html(html: str) -> dict[str, Any]:
     """Parse a league page's HTML into structured league info."""
     soup = BeautifulSoup(html, "html.parser")
@@ -210,6 +247,12 @@ def parse_league_html(html: str) -> dict[str, Any]:
         times = [d["time"] for d in draws if d["time"]]
         if times:
             draw_time = max(set(times), key=times.count)
+    if draw_time is None:
+        # No schedule posted yet. The Details prose is then the only place the
+        # start time exists, and it is exactly the case that needs one: with no
+        # draws, the sub board projects league nights (subs.projected_games) and
+        # labels them "time TBC" until it has a time to put on them.
+        draw_time = _prose_start_time(text_all)
 
     return {
         "teams": teams,
@@ -316,9 +359,12 @@ class LeagueClient:
 # It self-refreshes lazily: when the file is older than CACHE_TTL (or missing),
 # the next call refetches and rewrites it. Override via env vars.
 #
-# In dev the repo is mounted into the container, so the cache survives restarts.
-# In prod (no volume) it's ephemeral — fine, it just refetches once on boot.
-# Force a refresh out-of-band with refresh_leagues.py (cron / scheduled task).
+# The cache file is DURABLE in both dev and prod: dev bind-mounts the repo, prod
+# puts LEAGUE_CACHE_PATH on the /data volume so a restart doesn't refetch every
+# league page. So a DEPLOY DOES NOT REFRESH LEAGUE DATA — new parsing code reaches
+# the board only when the cache next goes stale (CACHE_TTL, 6h) or the nightly
+# refresh_leagues.py cron runs. Force it now with refresh_leagues.py; the bot
+# re-reads the file on each call, so no restart is needed after one.
 
 CACHE_PATH = os.environ.get("LEAGUE_CACHE_PATH", "league_cache.json")
 CACHE_TTL = int(os.environ.get("LEAGUE_CACHE_TTL", "21600"))  # seconds (6h)

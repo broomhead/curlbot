@@ -47,7 +47,7 @@ import json
 import os
 import uuid
 from datetime import datetime, timedelta
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 # How long after game start a request lingers before it's pruned. Covers a
 # typical draw so a still-running game's card doesn't vanish mid-game.
@@ -626,20 +626,37 @@ def expire(
     grace_hours: int = DEFAULT_GRACE_HOURS,
     avail_days: int = DEFAULT_AVAIL_DAYS,
     undated_days: int = DEFAULT_UNDATED_DAYS,
+    dead_leagues: Iterable | None = None,
 ) -> dict:
     """
     Drop played-out requests and stale availability sign-ups. Mutates `state`
     and returns the removed items: {"requests": [...], "availability": [...]}.
     A request with no game date ages out `undated_days` after it was posted; one
     whose timestamps can't be parsed at all is kept (never silently lost).
+
+    `dead_leagues` is the ids of leagues whose season is over. An UNDATED entry —
+    a "date TBD" request, an "available any time" offer — has no game to expire
+    against, so it otherwise lives out `undated_days`/`avail_days` from when it
+    was posted, and that outlives the season it was posted for: an offer made in
+    a league's last week sat on the board a fortnight after the league finished.
+    These ids end those entries when the season ends. Dated entries are left to
+    expire on their own dates, which they already do.
+
+    An id absent from `dead_leagues` is NOT a finished league — only ids we
+    positively read as over belong in it. A league we couldn't fetch must never
+    look dead, or one site outage clears the board.
     """
     cutoff = board_cutoff(now, grace_hours)
     undated_cutoff = now - timedelta(days=undated_days)
+    dead = {str(x) for x in (dead_leagues or ())}
     kept_reqs, dropped_reqs = [], []
     for r in state["requests"]:
         if not (r.get("game_ts") or "").strip():
             # "Someone needs a sub, date TBD" — no game to expire against, so age
             # it out from when it was posted or it sits on the board forever.
+            if str(r.get("league_id") or "") in dead:
+                dropped_reqs.append(r)      # the season it was posted for is over
+                continue
             try:
                 created = datetime.fromisoformat(r["created_ts"])
             except (ValueError, KeyError, TypeError):
@@ -684,6 +701,9 @@ def expire(
             else:
                 kept_av.append(a)
         else:
+            if str(a.get("league_id") or "") in dead:
+                dropped_av.append(a)        # the season they offered to sub in is over
+                continue
             try:
                 created = datetime.fromisoformat(a["created_ts"])
             except (ValueError, KeyError):

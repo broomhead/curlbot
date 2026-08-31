@@ -341,6 +341,51 @@ check("ou/schedule takes over",
       [o["label"] for o in subs.game_options(OU_SCHEDULED, NOW)],
       ["Sun Sep 6 · 6:00 PM", "Sun Sep 13 · 6:00 PM"])
 
+# A game's timestamp is written once, when it's posted, so a date picked while the
+# start time was unknown stays parked at TIME_TBC for good — refreshing the league
+# cache feeds the PICKER and never reaches what's already on the board. Re-timing
+# walks the store instead, once the league page finally states a time.
+_tbc_iso = opts[0]["iso"]                       # Sun Sep 6, parked at 23:59
+_st = {"requests": [{"id": "r1", "league_id": "26713", "game_ts": _tbc_iso},
+                    {"id": "r2", "league_id": "26713", "game_ts": "2026-09-13T18:00:00"},
+                    {"id": "r3", "league_id": "999", "game_ts": _tbc_iso}],
+       "availability": [{"user_id": 1, "league_id": "26713",
+                         "games": [_tbc_iso, "2026-09-13T18:00:00"]}]}
+_times = subs.league_times([dict(OU, time="7:00 pm"), {"id": 999, "time": None, "draws": []}])
+check("retime/only leagues we can put a clock on", _times, {"26713": subs.clock_time(19, 0)})
+_done = subs.retime_tbc(_st, _times)
+check("retime/board finally shows the time", subs.fmt_when(_st["requests"][0]["game_ts"]),
+      "Sun Sep 6 · 7:00 PM")
+check("retime/the date never moves",
+      datetime.fromisoformat(_st["requests"][0]["game_ts"]).date(), datetime(2026, 9, 6).date())
+check("retime/a real time is never overwritten", _st["requests"][1]["game_ts"],
+      "2026-09-13T18:00:00")
+check("retime/a league with no time is left alone", _st["requests"][2]["game_ts"], _tbc_iso)
+check("retime/availability too", _st["availability"][0]["games"][0], "2026-09-06T19:00:00")
+check("retime/and only its TBC game", _st["availability"][0]["games"][1],
+      "2026-09-13T18:00:00")
+# The changed requests come back whole: their alert pages still say "time TBC"
+# and the caller has to redraw them.
+check("retime/reports what to redraw", [r["id"] for r in _done["requests"]], ["r1"])
+check("retime/reports availability as well", len(_done["availability"]), 1)
+check("retime/a second pass is a no-op", subs.retime_tbc(_st, _times),
+      {"requests": [], "availability": []})
+check("retime/nothing to go on is a no-op",
+      subs.retime_tbc({"requests": [{"id": "r", "league_id": "26713", "game_ts": _tbc_iso}],
+                       "availability": []}, {}),
+      {"requests": [], "availability": []})
+
+# Seasons that are over, for expiry. A league we could not read is absent from the
+# list entirely and so is never in this set — that is the whole point of it.
+check("dead/ended flag counts",
+      subs.dead_league_ids([{"id": 1, "ended": True, "draws": []}], NOW), {"1"})
+check("dead/a played-out season counts",
+      subs.dead_league_ids([{"id": 2, "draws": [{"date": "2026-08-10"}]}], NOW), {"2"})
+check("dead/a running season does not",
+      subs.dead_league_ids([{"id": 3, "draws": [{"date": "2026-09-30"}]}], NOW), set())
+check("dead/no schedule yet is not a finished season",
+      subs.dead_league_ids([{"id": 4, "draws": []}], NOW), set())
+
 # Fall leagues (no draws yet) now sort into their night by start date instead of
 # piling up at the end of the list.
 FALL = [
@@ -396,6 +441,48 @@ _html = "<html>Error establishing a database connection</html>"
 check("describe/other html quotes the start",
       lc._describe_body(_html, "text/html"),
       f"{len(_html)} bytes of text/html starting {_html!r}")
+
+# ── Start time off the Details prose ─────────────────────────────────────────
+# A league whose schedule isn't posted has no draw headings to read a time off.
+# The prose states it; without it the sub board can only offer "time TBC".
+check("prose/from X to Y",
+      lc._prose_start_time("will run for 8 weeks from September 6 through "
+                           "October 25 from 7pm to 9:15pm."), "7:00 pm")
+# The opening time routinely omits its own am/pm and borrows the closing one.
+check("prose/borrowed meridiem",
+      lc._prose_start_time("will run for 7 weeks, from September 4 through "
+                           "October 16, from 8:30-10:45pm."), "8:30 pm")
+check("prose/en dash", lc._prose_start_time("from 8:30\u201310:45pm"), "8:30 pm")
+check("prose/dotted meridiem",
+      lc._prose_start_time("Sunday mornings, from 9:00 a.m. to 11:15 a.m."), "9:00 am")
+# Borrowing only works when the opening time actually precedes the closing one
+# on the clock; 11:30 before 1pm is the morning.
+check("prose/borrow flips over noon", lc._prose_start_time("from 11:30-1pm"), "11:30 am")
+check("prose/noon start", lc._prose_start_time("from 12-2pm"), "12:00 pm")
+# A date range is not a time, and a deadline is not a start time — only a "from"
+# sitting immediately before a clock time counts.
+check("prose/date range alone",
+      lc._prose_start_time("Runs from September 6 through October 25."), None)
+check("prose/deadline ignored",
+      lc._prose_start_time("Registration closes at 5pm on Friday."), None)
+check("prose/nothing", lc._prose_start_time(""), None)
+
+_NO_SCHEDULE = """<html><body>
+<p>The Sunday Evening League will run for 8 weeks from September 6 through
+October 25 from 7pm to 9:15pm.</p>
+<h4>Schedule &amp; Scores</h4><p>Schedule Coming Soon!</p>
+</body></html>"""
+_parsed = lc.parse_league_html(_NO_SCHEDULE)
+check("prose/page with no schedule still has a time", _parsed["time"], "7:00 pm")
+check("prose/and still no draws", _parsed["draws"], [])
+
+# A posted schedule outranks the prose: the draws are what people actually play,
+# and the prose can be a season-opening blurb that was never corrected.
+_SCHEDULED = """<html><body>
+<p>This league runs from September 4 through October 16, from 8:30-10:45pm.</p>
+<h6>September 4, 2026 7:45 pm T1 T2 Sheet A Sheet B is open</h6>
+</body></html>"""
+check("prose/draws win", lc.parse_league_html(_SCHEDULED)["time"], "7:45 pm")
 
 # A league whose page we couldn't read must NOT get invented league nights —
 # "no draws" only means "not scheduled yet" when the fetch actually worked.

@@ -503,6 +503,41 @@ store.expire(s7, datetime(2026, 8, 20, 10, 0), 3)
 check("subs/a game earlier today is still today",
       [r["id"] for r in s7["requests"]], ["earlier-today"])
 
+# An entry with no date of its own outlives the season it was posted for: an
+# "available any time" offer made in a league's last week was still on the board
+# a fortnight after that league finished ("Tuesday League 8/4 - 8/25" showing on
+# the 31st). Seasons that are over end those entries; dated ones still go by date.
+s9 = store.empty_state()
+s9["availability"].append(avail(1, "Dead League", [], created="2026-08-19T09:00:00"))
+s9["availability"].append(avail(2, "Live League", [], created="2026-08-19T09:00:00"))
+s9["availability"][1]["league_id"] = "8"
+s9["requests"] = [req("tbd", "", created="2026-08-19T09:00:00"),
+                  req("dated", "2026-08-25T19:00:00")]
+dropped = store.expire(s9, NOW, 3, dead_leagues={"7"})
+check("dead/any-time offer goes when the season does",
+      [a["name"] for a in s9["availability"]], ["Live League"])
+check("dead/it is reported so the caller saves",
+      [a["name"] for a in dropped["availability"]], ["Dead League"])
+check("dead/date-TBD request goes too", [r["id"] for r in s9["requests"]], ["dated"])
+
+# A dated game in a finished league is left alone here — it expires on its own
+# date like every other game. Nothing else may quietly reach back past today.
+s10 = store.empty_state()
+s10["requests"] = [req("future", "2026-08-25T19:00:00")]
+store.expire(s10, NOW, 3, dead_leagues={"7"})
+check("dead/a dated game still expires on its date",
+      [r["id"] for r in s10["requests"]], ["future"])
+
+# A league we couldn't read is NOT a finished league. Expiry is handed only the
+# ids it positively read as over, so an empty set on a site outage is a no-op,
+# not a board wipe.
+s11 = store.empty_state()
+s11["availability"].append(avail(1, "Unknown League", [], created="2026-08-19T09:00:00"))
+store.expire(s11, NOW, 3, dead_leagues=set())
+check("dead/empty set prunes nothing", len(s11["availability"]), 1)
+store.expire(s11, NOW, 3)
+check("dead/omitting the argument prunes nothing", len(s11["availability"]), 1)
+
 # ...and the board itself refuses to render a past date even if expiry hasn't run.
 s8 = store.empty_state()
 s8["availability"].append(avail(1, "Matt", ["2026-08-16T13:00:00", "2026-08-23T13:00:00"]))

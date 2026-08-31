@@ -126,10 +126,12 @@ board refreshes it in place. The buttons:
   When a league's schedule isn't posted, the game picker projects its upcoming
   **league nights** — weekly, on its own night, from that same start date — so
   there's always a real date to attach a request to. A posted schedule always
-  wins; projected nights are marked "not on the schedule yet". If the club
-  hasn't announced the start time either, the option reads "Sun Sep 6 · time
-  TBC" rather than guessing one: the date is what matters, and a neighbouring
-  league's time would be wrong (Sunday morning is 9am, Sunday night isn't).
+  wins; projected nights are marked "not on the schedule yet". The start time
+  for those comes from the league page's Details prose ("...from 7pm to 9:15pm"),
+  since there are no draws to read it off. If the page states no time either, the
+  option reads "Sun Sep 6 · time TBC" rather than guessing one: the date is what
+  matters, and a neighbouring league's time would be wrong (Sunday morning is
+  9am, Sunday night isn't).
 
   **Several dates at once.** Tick more than one date in the picker and each one is
   posted as its own request; the button reads **Post 4 dates**. A date that already
@@ -196,6 +198,21 @@ expires once those games pass — all checked every 15 minutes and on startup.
 (Requests can no longer be posted without a date. Any made while that was briefly
 allowed still show under a **Date TBD** heading and age out after
 `SUBS_UNDATED_DAYS`.)
+
+A game's timestamp is written **once**, when it's posted, so a date picked while
+the start time was still unknown stays parked at "time TBC" — refreshing the
+league cache feeds the *picker* and can't reach what's already on the board. The
+same housekeeping pass **re-times** those entries once the league page states a
+time: same date, real clock time, alert pages redrawn. Nobody is notified — it's
+the club's own league night, and the people involved know when they play; only
+the board was out of date.
+
+An entry with **no date of its own** — an "available any time" offer, a Date TBD
+request — has no game to expire against, so it also ends when its **league's
+season** does, rather than waiting out its posting age. Without that, an offer
+made in a league's last week stayed on the board a fortnight after the league had
+finished. Only leagues positively read as over count: a league page the bot
+couldn't fetch is never treated as finished.
 
 Notifications try a DM first and fall back to an @-mention in the board channel
 if the member has DMs closed.
@@ -346,7 +363,8 @@ the form IDs, and the practice category slug. Adjust to match your site.
   passed as query parameters so they survive proxies that strip `Authorization`
   headers. LTC entries are matched by event date, summed across submissions.
 - **Leagues:** league pages are fetched and parsed (standings → team count;
-  schedule → upcoming draw day/time/sheets), then cached to `league_cache.json`.
+  schedule → upcoming draw day/time/sheets; Details prose → start time when no
+  schedule is posted), then cached to `league_cache.json`.
   `refresh_leagues.py` force-refreshes the cache and is suitable for a cron job.
 
 ## Caching

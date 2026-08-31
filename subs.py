@@ -468,11 +468,13 @@ def projected_games(league: dict, now: datetime, *, start: date | None = None,
     dates: weekly on its own night, starting from the league's own start date, so
     a date that isn't a league night can't be picked.
 
-    The START TIME may legitimately be unknown — the club itself sometimes hasn't
-    settled it ("either 6pm or 7pm", per the Fall over/under league page). We
-    don't guess it (a neighbouring league's time would be flat wrong: Sunday
-    morning is 9am, Sunday night is not) and we don't let it block the date,
-    which is the part people actually need. Those entries carry TIME_TBC."""
+    The START TIME may still be unknown. With no draws to read it off,
+    league_client falls back to the league page's Details prose ("...from 7pm to
+    9:15pm"), which covers most unscheduled leagues; a page that states no time
+    at all leaves us nothing. We don't guess it (a neighbouring league's time
+    would be flat wrong: Sunday morning is 9am, Sunday night is not) and we don't
+    let it block the date, which is the part people actually need. Those entries
+    carry TIME_TBC."""
     idx = league_weekday_index(league)
     if idx > 6:
         return []                      # no idea what night this league plays
@@ -500,6 +502,70 @@ def league_is_over(league: dict, now: datetime) -> bool:
     over — that's a season whose schedule simply hasn't been posted."""
     dates = _draw_dates(league)
     return bool(dates) and dates[-1] < now.date()
+
+
+def dead_league_ids(leagues: list[dict], now: datetime) -> set[str]:
+    """Ids of the leagues whose season is over. The inverse of what a member is
+    offered in a picker (see LeagueCog.get_leagues), and deliberately so: the two
+    must never disagree about whether a season is finished."""
+    return {str(lg.get("id")) for lg in leagues
+            if lg.get("ended") or league_is_over(lg, now)}
+
+
+def league_times(leagues: list[dict]) -> dict[str, clock_time]:
+    """{league id: start time} for every league we can put a clock on."""
+    return {str(lg.get("id")): t for lg in leagues
+            if (t := _league_time(lg)) is not None}
+
+
+def _retimed(iso: str, t: clock_time) -> str | None:
+    """The same date at `t`, when `iso` is parked at TIME_TBC. None otherwise —
+    a real time is never overwritten, and the DATE never moves."""
+    try:
+        dt = datetime.fromisoformat(iso)
+    except (ValueError, TypeError):
+        return None
+    if dt.time() != TIME_TBC:
+        return None
+    return dt.replace(hour=t.hour, minute=t.minute, second=0, microsecond=0).isoformat()
+
+
+def retime_tbc(state: dict, times: dict[str, clock_time]) -> dict:
+    """Stamp the real start time on entries posted while it was still unknown.
+    Mutates `state` and returns what changed: {"requests": [...], "availability":
+    [...]}. The requests come back whole because their alert pages still read
+    "time TBC" and have to be redrawn.
+
+    A game's timestamp is written once, when it's posted, so a date picked before
+    the club announced a start time keeps TIME_TBC for good: the board says "time
+    TBC" long after the league page has a time on it, and no cache refresh reaches
+    it, because a refresh feeds the PICKER — it can't touch what's already posted.
+    This walks the store instead.
+
+    Nobody is told. The time was never a secret from the people involved — it's
+    the club's own league night, and they know when they play; only the board was
+    out of date. Run this BEFORE expiry in the same pass: an entry that lands on a
+    real time in the past is a game that has been played, and expiry should see it
+    that way in the same breath rather than a tick later."""
+    reqs, avail = [], []
+    for r in state.get("requests", []):
+        t = times.get(str(r.get("league_id") or ""))
+        if t is None:
+            continue
+        iso = _retimed(r.get("game_ts") or "", t)
+        if iso:
+            r["game_ts"] = iso
+            reqs.append(r)
+    for a in state.get("availability", []):
+        t = times.get(str(a.get("league_id") or ""))
+        if t is None:
+            continue
+        games = a.get("games") or []
+        fixed = [(_retimed(g, t) or g) for g in games]
+        if fixed != games:
+            a["games"] = fixed
+            avail.append(a)
+    return {"requests": reqs, "availability": avail}
 
 
 def game_options(league: dict, now: datetime, *, cap: int = 25) -> list[dict]:
@@ -2827,9 +2893,16 @@ class Subs(commands.Cog):
 
     async def startup(self):
         """Prune expired requests and re-render every server's board after a (re)connect."""
+        leagues = await self.maintenance_leagues()   # outside the lock: it can hit the network
+        now = club_now()
         async with self._lock:
-            store.expire(self.state, club_now(), GRACE_HOURS, undated_days=UNDATED_DAYS)
+            retimed = retime_tbc(self.state, league_times(leagues))
+            store.expire(self.state, now, GRACE_HOURS, undated_days=UNDATED_DAYS,
+                         dead_leagues=dead_league_ids(leagues, now))
             store.save(STORE_PATH, self.state)
+        n = len(retimed["requests"]) + len(retimed["availability"])
+        if n:
+            log.info("Re-timed %d entries posted before their start time was known", n)
         await self.render_all_boards()
         self._requeue_unnotified()
 
@@ -3172,6 +3245,20 @@ class Subs(commands.Cog):
         now = club_now()
         return [lg for lg in leagues
                 if not lg.get("ended") and not league_is_over(lg, now)]
+
+    async def maintenance_leagues(self) -> list[dict]:
+        """The league list the housekeeping passes work from — fetched ONCE per
+        pass so expiry and re-timing can't disagree about the same league.
+
+        Empty when the list can't be read at all. Both callers are written to do
+        nothing with an empty list rather than assume the worst: "not in the list"
+        is not evidence a season ended, and a site outage that read as one would
+        wipe the board."""
+        try:
+            return await get_cached_leagues()
+        except Exception as e:  # noqa: BLE001 — never let housekeeping die on a fetch
+            log.warning("League fetch failed; skipping season expiry and re-timing: %s", e)
+            return []
 
     # -- mutations (called from button/modal callbacks) ---------------------
     async def add_series(self, *, requester, league_id, league, team, game_isos, spots,
@@ -3770,12 +3857,24 @@ class Subs(commands.Cog):
     # -- background expiry --------------------------------------------------
     @tasks.loop(minutes=15)
     async def expiry_loop(self):
+        leagues = await self.maintenance_leagues()   # outside the lock: it can hit the network
+        now = club_now()
         async with self._lock:
-            dropped = store.expire(self.state, club_now(), GRACE_HOURS,
-                                   undated_days=UNDATED_DAYS)
-            changed = bool(dropped["requests"] or dropped["availability"] or dropped["games"])
+            retimed = retime_tbc(self.state, league_times(leagues))
+            dropped = store.expire(self.state, now, GRACE_HOURS,
+                                   undated_days=UNDATED_DAYS,
+                                   dead_leagues=dead_league_ids(leagues, now))
+            changed = bool(retimed["requests"] or retimed["availability"]
+                           or dropped["requests"] or dropped["availability"]
+                           or dropped["games"])
             if changed:
                 self._save()
+        # A retimed request's alert page still reads "time TBC" — redraw it. Skip
+        # any that expiry has just dropped: their pages come down below instead.
+        gone = {r.get("id") for r in dropped["requests"]}
+        for r in retimed["requests"]:
+            if r.get("id") not in gone:
+                await self.refresh_page(r)
         # Retire alert pages for played-out requests.
         for r in dropped["requests"]:
             alert = r.get("alert") or {}
