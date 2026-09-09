@@ -26,6 +26,7 @@ practice_signups.json*
 subs_store.json*
 sheet_blocks.json*
 league_cache.json*
+alert_state.json*
 
 # macOS
 .DS_Store

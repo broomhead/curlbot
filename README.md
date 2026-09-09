@@ -366,6 +366,27 @@ the form IDs, and the practice category slug. Adjust to match your site.
   schedule → upcoming draw day/time/sheets; Details prose → start time when no
   schedule is posted), then cached to `league_cache.json`.
   `refresh_leagues.py` force-refreshes the cache and is suitable for a cron job.
+- **Reserved facility ice:** the rink's public iCal feeds (`POND_ICS_URLS`,
+  comma-separated). A rink may split its curling blocks across SEVERAL of the
+  calendars its schedule page overlays, so this is a list, not a URL — one feed
+  is rarely the whole picture.
+
+### Watching the ice feeds
+
+The feeds are the one source the club doesn't control, and they fail quietly:
+the facility ends each weekly series at the season rollover (`UNTIL`) and
+re-creates it — sometimes on a different calendar — so a day that still has ice
+can vanish from `/sheets` with nothing logged and nothing broken.
+
+`refresh_leagues.py` therefore also runs a coverage check: it expands every
+configured feed over the recent past and the window ahead, and reports a weekday
+that had reserved ice and now has none, a feed that won't load, and a
+provisional "hold" being offered as free ice. Findings are posted to
+`ALERT_CHANNEL_ID` (the bot needs View Channel + Send Messages there); unset,
+they only print. A finding repeats at most every `ALERT_REPEAT_DAYS`, and one line is sent
+when it clears — silence means healthy. `--no-alert` prints without messaging.
+
+    python refresh_leagues.py --no-alert          # just show me the picture
 
 ## Caching
 

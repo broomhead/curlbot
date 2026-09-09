@@ -221,9 +221,92 @@ def reserved_curling_sessions(ics_texts, window_start, window_end, match: str = 
     return uniq
 
 
+# ── Feed labels + suspicious titles (pure) ──────────────────────────────────
+
+# Titles the rink uses for ice it has pencilled in but not committed. They match
+# `curl` like any other block, so they'd be advertised as free practice ice —
+# worth flagging rather than silently trusting.
+TENTATIVE_MARKERS = ("tentative", "hold", "pending", "temp")
+
+
+def is_tentative(title: str) -> bool:
+    """True if a block's title marks it as provisional rather than confirmed."""
+    t = (title or "").lower()
+    return any(m in t for m in TENTATIVE_MARKERS)
+
+
+def feed_label(url: str) -> str:
+    """Short name for a feed, for reports: the calendar id without its domain.
+
+    Falls back to the trimmed URL for anything that isn't the usual iCal shape.
+    """
+    from urllib.parse import unquote
+
+    marker = "/ical/"
+    if marker in url:
+        rest = url.split(marker, 1)[1]
+        cal_id = unquote(rest.split("/", 1)[0])
+        return cal_id.split("@", 1)[0] or cal_id
+    return url[:40]
+
+
+def weekdays_covered(occurrences) -> set:
+    """The weekday numbers (Mon=0 … Sun=6) that these occurrences land on."""
+    return {o["start"].weekday() for o in occurrences}
+
+
 # ── I/O (cached fetch) ──────────────────────────────────────────────────────
 
-_cache = {"ts": 0.0, "texts": []}
+# url -> last text we successfully read, plus when the set was last refreshed.
+_cache = {"ts": 0.0, "texts": {}}
+
+
+async def fetch_feeds(urls, ttl: int = 21600, force: bool = False) -> list[dict]:
+    """Read each feed, one entry per URL: {"url", "label", "text", "ok"}.
+
+    `ok` is False when this run couldn't read that feed; `text` then falls back to
+    the last good copy of THAT feed (or None if there's never been one), so one
+    dead feed can't blank out the others. `force` bypasses the cache — for the
+    out-of-band refresh, which exists precisely to go to the network.
+    """
+    if not urls:
+        return []
+    import aiohttp  # local import keeps the parser import-light and pure
+
+    now = time.monotonic()
+    cached = _cache["texts"]
+    if not force and cached and now - _cache["ts"] < ttl:
+        # Inside the TTL, `ok` means "we have a copy of this feed" — the health
+        # check passes force=True precisely so its `ok` reflects a live attempt.
+        return [{"url": u, "label": feed_label(u), "text": cached.get(u), "ok": u in cached}
+                for u in urls]
+
+    results: list[dict] = []
+    try:
+        async with aiohttp.ClientSession() as s:
+            for url in urls:
+                text, ok = None, False
+                try:
+                    async with s.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                        if r.status == 200:
+                            text, ok = await r.text(), True
+                        else:
+                            log.warning("Pond ICS fetch -> HTTP %s (%s)", r.status, feed_label(url))
+                except Exception as ex:  # noqa: BLE001 — per-feed failure
+                    log.warning("Pond ICS fetch failed (%s): %s", feed_label(url), ex)
+                results.append({"url": url, "label": feed_label(url), "text": text, "ok": ok})
+    except Exception as ex:  # noqa: BLE001 — session-level failure
+        log.warning("Pond ICS session failed: %s", ex)
+        results = [{"url": u, "label": feed_label(u), "text": None, "ok": False} for u in urls]
+
+    for f in results:
+        if f["ok"]:
+            cached[f["url"]] = f["text"]
+        else:
+            f["text"] = cached.get(f["url"])  # serve this feed's last good copy
+    if any(f["ok"] for f in results):
+        _cache["ts"] = now
+    return results
 
 
 async def fetch_reserved_curling(urls, window_start, window_end,
@@ -231,33 +314,6 @@ async def fetch_reserved_curling(urls, window_start, window_end,
     """Fetch the configured iCal feeds (cached `ttl` seconds) and return the
     curling occurrences in the window. Network failures degrade to stale cache,
     then to an empty list, so /sheets never breaks on a feed hiccup."""
-    if not urls:
-        return []
-    import aiohttp  # local import keeps the parser import-light and pure
-
-    now = time.monotonic()
-    texts = None
-    if _cache["texts"] and now - _cache["ts"] < ttl:
-        texts = _cache["texts"]
-    if texts is None:
-        fetched = []
-        try:
-            async with aiohttp.ClientSession() as s:
-                for url in urls:
-                    try:
-                        async with s.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
-                            if r.status == 200:
-                                fetched.append(await r.text())
-                            else:
-                                log.warning("Pond ICS fetch -> HTTP %s", r.status)
-                    except Exception as ex:  # noqa: BLE001 — per-feed failure
-                        log.warning("Pond ICS fetch failed: %s", ex)
-        except Exception as ex:  # noqa: BLE001 — session-level failure
-            log.warning("Pond ICS session failed: %s", ex)
-        if fetched:
-            _cache["texts"], _cache["ts"] = fetched, now
-            texts = fetched
-        else:
-            texts = _cache["texts"]  # serve stale on total failure (may be empty)
-
+    feeds = await fetch_feeds(urls, ttl)
+    texts = [f["text"] for f in feeds if f["text"]]
     return reserved_curling_sessions(texts, window_start, window_end, match)
