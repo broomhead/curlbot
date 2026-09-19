@@ -55,6 +55,23 @@ signs up (in whatever channel they used `/sheets`) and edited silently on every
 join or leave. When someone *newly joins* a slot, the bot also posts a short
 ping so others get notified and can join in.
 
+**Taking a practice back.** Plans change after the sign-up, and usually after the
+slot has already started — by which point the per-slot buttons no longer reach it
+and the practice is counted toward the member's streak. The **🙅 Not coming**
+button on every report opens a private list of their own practices from this week
+and all of last week (back to that week's Sunday): pick a date, confirm, and it's
+removed. Dropping a slot that hasn't happened yet republishes the board, so the
+rest of the club sees the change; correcting one that's already past just fixes
+the streak table quietly. A week only comes off a streak when it was that
+member's last practice that week.
+
+Weeks credited before the bot kept the dates behind a streak have no date to take
+back. `load()` stands a keyless placeholder behind every such week, and the menu
+offers it as the week itself ("Week of Sep 14 — date not recorded"), judged on the
+week's Monday since there's no date to place inside it. Without this, a week
+credited by an earlier build was stuck on a member's streak permanently — the
+first thing that happened when this shipped.
+
 ### Blocking sheets (ice booked off the calendar)
 
 Sometimes ice gets reserved outside every system the bot can see — someone
@@ -84,7 +101,9 @@ Notes on how it behaves:
   arithmetic on each render, so they don't wait out the six-hour `/sheets` cache.
 - **They expire on their own** once the ice is past (`BLOCK_GRACE_HOURS`), and can
   be released early from the same 🚫 menu — pick the block from "…or release a
-  block".
+  block", then confirm with **♻️ Release it**. The pick and the release are two
+  taps because a release puts sheets back on everyone's report and announces it in
+  the channel; a dropdown that did that on touch had no undo.
 - **A block that takes a slot to zero pings anyone signed up to practice then**,
   since their plans just changed.
 - A block never gets a row of its own; it only reduces the free count on the rows

@@ -9,7 +9,10 @@ and members sort out the details themselves.
 Sessions are keyed by their start minute (e.g. "20260616T1945") so the same
 practice slot maps to the same pool across queries and restarts. Metadata
 (label, sheets) is refreshed whenever the session is seen; the user pool is
-preserved. A session ages out once its start time has passed (+grace).
+preserved. A session ages out once its start time has passed (+grace), and the people still
+signed up for it at that point have that practice confirmed against their streak.
+A confirmed practice stays individually addressable for a couple of weeks, so a
+member who didn't actually make it can take it back (see editable_practices).
 
 State shape:
   {
@@ -38,9 +41,15 @@ def empty_state() -> dict:
     # `attendance` is a PERSISTENT per-user record of the ISO weeks a member's
     # practice has been CONFIRMED — i.e. a session they were signed up for that has
     # since passed (weeks are added in expire(), never at sign-up, so future sign-ups
-    # don't count yet): {"<user_id>": {"name": str, "weeks": ["2026-W24", ...]}}. It's
-    # never pruned when a streak breaks — a gap just ends the current streak — so the
-    # full history survives. See current_streak / streak_leaderboard.
+    # don't count yet): {"<user_id>": {"name": str, "weeks": ["2026-W24", ...],
+    # "practices": [{"key", "label", "when_ts", "week"}, ...]}}. It's never pruned
+    # when a streak breaks — a gap just ends the current streak — so the full history
+    # survives. See current_streak / streak_leaderboard.
+    #
+    # `practices` is the per-session detail behind those weeks. A week on its own
+    # can't be un-done: "I wasn't actually there on Tuesday" needs to know which
+    # Tuesday. Each confirmed practice is kept so remove_practice can drop one and
+    # recompute the week from what's left.
     return {"sessions": {}, "board": None, "attendance": {}}
 
 
@@ -57,6 +66,8 @@ def load(path: str) -> dict:
     state.setdefault("attendance", {})
     for s in state["sessions"].values():
         s.setdefault("users", [])
+    for rec in state["attendance"].values():
+        _backfill_markers(rec)
     return state
 
 
@@ -154,15 +165,165 @@ def _week_monday(iso_week: str) -> Optional[date]:
         return None
 
 
-def _add_week(state: dict, user_id: int, name: str, week: Optional[str]) -> None:
-    if not week:
-        return
-    rec = state.setdefault("attendance", {}).setdefault(str(user_id), {"name": name, "weeks": []})
+def _backfill_markers(rec: dict) -> dict:
+    """Give every credited week at least one practice record.
+
+    Weeks credited before practices were kept individually are bare strings with
+    nothing behind them — there's no date to take back, so such a week would be
+    stuck on a streak forever. A keyless marker stands in for "a practice this
+    week, date not recorded": it can't be offered as a date, but the week it
+    belongs to can be taken back whole (see editable_practices)."""
+    rec.setdefault("weeks", [])
+    rec.setdefault("practices", [])
+    known = {p.get("week") for p in rec["practices"]}
+    for w in rec["weeks"]:
+        if w not in known:
+            rec["practices"].append({"key": "", "label": "", "when_ts": "", "week": w})
+    return rec
+
+
+def _record(state: dict, user_id: int, name: str) -> dict:
+    rec = state.setdefault("attendance", {}).setdefault(
+        str(user_id), {"name": name, "weeks": [], "practices": []})
+    _backfill_markers(rec)
     if name:
         rec["name"] = name
+    return rec
+
+
+def _confirm_practice(state: dict, user_id: int, name: str, key: str,
+                      when_ts: str, label: str) -> None:
+    """Count one practice that has now happened: add its ISO week to the user's
+    streak and keep the practice itself so it stays individually removable."""
+    week = _week_of(when_ts)
+    if not week:
+        return
+    rec = _record(state, user_id, name)
     if week not in rec["weeks"]:
         rec["weeks"].append(week)
         rec["weeks"].sort()
+    if not any(p.get("key") == key for p in rec["practices"]):
+        rec["practices"].append({"key": key, "label": label,
+                                 "when_ts": when_ts, "week": week})
+        rec["practices"].sort(key=lambda p: p.get("when_ts", ""))
+
+
+# ── Taking a practice back ───────────────────────────────────────────────────
+# Sign-ups get stale in both directions: someone signs up and can't make it, and
+# by the time they know, the slot has often already passed and been counted. The
+# edit window is this week plus all of last week — long enough to fix a practice
+# that had already started before anyone knew, short enough that the streak board
+# isn't rewritable history.
+
+def window_start(now: datetime) -> datetime:
+    """Midnight on the Sunday of the week containing seven days ago."""
+    d = (now - timedelta(days=7)).date()
+    d -= timedelta(days=(d.weekday() + 1) % 7)   # weekday(): Mon=0 … Sun=6
+    return datetime(d.year, d.month, d.day)
+
+
+def _in_window(when_ts: str, floor: datetime) -> bool:
+    try:
+        return datetime.fromisoformat(when_ts) >= floor
+    except (ValueError, TypeError):
+        return False
+
+
+WEEK_KEY_PREFIX = "week:"   # can't collide with a session key (%Y%m%dT%H%M)
+
+
+def _week_label(iso_week: str) -> str:
+    monday = _week_monday(iso_week)
+    return (f"Week of {monday.strftime('%b %-d')} — date not recorded"
+            if monday else iso_week)
+
+
+def editable_practices(state: dict, user_id: int, now: datetime) -> list[dict]:
+    """Every practice this member can still take back, earliest first. Each:
+    {key, label, when_ts, counted, whole_week} — `counted` meaning the practice has
+    passed and is already part of their streak, as opposed to a slot still coming
+    up; `whole_week` meaning the entry stands for a week with no date on record, so
+    taking it back takes the whole week.
+
+    Covers every half of the pool because a member shouldn't have to know which one
+    a given date is in: live sessions they're signed up for, practices already
+    confirmed against their streak, and weeks credited before the dates behind them
+    were kept. A key is only ever in one of them — expire() moves it across."""
+    floor = window_start(now)
+    out = []
+    for key, s in state.get("sessions", {}).items():
+        if not any(u["user_id"] == user_id for u in s.get("users", [])):
+            continue
+        when_ts = s.get("when_ts", "")
+        if _in_window(when_ts, floor):
+            out.append({"key": key, "label": s.get("label", "") or key,
+                        "when_ts": when_ts, "counted": False, "whole_week": False})
+    rec = state.get("attendance", {}).get(str(user_id)) or {}
+    for p in rec.get("practices", []):
+        if p.get("key") and _in_window(p.get("when_ts", ""), floor):
+            out.append({"key": p["key"], "label": p.get("label", "") or p["key"],
+                        "when_ts": p.get("when_ts", ""), "counted": True,
+                        "whole_week": False})
+    # A week with no date on record is offered as the week itself. Judged on its
+    # MONDAY rather than the Sunday floor: with no date to place inside the week,
+    # the only honest reading is "this week and last week", and a week whose Monday
+    # is in the window is exactly that.
+    seen_weeks = set()
+    for p in rec.get("practices", []):
+        week = p.get("week")
+        if p.get("key") or not week or week in seen_weeks:
+            continue
+        seen_weeks.add(week)
+        monday = _week_monday(week)
+        if monday is None or datetime(monday.year, monday.month, monday.day) < floor:
+            continue
+        out.append({"key": WEEK_KEY_PREFIX + week, "label": _week_label(week),
+                    "when_ts": monday.isoformat(), "counted": True,
+                    "whole_week": True})
+    out.sort(key=lambda p: p["when_ts"])
+    return out
+
+
+def remove_practice(state: dict, user_id: int, key: str, now: datetime) -> Optional[dict]:
+    """Take one practice back. Returns what was removed — {key, label, when_ts,
+    counted, live, week_lost} — or None if it isn't theirs to remove or has aged
+    past the window.
+
+    `live` says the slot is still an open session (so the shared board shows it and
+    wants a repaint); `week_lost` says this was their last practice that week, so
+    the week has come off their streak."""
+    target = next((p for p in editable_practices(state, user_id, now)
+                   if p["key"] == key), None)
+    if target is None:
+        return None
+    out = {**target, "live": False, "week_lost": False}
+    rec = state.get("attendance", {}).get(str(user_id)) or {}
+    if target.get("whole_week"):
+        week = key[len(WEEK_KEY_PREFIX):]
+        # Only the dateless markers go. A dated practice in the same week is its own
+        # entry on the menu and stays until it's removed on its own terms.
+        rec["practices"] = [p for p in rec["practices"]
+                            if p.get("key") or p.get("week") != week]
+        if not any(p.get("week") == week for p in rec["practices"]):
+            rec["weeks"] = [w for w in rec.get("weeks", []) if w != week]
+            out["week_lost"] = True
+        return out
+    session = state.get("sessions", {}).get(key)
+    if session is not None and not target["counted"]:
+        session["users"] = [u for u in session["users"] if u["user_id"] != user_id]
+        out["live"] = True
+        return out
+    gone = next((p for p in rec.get("practices", []) if p.get("key") == key), None)
+    if gone is None:
+        return None
+    rec["practices"] = [p for p in rec["practices"] if p.get("key") != key]
+    week = gone.get("week")
+    # The week only comes off if nothing else that week is still on record — two
+    # practices in a week are one week of streak, and taking one back leaves it.
+    if week and not any(p.get("week") == week for p in rec["practices"]):
+        rec["weeks"] = [w for w in rec.get("weeks", []) if w != week]
+        out["week_lost"] = True
+    return out
 
 
 def current_streak(state: dict, user_id: int, now: datetime) -> int:
@@ -265,10 +426,9 @@ def expire(state: dict, now: datetime, grace_hours: int = DEFAULT_GRACE_HOURS) -
         except (ValueError, KeyError, TypeError):
             continue
         if when < cutoff:
-            week = _week_of(s.get("when_ts", ""))
-            if week:
-                for u in s.get("users", []):
-                    _add_week(state, u["user_id"], u.get("name", ""), week)
+            for u in s.get("users", []):
+                _confirm_practice(state, u["user_id"], u.get("name", ""), key,
+                                  s.get("when_ts", ""), s.get("label", ""))
             dropped.append(key)
             del state["sessions"][key]
     return dropped

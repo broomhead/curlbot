@@ -493,6 +493,7 @@ async def setup_hook():
         subs.DropAutoButton,
         subs.SetTeamButton,
         JoinPracticeButton,
+        UnlistPracticeButton,
         BlockSheetsButton,
     )
     await bot.add_cog(subs.Subs(bot))
@@ -694,6 +695,7 @@ async def build_sheets_payload(weeks: int, user) -> tuple[discord.Embed, discord
         # the only way to record ice that got reserved off the calendar — and the
         # release menu is how a block placed in error gets undone.
         empty = discord.ui.View(timeout=None)
+        empty.add_item(UnlistPracticeButton(weeks))
         empty.add_item(BlockSheetsButton(weeks))
         return embed, empty
 
@@ -727,10 +729,12 @@ async def build_sheets_payload(weeks: int, user) -> tuple[discord.Embed, discord
         lines.append(f"…and {dropped} more slot{'s' if dropped != 1 else ''} — "
                      "run `/sheets` with a smaller `weeks` to see them.")
     embed.description = "\n\n".join(lines)
-    # Sits last, after the slot buttons (20 of those at most, so this stays inside
-    # Discord's 25-component cap).
+    # Sit last, after the slot buttons (20 of those at most, so these two stay
+    # inside Discord's 25-component cap).
+    view.add_item(UnlistPracticeButton(weeks))
     view.add_item(BlockSheetsButton(weeks))
-    embed.set_footer(text="Tap a slot to sign up · 🚫 to hold ice that's booked off the calendar")
+    embed.set_footer(text="Tap a slot to sign up · 🙅 if you can't make one "
+                          "· 🚫 to hold ice that's booked off the calendar")
     return embed, view
 
 
@@ -1027,6 +1031,214 @@ class JoinPracticeButton(discord.ui.DynamicItem[discord.ui.Button],
             ephemeral=True)
 
 
+# ── Taking a practice back ────────────────────────────────────────────────────
+# The per-slot buttons above only reach ice that's still in the report's window, so
+# once a slot starts there's nothing left to press — and a practice nobody attended
+# goes on counting toward their streak. This menu reaches back over this week and
+# all of last week (see practice_store.window_start) and covers both directions:
+# "I'm not coming tonight", which the rest of the club should see on the board, and
+# "I wasn't there last Tuesday", which quietly corrects the streak board.
+
+UNLIST_MAX_OPTIONS = 25   # Discord's cap on select options
+
+
+class UnlistSlotSelect(discord.ui.Select):
+    """Picks which practice to take back. Sets the choice only — the removal is a
+    button, because a mis-tapped dropdown that instantly dropped a practice (and
+    possibly a streak week) would have no undo."""
+
+    def __init__(self, practices: list[dict], selected: str | None):
+        opts = []
+        for p in practices[:UNLIST_MAX_OPTIONS]:
+            opts.append(discord.SelectOption(
+                label=_opt_text(p["label"]),
+                value=p["key"],
+                description=_opt_text(
+                    "counted toward your streak" if p["counted"]
+                    else "signed up — counts once it's played"),
+                default=(p["key"] == selected),
+            ))
+        super().__init__(placeholder="Which practice aren't you making?…",
+                         min_values=1, max_values=1, options=opts, row=0)
+
+    async def callback(self, interaction: discord.Interaction):
+        flow: "UnlistFlowView" = self.view
+        flow.key = self.values[0]
+        await flow.refresh(interaction)
+
+
+class UnlistConfirmButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Remove it", emoji="🗑️",
+                         style=discord.ButtonStyle.danger, row=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        flow: "UnlistFlowView" = self.view
+        # One-shot, set before the first await: a second press mustn't re-run a
+        # removal whose board refresh is still in flight.
+        if flow.submitted:
+            return
+        flow.submitted = True
+        await flow.remove(interaction)
+
+
+class UnlistCancelButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Never mind", style=discord.ButtonStyle.secondary, row=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        flow: "UnlistFlowView" = self.view
+        flow.stop()
+        await flow.restore(interaction, "")
+
+
+class UnlistFlowView(discord.ui.View):
+    """Replaces the report's buttons with the picker, then puts the report back.
+
+    In place rather than in a second message on purpose: the report is the thing
+    carrying those "Leave 7:45PM" buttons, and one left open beside this menu still
+    shows the member signed up for a practice they just dropped — pressing it would
+    quietly sign them back up."""
+
+    def __init__(self, weeks: int, practices: list[dict]):
+        super().__init__(timeout=180)
+        self.weeks = weeks
+        self.practices = practices
+        self.key: str | None = None
+        self.submitted = False
+        self.origin: discord.Interaction | None = None
+        self.build()
+
+    def chosen(self) -> dict | None:
+        return next((p for p in self.practices if p["key"] == self.key), None)
+
+    def build(self) -> "UnlistFlowView":
+        self.clear_items()
+        self.add_item(UnlistSlotSelect(self.practices, self.key))
+        if self.chosen() is not None:
+            self.add_item(UnlistConfirmButton())
+        self.add_item(UnlistCancelButton())
+        return self
+
+    def prompt(self) -> str:
+        lines = ["🙅  **Not coming?** — take yourself off a practice from this week "
+                 "or last."]
+        p = self.chosen()
+        if p is None:
+            lines.append("Pick a date, then press **Remove it**.")
+        else:
+            lines.append(f"Removing: **{p['label']}**")
+            if p.get("whole_week"):
+                lines.append("No date was recorded for that one — it predates the "
+                             "bot keeping the dates behind a streak. Removing it "
+                             "drops that week from your streak unless another "
+                             "practice that week is still on record; practising "
+                             "again that week earns it back.")
+            elif p["counted"]:
+                lines.append("That practice is already counted toward your streak — "
+                             "taking it back may shorten it.")
+            else:
+                lines.append("Everyone on the board will see the sign-up go.")
+        return "\n".join(lines)
+
+    async def refresh(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(content=self.prompt(), view=self.build())
+
+    async def restore(self, interaction: discord.Interaction, status: str):
+        """Put the live report back under whatever just happened. A fetch hiccup
+        must not leave the picker's controls on screen — they'd be pointing at a
+        removal that already happened."""
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+        try:
+            embed, view = await build_sheets_payload(self.weeks, interaction.user)
+        except (SheetsError, discord.HTTPException):
+            log.warning("Couldn't rebuild the /sheets report after an unlist.")
+            await interaction.edit_original_response(
+                content=(status + "\n_Run `/sheets` for an up-to-date report._").strip(),
+                view=None)
+            return
+        await interaction.edit_original_response(content=status or None,
+                                                 embed=embed, view=view)
+
+    async def remove(self, interaction: discord.Interaction):
+        await interaction.response.defer()   # restore() edits this same message
+        self.stop()
+        p = self.chosen()
+        async with _practice_lock:
+            removed = ps.remove_practice(_practice_state, interaction.user.id,
+                                         self.key, now_club())
+            if removed is not None:
+                ps.save(PRACTICE_STORE_PATH, _practice_state)
+        if removed is None:
+            label = p["label"] if p else "that practice"
+            await self.restore(interaction, f"**{label}** was already off your list.")
+            return
+        status = (f"👍  Took **{removed['label']}** off your streak."
+                  if removed.get("whole_week")
+                  else f"👍  Took you off **{removed['label']}**.")
+        if removed["week_lost"] and not removed.get("whole_week"):
+            status += " That week no longer counts toward your streak."
+        await self.restore(interaction, status)
+        # A slot that's still open is on the shared board, so republish it where
+        # everyone's watching. A practice that's already past isn't on the board at
+        # all — but the streak table on it is, so that still gets repainted, quietly
+        # and where it already lives.
+        if removed["live"]:
+            await bump_practice_board(interaction.channel)
+        else:
+            await render_practice_board(await _board_channel())
+
+    async def on_timeout(self) -> None:
+        """Grey the picker out rather than leaving controls that answer every press
+        with "This interaction failed"."""
+        if self.origin is None:
+            return
+        for child in self.children:
+            child.disabled = True
+        try:
+            await self.origin.edit_original_response(
+                content=self.prompt() + "\n\n_Timed out — run `/sheets` again._",
+                view=self)
+        except discord.HTTPException:
+            pass
+
+
+class UnlistPracticeButton(discord.ui.DynamicItem[discord.ui.Button],
+                           template=r"sheet:unlist:(?P<weeks>\d+)"):
+    """The 🙅 entry point on every /sheets report. Persistent, so it keeps working
+    on a report someone left open across a restart."""
+
+    def __init__(self, weeks: int):
+        self.weeks = int(weeks)
+        super().__init__(discord.ui.Button(
+            label="Not coming", emoji="🙅",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"sheet:unlist:{int(weeks)}",
+        ))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["weeks"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        async with _practice_lock:
+            ps.expire(_practice_state, now_club())
+            practices = ps.editable_practices(_practice_state, interaction.user.id,
+                                              now_club())
+            ps.save(PRACTICE_STORE_PATH, _practice_state)
+        if not practices:
+            # Nothing to pick: answer beside the report instead of replacing it,
+            # so their slot buttons survive an idle press.
+            await interaction.response.send_message(
+                "Nothing to take back — you're not on any practice from this week "
+                "or last.", ephemeral=True)
+            return
+        flow = UnlistFlowView(self.weeks, practices)
+        flow.origin = interaction
+        await interaction.response.edit_message(content=flow.prompt(), view=flow)
+
+
 # ── Blocking sheets ───────────────────────────────────────────────────────────
 # Ice gets reserved off the books: a board member books a Learn-to-Curl by hand,
 # a group reserves sheets at the rink, money changes hands and nothing lands on
@@ -1145,12 +1357,13 @@ class BlockConfirmButton(discord.ui.Button):
 
 
 class ReleaseBlockSelect(discord.ui.Select):
-    def __init__(self, blocks: list[dict], row: int = 3):
+    def __init__(self, blocks: list[dict], selected: str | None = None, row: int = 3):
         opts = [
             discord.SelectOption(
                 label=_opt_text(bs.describe(b, with_who=False)),
                 value=b["id"],
                 description=_opt_text(f"blocked by {b.get('name') or 'someone'}"),
+                default=(b["id"] == selected),
             )
             for b in blocks[:25] if b.get("id")
         ]
@@ -1159,12 +1372,40 @@ class ReleaseBlockSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         flow: "BlockFlowView" = self.view
-        block_id = self.values[0]
+        flow.release_id = self.values[0]
+        await flow.refresh(interaction)
+
+
+class ReleaseConfirmButton(discord.ui.Button):
+    """Releasing is the half of this menu that changes what everyone else sees, and
+    a dropdown that did it on touch had no undo — one mis-tap put sheets back on a
+    report that a member had deliberately taken them off."""
+
+    def __init__(self, row: int = 4):
+        super().__init__(label="Release it", emoji="♻️",
+                         style=discord.ButtonStyle.danger, row=row)
+
+    async def callback(self, interaction: discord.Interaction):
+        flow: "BlockFlowView" = self.view
+        block_id = flow.release_id
+        if block_id is None:
+            # The pick is already cleared, so this is a second tap landing after the
+            # first one did the work — the member's finger was faster than the edit.
+            # Ack and redraw; an error is a baffling reply to a click they only
+            # meant to make once.
+            await interaction.response.edit_message(content=flow.prompt(),
+                                                    view=flow.build())
+            return
+        # No debounce here, unlike placing a block: bs.release pops by id, so a
+        # second press through a contended lock gets None and falls out below
+        # without re-announcing. Placing needs one because bs.add isn't idempotent
+        # — two presses make two blocks. Releasing twice releases once.
         async with _block_lock:
             block = bs.release(_block_state, block_id)
             if block is not None:
                 bs.save(BLOCK_STORE_PATH, _block_state)
             flow.blocks = _releasable_blocks()
+        flow.release_id = None
         flow.status = ("That block was already gone." if block is None
                        else f"♻️  Released: {bs.describe(block)}")
         # Answer by editing the picker itself, so it stays live and its release
@@ -1198,6 +1439,7 @@ class BlockFlowView(discord.ui.View):
         self.sheets = 1
         self.message = None
         self.status = ""
+        self.release_id = None
         self.build()
 
     def slot(self) -> dict | None:
@@ -1210,8 +1452,13 @@ class BlockFlowView(discord.ui.View):
             self.add_item(BlockCountSelect(self.sheets, self.slot(), row=1))
             self.add_item(BlockConfirmButton(row=2))
         if self.blocks:
-            self.add_item(ReleaseBlockSelect(self.blocks, row=3))
+            self.add_item(ReleaseBlockSelect(self.blocks, self.release_id, row=3))
+            if self.picked_block() is not None:
+                self.add_item(ReleaseConfirmButton(row=4))
         return self
+
+    def picked_block(self) -> dict | None:
+        return next((b for b in self.blocks if b.get("id") == self.release_id), None)
 
     def prompt(self) -> str:
         lines = ["🚫  **Block out sheets** — hold ice that's booked outside the calendar."]
@@ -1229,6 +1476,11 @@ class BlockFlowView(discord.ui.View):
         if self.blocks:
             lines.append("\nCurrently blocked:")
             lines += [f"· {bs.describe(b)}" for b in self.blocks[:5]]
+        picked = self.picked_block()
+        if picked is not None:
+            lines.append(f"\nReleasing: **{bs.describe(picked)}** — those sheets go "
+                         "back on the report and the channel is told. "
+                         "Press **Release it** to confirm.")
         if self.status:
             lines.append(f"\n{self.status}")
         return "\n".join(lines)
@@ -1249,6 +1501,7 @@ class BlockFlowView(discord.ui.View):
         if self.is_finished():
             return
         self.slot_key = None
+        self.release_id = None
         self.status = status
         async with _block_lock:
             self.blocks = _releasable_blocks()

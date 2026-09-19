@@ -405,6 +405,164 @@ check("view/no empty release menu",
       [type(c).__name__ for c in idless.children], ["BlockSlotSelect"])
 
 
+# ── Releasing takes two taps ─────────────────────────────────────────────────
+# The release dropdown used to let a block go the instant it was touched, putting
+# sheets back on everyone's report and announcing it in the channel — from a
+# mis-tap, with no undo. Picking now only picks; a labelled button does the work.
+
+held_block = {"id": "20260823T1330-2", "start": "2026-08-23T13:30:00",
+              "end": "2026-08-23T16:00:00", "sheets": 2, "name": "Robin Vale",
+              "reason": "LTC", "user_id": 7}
+rel = botmod.BlockFlowView(1, rows, [held_block])
+check("release/no confirm button before a block is picked",
+      [type(c).__name__ for c in rel.children], ["BlockSlotSelect", "ReleaseBlockSelect"])
+rel.release_id = "20260823T1330-2"
+rel.build()
+check("release/picking one adds the confirm",
+      [type(c).__name__ for c in rel.children],
+      ["BlockSlotSelect", "ReleaseBlockSelect", "ReleaseConfirmButton"])
+check("release/the confirm is a danger button",
+      rel.children[2].style, discord.ButtonStyle.danger)
+check("release/the pick stays visible in the dropdown",
+      [o.value for o in rel.children[1].options if o.default], ["20260823T1330-2"])
+check_true("release/the prompt names the block being released",
+           "Robin Vale" in rel.prompt() or "LTC" in rel.prompt())
+check_true("release/…and warns the channel gets told", "channel" in rel.prompt())
+# A stale pick (someone else released it first) must not leave a live confirm —
+# with other blocks still listed, so the confirm is dropped on the PICK being gone
+# rather than on the menu being empty.
+other = dict(held_block, id="20260823T1330-9", name="Ann Lee")
+rel.blocks = [other]
+rel.build()
+check("release/a vanished pick takes its confirm with it, menu and all",
+      [type(c).__name__ for c in rel.children], ["BlockSlotSelect", "ReleaseBlockSelect"])
+check_true("release/…and the prompt stops naming it", "Releasing:" not in rel.prompt())
+rel.blocks = []
+rel.build()
+check("release/an empty menu renders neither control",
+      [type(c).__name__ for c in rel.children], ["BlockSlotSelect"])
+
+
+# The select's own callback records the pick and nothing else — no store write, no
+# channel note. Driven directly rather than inspected, because the whole bug was in
+# the callback.
+class _RelResponse:
+    def __init__(self):
+        self.edits = []
+
+    async def edit_message(self, **kwargs):
+        self.edits.append(kwargs)
+
+
+class _RelInteraction:
+    def __init__(self):
+        self.response = _RelResponse()
+        self.user = type("U", (), {"id": 7, "display_name": "Robin Vale"})()
+        self.channel = None
+
+
+def _touch_release_select():
+    botmod._block_state = bs.empty_state()
+    botmod.BLOCK_STORE_PATH = "/tmp/test_blocks_release.json"
+    botmod.now_club = lambda: NOW
+    placed = bs.add(botmod._block_state, start=SUN, end=datetime(2026, 8, 23, 16, 0),
+                    sheets=2, user_id=7, name="Robin Vale", reason="LTC", now=NOW)
+    flow = botmod.BlockFlowView(1, rows, bs.active(botmod._block_state))
+    sel = next(c for c in flow.children if type(c).__name__ == "ReleaseBlockSelect")
+    sel._values = [placed["id"]]          # what Discord hands a select on touch
+    asyncio.run(sel.callback(_RelInteraction()))
+    return flow, placed
+
+
+def _press_release_twice():
+    """An impatient double-tap must release once and answer once, and must not
+    repaint the menu with "that block was already gone" — a baffling reply to a
+    click the member only meant to make once. The second press is aimed at the
+    button the FIRST press is still in the middle of replacing, which is exactly
+    what a tap landing before the edit does."""
+    botmod._block_state = bs.empty_state()
+    botmod.BLOCK_STORE_PATH = "/tmp/test_blocks_release2.json"
+    botmod.now_club = lambda: NOW
+    announced = []
+
+    async def fake_publish(interaction, weeks, note):
+        announced.append(note)
+
+    placed = bs.add(botmod._block_state, start=SUN, end=datetime(2026, 8, 23, 16, 0),
+                    sheets=2, user_id=7, name="Robin Vale", reason="LTC", now=NOW)
+    flow = botmod.BlockFlowView(1, rows, bs.active(botmod._block_state))
+    flow.release_id = placed["id"]
+    flow.build()
+    btn = next(c for c in flow.children if type(c).__name__ == "ReleaseConfirmButton")
+    it = _RelInteraction()
+    saved = botmod._publish_block_change
+    botmod._publish_block_change = fake_publish
+    try:
+        asyncio.run(btn.callback(it))
+        btn._view = flow            # the rebuild detached it; the member's finger didn't
+        asyncio.run(btn.callback(it))   # the double-tap
+    finally:
+        botmod._publish_block_change = saved
+    return flow, it, announced
+
+
+twice, twice_it, announced = _press_release_twice()
+check("release/a double-tap releases once", len(bs.active(botmod._block_state)), 0)
+check("release/…announces once", len(announced), 1)
+check("release/…and acks both, so neither tap fails", len(twice_it.response.edits), 2)
+check_true("release/…without telling them it was already gone",
+           "already gone" not in twice.status)
+
+
+
+# …and the same double-tap with another member's release in flight, which is the
+# only way two presses both get past the release_id clear. There's no debounce on
+# this path — releasing by id is idempotent, so the second press gets nothing back
+# and falls out without re-announcing. This is the test that says so.
+async def _contended_double_release():
+    botmod._block_state = bs.empty_state()
+    botmod.BLOCK_STORE_PATH = "/tmp/test_blocks_release3.json"
+    botmod.now_club = lambda: NOW
+    notes = []
+
+    async def fake_publish(interaction, weeks, note):
+        notes.append(note)
+
+    placed = bs.add(botmod._block_state, start=SUN, end=datetime(2026, 8, 23, 16, 0),
+                    sheets=2, user_id=7, name="Robin Vale", reason="LTC", now=NOW)
+    flow = botmod.BlockFlowView(1, rows, bs.active(botmod._block_state))
+    flow.release_id = placed["id"]
+    flow.build()
+    btn = next(c for c in flow.children if type(c).__name__ == "ReleaseConfirmButton")
+    a, b = _RelInteraction(), _RelInteraction()
+    saved = botmod._publish_block_change
+    botmod._publish_block_change = fake_publish
+    try:
+        async with botmod._block_lock:      # somebody else is mid-release
+            t1 = asyncio.create_task(btn.callback(a))
+            t2 = asyncio.create_task(btn.callback(b))
+            await asyncio.sleep(0)          # both reach the lock and queue on it
+            await asyncio.sleep(0)
+        await asyncio.gather(t1, t2)
+    finally:
+        botmod._publish_block_change = saved
+    return flow, notes, a, b
+
+
+raced, race_notes, a, b = asyncio.run(_contended_double_release())
+check("release/a contended double-tap releases once", len(bs.active(botmod._block_state)), 0)
+check("release/…and announces once", len(race_notes), 1)
+check("release/…while both taps are acked", len(a.response.edits) + len(b.response.edits), 2)
+
+
+touched, placed = _touch_release_select()
+check("release/touching the dropdown releases nothing",
+      bs.get(botmod._block_state, placed["id"]) is not None, True)
+check("release/…it only records the pick", touched.release_id, placed["id"])
+check("release/…and the sheets are still held",
+      len(bs.active(botmod._block_state)), 1)
+
+
 # A timed-out picker must stay dead: rebuilding it would put fresh ENABLED
 # controls on a message Discord no longer routes — the exact dead-but-live-looking
 # menu on_timeout exists to prevent. (A modal has no timeout of its own, so a slow
