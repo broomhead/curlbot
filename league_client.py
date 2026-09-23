@@ -16,6 +16,7 @@ So this client:
          Date + time come straight from the header; a draw is upcoming when its
          date >= today (club timezone). Played draws are in the past.
          Sheets used per draw = count("Sheet X") - count("Sheet X is open").
+         A team with no game that draw is listed as "<Team> - On Bye" (`byes`).
 
 Returns, per league: teams, day, time, ended, and a list of draws (with an
 `upcoming` flag and `sheets_used`).
@@ -120,6 +121,8 @@ _DRAW_RE = re.compile(
 )
 _SHEET_RE = re.compile(r"Sheet [A-Z]\b", re.IGNORECASE)
 _SHEET_OPEN_RE = re.compile(r"Sheet [A-Z]\s+is open", re.IGNORECASE)
+# "Ashby - On Bye" — the tail DataBowl appends to the team sitting a draw out.
+_BYE_TAIL_RE = re.compile(r"\s*[-\u2013\u2014]?\s*on\s+bye\s*$", re.IGNORECASE)
 
 
 def _now_club() -> datetime:
@@ -201,6 +204,19 @@ def _prose_start_time(text: str) -> str | None:
     return f"{h12 or 12}:{minute:02d} {mer}m"
 
 
+def _draw_byes(heading) -> list[str]:
+    """Teams sitting this draw out. With an odd number of teams (or more teams
+    than sheets) somebody has no game each week, and DataBowl renders them in the
+    draw heading as <div class="bye">Team - On Bye</div>. A list, because a league
+    with fewer sheets than games has more than one bye in a week."""
+    out: list[str] = []
+    for el in heading.select(".bye"):
+        name = _BYE_TAIL_RE.sub("", " ".join(el.get_text(" ", strip=True).split()))
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
 def parse_league_html(html: str) -> dict[str, Any]:
     """Parse a league page's HTML into structured league info."""
     soup = BeautifulSoup(html, "html.parser")
@@ -213,16 +229,22 @@ def parse_league_html(html: str) -> dict[str, Any]:
     for table in soup.find_all("table"):
         head = table.get_text(" ", strip=True).lower()
         if "team name" in head or "win %" in head:
-            rows = table.find_all("tr")
-            data_rows = [
-                r for r in rows
-                if r.find_all("td") and not r.find_all("th")
-            ]
+            # A data row is any row with at least one <td>; the header row is all
+            # <th>. Don't require a row to be free of <th>: the site marks each
+            # team's own cell <th scope="row" class="standing-teams">, and reading
+            # a th as "this is a header row" silently emptied every roster.
+            data_rows = [r for r in table.find_all("tr") if r.find("td")]
             teams = len(data_rows)
             for r in data_rows:
-                cells = r.find_all("td")
-                if len(cells) >= 2:
-                    team_names.append(cells[1].get_text(" ", strip=True))
+                named = r.find(class_="standing-teams")
+                if named is None:
+                    # Older markup: all cells are <td> and the name is the second.
+                    cells = r.find_all("td")
+                    named = cells[1] if len(cells) >= 2 else None
+                if named is not None:
+                    name = named.get_text(" ", strip=True)
+                    if name:
+                        team_names.append(name)
             break
 
     # ── Draws: the Schedule & Scores <h6> headers ────────────────────────────
@@ -231,6 +253,7 @@ def parse_league_html(html: str) -> dict[str, Any]:
     for h in soup.find_all(["h6", "h5"]):
         draw = _parse_draw_heading(h.get_text(" ", strip=True), today)
         if draw:
+            draw["byes"] = _draw_byes(h)
             draws.append(draw)
     draws.sort(key=lambda d: d["date"])
 

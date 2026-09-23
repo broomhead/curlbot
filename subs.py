@@ -442,9 +442,10 @@ def league_games(league: dict, now: datetime) -> list[dict]:
             # missing or unparseable. No club draws at midnight, so read that as
             # "time unknown" and use the league's start time instead — otherwise
             # the picker offers "12:00 AM" and the request expires a day early.
-            dt = datetime.combine(dd, _league_time(league) or time(0, 0))
+            dt = datetime.combine(dd, _league_time(league) or clock_time(0, 0))
         dt = dt.replace(second=0, microsecond=0)
-        out.append({"iso": dt.isoformat(), "label": fmt_when(dt.isoformat()), "dt": dt})
+        out.append({"iso": dt.isoformat(), "label": fmt_when(dt.isoformat()), "dt": dt,
+                    "byes": list(d.get("byes") or [])})
     out.sort(key=lambda g: g["dt"])
     seen, uniq = set(), []
     for g in out:
@@ -493,6 +494,69 @@ def projected_games(league: dict, now: datetime, *, start: date | None = None,
         out.append({"iso": dt.isoformat(), "label": fmt_when(dt.isoformat()),
                     "dt": dt, "projected": True, "time_known": time_known})
     return out
+
+
+# ── Byes ────────────────────────────────────────────────────────────────────
+# With an odd number of teams, one team has no game each draw. That team can't
+# need a sub that week, so its bye dates are never offered to it — and the bye is
+# shown on every date so everyone else can see who's sitting out (their players
+# are the obvious subs that night). Byes come only from a POSTED schedule:
+# projected dates have none, so an unscheduled league is never blocked.
+
+def _team_key(name: str) -> str:
+    return " ".join((name or "").split()).casefold()
+
+
+def on_bye(game: dict, team: str) -> bool:
+    """True when `team` sits out this game (an entry from league_games)."""
+    key = _team_key(team)
+    return bool(key) and any(_team_key(b) == key for b in game.get("byes") or [])
+
+
+def bye_dates(league: dict | None, team: str) -> set[date]:
+    """Every scheduled date `team` is on bye, from the league's posted draws."""
+    key = _team_key(team)
+    out: set[date] = set()
+    if not key or not league:
+        return out
+    for d in league.get("draws") or []:
+        if any(_team_key(b) == key for b in d.get("byes") or []):
+            try:
+                out.add(date.fromisoformat(d["date"]))
+            except (ValueError, KeyError, TypeError):
+                continue
+    return out
+
+
+def _iso_date(iso: str) -> date | None:
+    try:
+        return datetime.fromisoformat(iso).date()
+    except (ValueError, TypeError):
+        return None
+
+
+# A bye date is SHOWN, marked, and refused — never quietly missing. A date that
+# vanishes from the picker reads as a bug ("where's the 22nd?"); one that is there
+# and says "on bye" answers the question before it's asked. Discord can't disable a
+# single option, so the refusal is the flow's: ticking it changes nothing you can
+# post, and the prompt says why.
+BYE_EMOJI = "🛋️"
+BYE_HINT = "on bye — no game, no sub needed"
+
+
+def bye_note(team: str, isos: list[str], *, held_back: bool = False) -> str:
+    """'Ashby is on bye Tue 9/22 — no game that week, so it can't be posted.'
+    `held_back` is the set-team wording: those dates are already posted, so the
+    question there is whose spot they are, not whether to post them."""
+    if not isos:
+        return ""
+    many = len(isos) > 1
+    what = ("those dates" if many else "that date")
+    tail = (f"so {what} can't be {team}'s spot" if held_back
+            else f"so {what} can't be posted — untick "
+                 f"{'them' if many else 'it'}")
+    return (f"{BYE_EMOJI}  **{team}** is on bye {fmt_run(sorted(isos))} — no game "
+            f"that week, {tail}.")
 
 
 def league_is_over(league: dict, now: datetime) -> bool:
@@ -1502,17 +1566,30 @@ class GameSelect(discord.ui.Select):
     in front of a requester the moment the need-a-sub flow went multi-select."""
 
     def __init__(self, games: list[dict], selected_isos, *, multi: bool, row: int = 2,
-                 placeholder: str | None = None):
+                 placeholder: str | None = None, bye_team: str = ""):
         self.multi = multi
         # Real draws, plus the league's own upcoming nights where the schedule
         # doesn't reach yet (flagged in the description so nobody mistakes a
         # projected night for a posted one). Still a pick-list, never free text:
         # every option is a real league night at the league's start time.
+        def describe(g: dict) -> str | None:
+            if on_bye(g, bye_team):
+                # Their OWN bye: say what it means for them, not who else is out.
+                return _truncate(f"{bye_team} {BYE_HINT}", 100)
+            if g.get("projected"):
+                return "not on the schedule yet"
+            if g.get("byes"):
+                return _truncate("On bye: " + ", ".join(g["byes"]), 100)
+            return None
+
         opts = _unique_options([
             discord.SelectOption(
                 label=_truncate(g["label"], 100),
                 value=g["iso"],
-                description=("not on the schedule yet" if g.get("projected") else None),
+                description=describe(g),
+                # The one visual cue Discord gives a single option. It marks the
+                # date the caller can't post, so it can't be mistaken for missing.
+                emoji=(BYE_EMOJI if on_bye(g, bye_team) else None),
                 default=(g["iso"] in (selected_isos or [])),
             )
             for g in games[:25]
@@ -1604,13 +1681,25 @@ class NeedSubFlowView(discord.ui.View):
         self.game_isos = []
 
     def games(self) -> list[dict]:
+        """Every league date, byes included — a date that simply disappeared from the
+        picker reads as a bug. The chosen team's byes are marked in the select and
+        refused by dates()."""
         lg = self.league()
         return game_options(lg, club_now()) if lg else []
 
+    def bye_isos(self) -> list[str]:
+        """The chosen team's bye dates among the ones on offer."""
+        return [g["iso"] for g in self.games() if on_bye(g, self.team or "")]
+
+    def ticked_byes(self) -> list[str]:
+        """Bye dates they actually ticked — what the prompt has to explain."""
+        byes = set(self.bye_isos())
+        return sorted(iso for iso in set(self.game_isos) if iso in byes)
+
     def dates(self) -> list[str]:
-        """Exactly the dates ticked — nothing is inferred or extended. Whoever posts
-        chooses each date on purpose."""
-        return sorted(set(self.game_isos))
+        """What would be posted: the ticked dates, minus any that are the chosen
+        team's bye. They have no game that week, so there is no spot to fill."""
+        return sorted(set(self.game_isos) - set(self.bye_isos()))
 
     def existing(self) -> dict | None:
         """The open request this post would collide with. Only meaningful for a single
@@ -1651,7 +1740,8 @@ class NeedSubFlowView(discord.ui.View):
             # Multi-select: ticking several dates posts each one as its own request.
             self.add_item(GameSelect(
                 self.games(), self.game_isos, multi=True, row=2,
-                placeholder="Which date — tick as many as you need…"))
+                placeholder="Which date — tick as many as you need…",
+                bye_team=self.team or ""))
             ex = self.existing()
             shown = self.spots
             if ex is not None and not self.spots_touched:
@@ -1678,6 +1768,8 @@ class NeedSubFlowView(discord.ui.View):
         parts.append(f"When: **{fmt_run(d)}**" if d else "When: **not set**")
         parts.append(f"Spots: **{self.spots}**" + (" a date" if len(d) > 1 else ""))
         head = "**Need a sub** — " + " · ".join(parts)
+        if self.team and (note := bye_note(self.team, self.ticked_byes())):
+            head += "\n" + note
 
         if ex is not None:
             cov = store.covered(ex)
@@ -2448,15 +2540,33 @@ class SetTeamView(discord.ui.View):
     def teams(self) -> list[str]:
         return (self.league or {}).get("team_names") or []
 
+    def on_bye(self) -> list[dict]:
+        """Pending dates the chosen team is on bye — it has no game those weeks, so
+        these can't be its spot and are held back from the team being set."""
+        byes = bye_dates(self.league, self.team or "")
+        return [r for r in self.pending() if _iso_date(r.get("game_ts", "")) in byes]
+
+    def offered(self) -> list[dict]:
+        """Every pending date stays listed, byes included — see GameSelect: a date
+        that vanishes reads as a bug. The bye ones are marked and refused instead."""
+        return self.pending()
+
+    def chosen(self) -> list[str]:
+        """The ticked dates the team can actually go on."""
+        held = {r["id"] for r in self.on_bye()}
+        return [rid for rid in self.rids if rid not in held]
+
     def build(self) -> "SetTeamView":
         self.clear_items()
-        ps = self.pending()
+        ps = self.offered()
+        held = {r["id"] for r in self.on_bye()}
         if ps and self.teams():
             self.add_item(TeamSelect(self.teams(), self.team, row=0))
-            self.add_item(NightSelect(ps, self.rids, row=1,
-                                      placeholder="Which of your dates\u2026",
-                                      description_of=lambda r: f"{store.open_spots(r)} open"))
-            self.add_item(SetTeamSubmit(self.team, len(self.rids), row=2))
+            self.add_item(NightSelect(
+                ps, self.rids, row=1, placeholder="Which of your dates\u2026",
+                description_of=lambda r: (f"{self.team} {BYE_HINT}" if r["id"] in held
+                                          else f"{store.open_spots(r)} open")))
+            self.add_item(SetTeamSubmit(self.team, len(self.chosen()), row=2))
         return self
 
     def prompt(self) -> str:
@@ -2470,7 +2580,13 @@ class SetTeamView(discord.ui.View):
                 f"{fmt_run([r['game_ts'] for r in ps])}.\n")
         if not self.team:
             return head + "Pick the team the spot is on. All your dates are ticked \u2014 untick any that are a different team and do those after."
-        return head + f"Press the button to put **{self.team}** on the ticked dates."
+        note = bye_note(self.team, [r["game_ts"] for r in self.on_bye()], held_back=True)
+        if not self.chosen():
+            return head + note + ("\n" if note else "") + (
+                "Tick a date this team actually plays, or pick another team."
+                if note else "Tick the dates to put this team on.")
+        return (head + (note + "\n" if note else "")
+                + f"Press the button to put **{self.team}** on the ticked dates.")
 
     async def refresh(self, interaction: discord.Interaction):
         await interaction.response.edit_message(content=self.prompt(), view=self.build())
@@ -2489,10 +2605,10 @@ class SetTeamSubmit(discord.ui.Button):
         view: "SetTeamView" = self.view
         cog: "Subs" = interaction.client.get_cog("Subs")
         if cog._is_repeat_click(cog._click_cooldown,
-                                ("setteam", interaction.user.id, tuple(sorted(view.rids)))):
+                                ("setteam", interaction.user.id, tuple(sorted(view.chosen())))):
             return
         done, clashes, assigned = await cog.set_team_for(
-            interaction.user, view.rids, view.team, channel=interaction.channel)
+            interaction.user, view.chosen(), view.team, channel=interaction.channel)
         if not done:
             await interaction.edit_original_response(
                 content="Nothing changed \u2014 those requests already have a team, or have "
