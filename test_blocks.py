@@ -766,6 +766,54 @@ check("streak/...and is flagged tied",
       ps.streak_rank(rank_state, 0, datetime(2026, 8, 20, 10, 0))[2], True)
 
 
+# The sign-up ping ranks among streaks still GOING. A long run that has broken is on
+# the all-time board, not the current one, and must not push a live streak down.
+def _weeks(last: int, n: int) -> list[str]:
+    return [f"2026-W{last - k:02d}" for k in range(n)][::-1]
+
+ping_now = datetime(2026, 9, 25, 12, 0)          # Friday of W39
+ping = ps.empty_state()
+ping["attendance"] = {
+    "1": {"name": "Robin Vale", "weeks": _weeks(37, 7)},   # 7 weeks, missed W38: broken
+    "2": {"name": "Alex Reed", "weeks": _weeks(38, 2)},    # W37+W38: 2 and live
+    "3": {"name": "Bo Brooks", "weeks": _weeks(38, 1)},
+}
+check("ping/broken run isn't active", ps.current_streak(ping, 1, ping_now), 0)
+check("ping/live 2 ranks first among current", ps.streak_rank(ping, 2, ping_now)[0], 1)
+note = botmod.streak_signup_note(ping, 2, ping_now)
+check_true("ping/says longest active streak",
+           "the longest active streak in the club!" in note)
+check_true("ping/a 1-week streak gets no note",
+           botmod.streak_signup_note(ping, 3, ping_now) == "")
+check_true("ping/no note for a broken streak",
+           botmod.streak_signup_note(ping, 1, ping_now) == "")
+
+# All-time top three gets its own sentence. Records: 7 (broken), 5, 4, 3.
+rec = ps.empty_state()
+rec["attendance"] = {
+    "1": {"name": "Robin Vale", "weeks": _weeks(30, 7)},
+    "2": {"name": "Ann Lee", "weeks": _weeks(30, 5)},
+    "3": {"name": "Cy Cole", "weeks": _weeks(38, 4)},      # live 4: 3rd best ever
+    "4": {"name": "Dee Dunn", "weeks": _weeks(38, 3)},     # live 3: 4th ever
+}
+check("ever/live 4 is 3rd all time", ps.all_time_rank(rec, 3, ping_now), (3, False))
+n4 = botmod.streak_signup_note(rec, 3, ping_now)
+check_true("ever/top-3 streak is called out", "3rd longest streak in club history" in n4)
+check_true("ever/...alongside its current place", "the longest active streak" in n4)
+check_true("ever/4th all time isn't called out",
+           "history" not in botmod.streak_signup_note(rec, 4, ping_now))
+check("ever/no active streak ranks 0", ps.all_time_rank(rec, 1, ping_now), (0, False))
+# A live streak past every record is a new club record; level with one ties it.
+rec["attendance"]["5"] = {"name": "Eve Ebb", "weeks": _weeks(38, 8)}
+check_true("ever/new record", "new all-time club record" in
+           botmod.streak_signup_note(rec, 5, ping_now))
+rec["attendance"]["5"]["weeks"] = _weeks(38, 7)
+check_true("ever/ties the record", "ties the all-time club record" in
+           botmod.streak_signup_note(rec, 5, ping_now))
+# A past run of your own that beat this one still counts above it.
+rec["attendance"]["6"] = {"name": "Fay Fox", "weeks": _weeks(20, 6) + _weeks(38, 2)}
+check("ever/own older record sits above", ps.all_time_rank(rec, 6, ping_now)[0], 6)
+
 # ── 6. Import hygiene (the class of bug that has actually shipped) ───────────
 # `from datetime import time` in subs.py once shadowed the stdlib time module and
 # broke every debounced button in production. Re-check it for every module here.

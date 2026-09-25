@@ -743,6 +743,34 @@ def _ordinal(n: int) -> str:
     return f"{n}{suffix}"
 
 
+def _place(rank: int, tied: bool) -> str:
+    """'the longest' / 'tied for the longest' / '2nd longest' / 'tied for 3rd longest'."""
+    what = "the longest" if rank == 1 else f"{_ordinal(rank)} longest"
+    return f"tied for {what}" if tied else what
+
+
+def streak_signup_note(state: dict, user_id: int, now: datetime) -> str:
+    """The streak half of the sign-up ping ('' below two weeks), with a leading space.
+
+    Ranked among streaks still GOING — a broken run, however long, doesn't outrank
+    someone on a live one; the all-time records are for the stats board. The one
+    exception is a streak that's itself in the all-time top three: that's worth
+    saying out loud, so it gets a second sentence."""
+    streak = ps.current_streak(state, user_id, now)
+    if streak <= 1:
+        return ""
+    rank, _total, tied = ps.streak_rank(state, user_id, now)
+    note = (f" That's a **{streak}-week** practice streak — "
+            f"{_place(rank, tied)} active streak in the club! 🔥")
+    ever, ever_tied = ps.all_time_rank(state, user_id, now)
+    if ever == 1:
+        note += (" It ties the all-time club record! 🏆" if ever_tied
+                 else " That's a new all-time club record! 🏆")
+    elif 1 < ever <= 3:
+        note += f" It's the {_place(ever, ever_tied)} streak in club history! 🏆"
+    return note
+
+
 # Embed fields die past 1024 characters, and a leaderboard line is unbounded (it
 # carries every name in a tied group). Leave room for the "…and N others" tail.
 STREAK_FIELD_BUDGET = 900
@@ -778,8 +806,9 @@ def _streak_rows(rows: list[dict], key: str, n: int = 5) -> str:
     the repetition: place is the group's position, so the group after a three-way
     tie for first is second, and gets 🥈.
 
-    That's dense ranking, and ps.streak_rank matches it — the "2nd longest in the
-    club" line on a sign-up has to agree with the board the member is looking at."""
+    That's dense ranking, and ps.streak_rank matches it — the "2nd longest active
+    streak in the club" line on a sign-up has to agree with the board the member is
+    looking at."""
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
     if not rows:
         return "—"
@@ -1014,11 +1043,7 @@ class JoinPracticeButton(discord.ui.DynamicItem[discord.ui.Button],
         # and club ranking if it's a real streak (> 1 week).
         if result == "joined" and interaction.channel is not None:
             note = f"**{interaction.user.display_name}** is in for **{label}** — {n} signed up."
-            streak = ps.current_streak(_practice_state, interaction.user.id, now_club())
-            if streak > 1:
-                rank, _total, tied = ps.streak_rank(_practice_state, interaction.user.id, now_club())
-                place = f"{'tied for ' if tied else ''}{_ordinal(rank)} longest in the club"
-                note += f" That's a **{streak}-week** practice streak — {place}! 🔥"
+            note += streak_signup_note(_practice_state, interaction.user.id, now_club())
             try:
                 await interaction.channel.send(
                     note, allowed_mentions=discord.AllowedMentions.none())

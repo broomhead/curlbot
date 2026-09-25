@@ -403,8 +403,8 @@ def streak_rank(state: dict, user_id: int, now: datetime) -> tuple[int, int, boo
     DENSE ranking — the rank counts distinct streak LENGTHS above this one, not
     people. So the group below a three-way tie for first is 2nd, not 4th. This has
     to match how the leaderboard groups its lines (bot._streak_rows), because the
-    sign-up ping says "2nd longest in the club" about the very board the member is
-    about to look at; counting people made the two disagree."""
+    sign-up ping says "2nd longest active streak in the club" about the very board
+    the member is about to look at; counting people made the two disagree."""
     lb = streak_leaderboard(state, now)
     me = next((e for e in lb if e["user_id"] == user_id), None)
     if me is None:
@@ -412,6 +412,25 @@ def streak_rank(state: dict, user_id: int, now: datetime) -> tuple[int, int, boo
     higher = len({e["streak"] for e in lb if e["streak"] > me["streak"]})
     tied = sum(1 for e in lb if e["streak"] == me["streak"]) > 1
     return (higher + 1, len(lb), tied)
+
+
+def all_time_rank(state: dict, user_id: int, now: datetime) -> tuple[int, bool]:
+    """(rank, tied) of the user's CURRENT streak against the all-time records board;
+    rank 0 means no active streak.
+
+    The sign-up ping ranks you among streaks that are still going (streak_rank) —
+    that's the everyday comparison. This is the rarer one: whether the run you're on
+    right now stands among the club's best ever. Dense, like the boards: the rank
+    counts distinct record lengths longer than this streak. The member's own record
+    counts as "longer" when it's a past run that beat this one; `tied` means someone
+    ELSE's record is exactly this long."""
+    current = current_streak(state, user_id, now)
+    if current < 1:
+        return (0, False)
+    records = all_time_leaderboard(state)
+    higher = len({e["best"] for e in records if e["best"] > current})
+    tied = any(e["best"] == current for e in records if e["user_id"] != user_id)
+    return (higher + 1, tied)
 
 
 def expire(state: dict, now: datetime, grace_hours: int = DEFAULT_GRACE_HOURS) -> list[str]:
