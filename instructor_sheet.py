@@ -24,7 +24,7 @@ from __future__ import annotations
 import csv
 import io
 import logging
-
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -42,17 +42,23 @@ TIMEOUT = aiohttp.ClientTimeout(total=20)
 
 # Staffing comes from SHEETS OF ICE, not from a headcount ratio: ice.py turns
 # attendees into sheets (the same call /sheets uses for an LTC), and then two
-# instructors per sheet is the target while the club can stretch below it
-# ("3 instructors for 2 sheets, or 3 across 3"). So each event has two
-# thresholds rather than one number:
+# instructors per sheet is the target while the club can stretch below it. So
+# each event has three thresholds rather than one number:
 #
-#     ideal   = 2 per sheet   <- what the board asks toward
-#     minimum = 1 per sheet   <- below this the event is genuinely stuck
+#     ideal    = 2 per sheet     <- what the board asks toward
+#     workable = 1.5 per sheet   <- the event runs fine here; nobody is chased
+#     minimum  = 1 per sheet     <- below this the event is genuinely stuck
 #
-# Between the two it's workable but short, which is where those stretch cases
-# land. An "Instructors Needed" column in the sheet, if one is ever added,
-# overrides the ideal for that event.
+# Workable is the line that matters day to day. An event one instructor short
+# of ideal on two or three sheets (3 of 4, 5 of 6), or two short on a full rink
+# (6 of 8), goes ahead without anyone being asked twice. Under that average it
+# is a real ask: 2 of 4 is one instructor alone on each sheet. The board colours
+# on this line; the minimum is kept for callers that want the hard floor.
+#
+# An "Instructors Needed" column in the sheet, if one is ever added, overrides
+# the ideal for that event, and the workable line scales with it.
 INSTRUCTORS_PER_SHEET = int(os.environ.get("INSTRUCTORS_PER_SHEET", "2"))
+OK_INSTRUCTORS_PER_SHEET = float(os.environ.get("OK_INSTRUCTORS_PER_SHEET", "1.5"))
 MIN_INSTRUCTORS_PER_SHEET = int(os.environ.get("MIN_INSTRUCTORS_PER_SHEET", "1"))
 # How far ahead to look.
 HORIZON_DAYS = int(os.environ.get("HORIZON_DAYS", "60"))
@@ -127,6 +133,27 @@ class Event:
         """How many below the ideal. Zero once the event is fully staffed."""
         n = self.needed
         return 0 if n is None else max(0, n - self.filled)
+
+    @property
+    def workable(self) -> int | None:
+        """The fewest instructors the event runs comfortably with: an average
+        of OK_INSTRUCTORS_PER_SHEET, rounded up to whole people. Worked out from
+        `needed` rather than from the sheet count so an overridden target gets
+        the same proportional slack. Never above the target itself."""
+        n = self.needed
+        if n is None:
+            return None
+        share = OK_INSTRUCTORS_PER_SHEET / max(1, INSTRUCTORS_PER_SHEET)
+        # The epsilon keeps a float product like 2.0000000000000004 from
+        # rounding up to a whole extra person.
+        return max(0, min(n, math.ceil(n * share - 1e-9)))
+
+    @property
+    def understaffed(self) -> bool:
+        """Short by more than the event can absorb. False when it is merely
+        under target, and when there is no target to be under."""
+        w = self.workable
+        return w is not None and self.filled < w
 
     @property
     def critical(self) -> bool:

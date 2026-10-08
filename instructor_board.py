@@ -1,23 +1,39 @@
 """
 Renders the instructor board as the description of one Discord embed.
 
-Grouped by URGENCY, not by how short an event is. An LTC eleven days out with
-half its instructors is a problem someone has to solve this week; the same gap
-in October is not, and a board that shouts about both teaches people to ignore
-it. So events split at URGENT_DAYS (14) into "needs instructors now" and
-"coming up later", each with a traffic light on its heading, the same
-red/amber/green the subs and practice boards use.
+One chronological list with a traffic light per EVENT, not one per board. Each
+event is in one of three states, the same red/amber/green the subs and practice
+boards use:
 
-Inside a group it is one chronological table: date, event, time, and how many
-instructors are signed up against how many are wanted, with the names on the
-lines beneath each row. Discord has no markdown tables, so each goes in a fenced
-code block, which renders monospace and lets the columns line up. That costs
-bold/italic inside the block (they don't render in code) and gains a table you
-can actually scan. The lights live on the headings, OUTSIDE the block, because
-an emoji inside a code block is not one monospace cell wide and would shove the
-columns of its own row out of line. A long name list is wrapped here rather than
-left to Discord, which would start the continuation hard against the left margin
-where it reads as another row.
+    red     short by more than it can absorb, and close enough to hurt
+    amber   under target, but workable as it stands or still far enough out
+    green   fully staffed (or no target to measure against)
+
+It takes both things to make an event red. Severity: a two sheet event with
+three of its four instructors runs fine and nobody is chased over it, so it is
+amber; the same event with two is a real ask (see `Event.workable`). Proximity:
+a thin event eleven days out is a problem someone has to solve this week; the
+same gap two months out is not (URGENT_DAYS, 14). A board that shouts about
+both teaches people to ignore it.
+
+The list is never reordered by state. Consecutive events in the same state
+share one heading and one code block, and a change of state starts the next, so
+reading down the board is still reading down the calendar and the lights say
+where to look. A fully staffed Saturday between two thin Thursdays gets its own
+green heading in between rather than being lumped in with either.
+
+Each block is rows of date, event, time, and how many instructors are signed up
+against how many are wanted, with the names on the lines beneath each row.
+Discord has no markdown tables, so the rows go in fenced code blocks, which
+render monospace and let the columns line up. Every block is laid out to the
+same column widths and only the first carries the header row, so together they
+read as one table with headings between the rows. That costs bold/italic inside
+the block (they don't render in code) and gains a table you can actually scan.
+The lights live on the headings, OUTSIDE the block, because an emoji inside a
+code block is not one monospace cell wide and would shove the columns of its
+own row out of line. A long name list is wrapped here rather than left to
+Discord, which would start the continuation hard against the left margin where
+it reads as another row.
 
 Two rules shape everything here:
 
@@ -28,7 +44,7 @@ Two rules shape everything here:
    "as of 09:00", would make every check look like a change and spam the channel
    twice a day. Depending on the date is deliberate and costs at most one extra
    post on the day an event crosses the 14 day line, which is exactly the day
-   people should see it move.
+   people should see it change colour.
 2. Club house style: no em dashes and no en dash ranges anywhere in member
    facing copy. Plain hyphens, commas and parentheses only.
 
@@ -52,15 +68,25 @@ BOARD_TITLE = "🥌  Instructor board"
 # How close an event has to be before a gap in it counts as urgent.
 URGENT_DAYS = int(os.environ.get("URGENT_DAYS", "14") or 14)
 
-# Traffic lights, same vocabulary as the subs and practice boards.
-LIGHT_NOW = "🔴"        # short of instructors, and close enough to hurt
-LIGHT_LATER = "🟡"      # short, but there is still time
-LIGHT_OK = "🟢"         # covered
+# The three states an event can be in. See `state`.
+RED, AMBER, GREEN = "red", "amber", "green"
 
-# Colour of the embed's bar. Red is reserved for the urgent window: a bare
-# October LTC is worth listing, not worth making the whole board look on fire.
-COLOR_SHORT = 0xE03A3A      # something inside URGENT_DAYS is short
-COLOR_UNDER = 0xE6A700      # only later events are short
+# Traffic lights, same vocabulary as the subs and practice boards.
+LIGHTS = {RED: "🔴", AMBER: "🟡", GREEN: "🟢"}
+# What each light says. One wording per state: amber covers both "one short but
+# it runs" and "short with weeks to go", and the row beneath says which.
+HEADINGS = {
+    RED: "Needs instructors now",
+    AMBER: "Could use more, not urgent",
+    GREEN: "Fully staffed",
+}
+
+# Colour of the embed's bar: the worst state on the board. Red is reserved for
+# an event that is both close and properly short; one instructor under target,
+# or an empty LTC two months out, is worth listing and not worth making the
+# whole board look on fire.
+COLOR_SHORT = 0xE03A3A      # at least one red event
+COLOR_UNDER = 0xE6A700      # no red, at least one amber
 COLOR_OK = 0x2FA84F         # everything covered
 
 # Discord's hard cap on an embed description. A row plus its names runs 120 to
@@ -84,6 +110,34 @@ def is_urgent(event: Event, today: date) -> bool:
     """Inside the window we actually chase people for. Something already past
     (the sheet is hand-maintained, it happens) counts as urgent, not as calm."""
     return (event.date - today).days <= URGENT_DAYS
+
+
+def state(event: Event, today: date) -> str:
+    """RED, AMBER or GREEN for one event.
+
+    Green is at target. Red needs BOTH halves: short by more than the event can
+    absorb, and inside the window anyone is chased for. Everything else under
+    target is amber, which covers the event that is one down and will run fine
+    today as well as the empty one that is still weeks away."""
+    if event.short_by == 0:
+        return GREEN
+    if event.understaffed and is_urgent(event, today):
+        return RED
+    return AMBER
+
+
+def runs(events: list[Event], today: date) -> list[tuple[str, list[Event]]]:
+    """The events in the order given, cut wherever the state changes:
+    [(state, [events]), ...]. Nothing is moved, so a state can come up more
+    than once and each time gets its own group."""
+    out: list[tuple[str, list[Event]]] = []
+    for event in events:
+        s = state(event, today)
+        if out and out[-1][0] == s:
+            out[-1][1].append(event)
+        else:
+            out.append((s, [event]))
+    return out
 
 
 def fmt_date_short(d: date) -> str:
@@ -141,39 +195,44 @@ def wrap_names(names: str, width: int) -> list[str]:
     return [f"{NAME_INDENT}{line}" for line in lines]
 
 
-def _table(events: list[Event]) -> str:
-    rows = [[fmt_date_short(e.date), fmt_event(e), fmt_time(e), fmt_staffing(e)]
-            for e in events]
-    widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(HEADERS)]
+def _cells(event: Event) -> list[str]:
+    return [fmt_date_short(event.date), fmt_event(event), fmt_time(event),
+            fmt_staffing(event)]
 
-    def line(cells: list[str]) -> str:
-        # Last column isn't padded, so no trailing whitespace in the block.
-        return "  ".join(c.ljust(w) for c, w in zip(cells[:-1], widths[:-1])) + "  " + cells[-1]
 
-    out = [line(list(HEADERS)), line(["-" * w for w in widths])]
-    width = max([NAME_WRAP] + [len(l) for l in out])
-    for event, row in zip(events, rows):
-        out.append(line(row))
+def _widths(events: list[Event]) -> list[int]:
+    """Column widths for the WHOLE board, so every block lines up with the
+    others however the events are split between them."""
+    rows = [_cells(e) for e in events]
+    return [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(HEADERS)]
+
+
+def _line(cells: list[str], widths: list[int]) -> str:
+    # Last column isn't padded, so no trailing whitespace in the block.
+    return "  ".join(c.ljust(w) for c, w in zip(cells[:-1], widths[:-1])) + "  " + cells[-1]
+
+
+def _table(events: list[Event], widths: list[int], *, header: bool) -> str:
+    """One block's rows, each followed by its names. `header` puts the column
+    titles on top; only the first block on a board gets them."""
+    rule = _line(["-" * w for w in widths], widths)
+    out = [_line(list(HEADERS), widths), rule] if header else []
+    # The rule is the widest line the table can have, and it is the same for
+    # every block, so names wrap at the same place all the way down.
+    width = max(NAME_WRAP, len(rule))
+    for event in events:
+        out.append(_line(_cells(event), widths))
         out.extend(wrap_names(fmt_names(event), width))
     return "\n".join(out)
 
 
-def split_by_urgency(events: list[Event], today: date) -> tuple[list[Event], list[Event]]:
-    """(needs help now, coming up later). Both keep the sheet's date order."""
-    return ([e for e in events if is_urgent(e, today)],
-            [e for e in events if not is_urgent(e, today)])
-
-
 def color(events: list[Event], today: date | None = None) -> int:
-    """Embed bar colour: red only when something inside the urgent window is
-    short, amber when the only gaps are further out, green when nothing is
-    short. Proximity, not severity: a below-floor event in October is a yellow
-    board, because nobody needs to drop what they're doing today over it."""
+    """Embed bar colour: the worst state of any event on the board."""
     today = today or date.today()
-    near, later = split_by_urgency(events, today)
-    if any(e.short_by > 0 for e in near):
+    states = {state(e, today) for e in events}
+    if RED in states:
         return COLOR_SHORT
-    if any(e.short_by > 0 for e in later):
+    if AMBER in states:
         return COLOR_UNDER
     return COLOR_OK
 
@@ -194,31 +253,24 @@ def _plural(n: int, one: str, many: str) -> str:
     return one if n == 1 else many
 
 
-def _headline(near: list[Event], later: list[Event]) -> str:
+def _headline(events: list[Event], today: date) -> str:
     """The one line someone reads if they read nothing else. It counts only the
-    urgent gaps, so a quiet fortnight says so even with October wide open."""
-    near_short = [e for e in near if e.short_by > 0]
-    later_short = [e for e in later if e.short_by > 0]
-    if near_short:
-        n = len(near_short)
+    red events, so a board of near misses and far-off gaps says nothing is
+    urgent."""
+    states = [state(e, today) for e in events]
+    n = states.count(RED)
+    if n:
         return (f"**{n} {_plural(n, 'event', 'events')} in the next {URGENT_DAYS} days "
                 f"{_plural(n, 'needs', 'need')} instructors.**")
-    if later_short:
-        n = len(later_short)
-        return (f"**Nothing urgent. {n} later {_plural(n, 'event', 'events')} "
-                f"{_plural(n, 'is', 'are')} still short.**")
+    n = states.count(AMBER)
+    if n:
+        return (f"**Nothing urgent. {n} {_plural(n, 'event', 'events')} could use "
+                f"more instructors.**")
     return "**Every event is fully staffed.**"
 
 
-def _heading(events: list[Event], *, urgent: bool) -> str:
-    short = any(e.short_by > 0 for e in events)
-    if urgent:
-        if short:
-            return f"{LIGHT_NOW}  **Needs instructors now (next {URGENT_DAYS} days)**"
-        return f"{LIGHT_OK}  **Next {URGENT_DAYS} days, fully staffed**"
-    if short:
-        return f"{LIGHT_LATER}  **Coming up later**"
-    return f"{LIGHT_OK}  **Coming up later, fully staffed**"
+def _heading(s: str) -> str:
+    return f"{LIGHTS[s]}  **{HEADINGS[s]}**"
 
 
 def _render(all_events: list[Event], shown: int, today: date) -> str:
@@ -226,12 +278,11 @@ def _render(all_events: list[Event], shown: int, today: date) -> str:
         return "No events on the sheet for the next few weeks."
 
     events, dropped = all_events[:shown], len(all_events) - shown
-    near, later = split_by_urgency(events, today)
+    widths = _widths(events)
 
-    parts = [_headline(near, later)]
-    for group, urgent in ((near, True), (later, False)):
-        if group:
-            parts += ["", _heading(group, urgent=urgent), "```", _table(group), "```"]
+    parts = [_headline(events, today)]
+    for i, (s, group) in enumerate(runs(events, today)):
+        parts += ["", _heading(s), "```", _table(group, widths, header=i == 0), "```"]
 
     if dropped:
         parts.append(f"Showing the next {len(events)}; {dropped} further "
@@ -253,15 +304,13 @@ def _default_footer() -> str:
 
 
 def summary_line(events: list[Event], today: date | None = None) -> str:
-    """One line for logs and for the slash command's private reply. Leads with
-    the urgent count, same as the board does."""
+    """One line for logs and for the slash command's private reply. Ends on
+    the urgent count, the same thing the board's headline leads with."""
     today = today or date.today()
     short = [e for e in events if e.short_by > 0]
     if not short:
         return f"{len(events)} upcoming events, all fully staffed"
-    urgent = [e for e in short if is_urgent(e, today)]
+    urgent = sum(1 for e in short if state(e, today) == RED)
     total = sum(e.short_by for e in short)
-    tail = (f", {len(urgent)} inside {URGENT_DAYS} days" if urgent
-            else f", none inside {URGENT_DAYS} days")
     return (f"{len(events)} upcoming events, {len(short)} under target "
-            f"({total} instructor slots to fill){tail}")
+            f"({total} instructor slots to fill), {urgent or 'none'} urgent")

@@ -368,8 +368,9 @@ All configuration is via environment variables (see `.env.example`):
 | `INSTRUCTOR_CHANNEL_ID` | Channel the instructor board posts to. Unset = feature off |
 | `SHEET_ID` | Google Sheet id for the instructor sheet |
 | `CHECK_TIMES` | Club-local instructor-board checks (default `09:00,16:00`) |
-| `URGENT_DAYS` | How close an event has to be to count as urgent (default `14`) |
+| `URGENT_DAYS` | How close a short event has to be before it can turn red (default `14`) |
 | `INSTRUCTORS_PER_SHEET` / `MIN_INSTRUCTORS_PER_SHEET` | Staffing target and floor (2 / 1) |
+| `OK_INSTRUCTORS_PER_SHEET` | Average an event runs fine on; below it, and close, is red (default `1.5`) |
 
 Sheet count is set via `NUM_SHEETS`. A few other site-specific constants live at
 the top of `bot.py` — `PEOPLE_PER_SHEET`, `PRICE_PER_PERSON`, `TIMEZONE_OFFSET`,
@@ -466,42 +467,56 @@ short. This posts the same ask into a Discord channel instead.
 
 ### What it posts
 
-Two groups, split by how close the event is, each a table in date order inside a
-code block so the columns line up (Discord has no markdown tables):
+One list in date order, with a traffic light per event. Consecutive events in
+the same state share a heading and a code block (Discord has no markdown tables,
+and a code block lets the columns line up); a change of state starts the next
+one. Nothing is reordered, so reading down the board is reading down the
+calendar:
 
-**2 events in the next 14 days need instructors.**
+**1 event in the next 14 days needs instructors.**
 
-🔴  **Needs instructors now (next 14 days)**
+🟡  **Could use more, not urgent**
 ```
-Date      Event    Time           Have/Need
---------  -------  -------------  ---------
-Tue 8/25  Private  12:30-2:45 pm  6/8
+Date       Event    Time           Have/Need
+---------  -------  -------------  ---------
+Tue 8/25   Private  12:30-2:45 pm  6/8
    Ann Adams, Bo Brooks, Cara Cole,
    Dev Diaz, Eve Ellis, Finn Ford
-Sat 8/29  Private  1:30-3:45 pm   1/6
+```
+
+🔴  **Needs instructors now**
+```
+Sat 8/29   Private  1:30-3:45 pm   1/6
    Ann Adams
 ```
 
-🟡  **Coming up later**
+🟡  **Could use more, not urgent**
 ```
-Date       Event  Time       Have/Need
----------  -----  ---------  ---------
-Sat 9/19   LTC    2-4:15 pm  1/8
+Sat 9/19   LTC      2-4:15 pm      1/8
    Bo Brooks
-Sat 10/17  LTC    2-4:15 pm  0/6
+Sat 10/17  LTC      2-4:15 pm      0/6
    nobody yet
 ```
 
-**Urgency is proximity, not severity.** An LTC eleven days out with half its
-instructors is this week's problem; the same gap in October is not, and a board
-that shouts about both teaches people to ignore it. The line is `URGENT_DAYS`
-(default 14). The traffic lights are the same red/amber/green the subs and
-practice boards use, and they sit on the headings rather than inside the code
-block, where an emoji is not one monospace cell wide and would shove that row's
-columns out of line. The embed's bar follows the same rule: red only when
-something inside the window is short, amber when the only gaps are further out,
-green when everything is covered. The headline counts the urgent asks only, so a
-quiet fortnight reads as "Nothing urgent" even with October wide open.
+**An event is red only when it is both properly short and close.** The lights
+are the same red/amber/green the subs and practice boards use:
+
+- 🔴 under the workable line (below) **and** inside `URGENT_DAYS` (default 14).
+  This is the only state anyone gets chased over.
+- 🟡 under target, but either workable as it stands (three instructors for two
+  sheets runs fine) or still more than `URGENT_DAYS` out.
+- 🟢 at target, or no target to measure against.
+
+So an event two down on a full rink sits amber the day before, and an LTC two
+months out with nobody on it sits amber too, and neither makes the board look
+on fire. A board that shouts about everything teaches people to ignore it.
+
+Every block is laid out to the same column widths and only the first carries
+the header row, so the blocks read as one table with headings between the rows.
+The lights sit on the headings rather than inside the code block, where an
+emoji is not one monospace cell wide and would shove that row's columns out of
+line. The embed's bar is the worst state on the board, and the headline counts
+the red events only, so a week of near misses reads as "Nothing urgent".
 
 A long name list is wrapped by the bot at whole names, every line indented, since
 Discord would otherwise put the continuation flush left where it reads as
@@ -516,20 +531,24 @@ From **sheets of ice**, using the same `ice.sheets_for_people()` that `/sheets`
 uses, so the two can never disagree:
 
 ```
-sheets = ceil(attendees / PEOPLE_PER_SHEET), capped at NUM_SHEETS
-target = INSTRUCTORS_PER_SHEET per sheet      (default 2)
-floor  = MIN_INSTRUCTORS_PER_SHEET per sheet  (default 1)
+sheets   = ceil(attendees / PEOPLE_PER_SHEET), capped at NUM_SHEETS
+target   = INSTRUCTORS_PER_SHEET per sheet                 (default 2)
+workable = OK_INSTRUCTORS_PER_SHEET per sheet, rounded up  (default 1.5)
+floor    = MIN_INSTRUCTORS_PER_SHEET per sheet             (default 1)
 ```
 
-Two per sheet is the goal; a club can stretch below it (three across two sheets,
-three across three), which is why there's a floor as well as a target.
+Two per sheet is the goal and what the Have/Need column counts toward. The
+workable line is what decides the colour: an event at or above it runs fine and
+is never red. At the default that allows one short on two or three sheets (3 of
+4, 5 of 6) and two short on four (6 of 8), and nothing on a single sheet. The
+floor is the hard minimum and is not used by the board.
 
 An event with no attendee count gets no target at all: its row shows just how
 many are signed up, rather than a shortfall invented from nothing. A name
 written as `Jane Doe (if needed)` is tentative, listed with that qualifier and not counted
 in the total, since counting a maybe would hide a real gap. Adding an
 **`Instructors Needed`** column to the sheet overrides the computed target per
-row; without one, everything works as-is.
+row, and the workable line scales with it; without one, everything works as-is.
 
 ### Setting it up
 
