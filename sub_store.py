@@ -17,6 +17,18 @@ The store is deliberately generic: every request carries a `kind` field (default
 "sub") so the same board machinery can later back pickup games, team-building,
 etc. without a schema change.
 
+Three more keys are a RECORD rather than board state, and nothing expires them
+(see "History" near the bottom):
+
+  history       — one row per person per game they subbed, written at the moment
+                  a played request is pruned. The requests list forgets a game as
+                  soon as it is over; this is the only memory of who covered it.
+  played        — per league slot, the dates that slot had a draw. Lets a streak
+                  tell "the league was off that week" from "you didn't sub".
+  league_slots  — league id -> the slot (the site's league category) it belongs
+                  to, so a new season's league counts toward the same totals as
+                  the last one.
+
 State shape:
   {
     "board": {"channel_id": int, "message_id": int} | null,
@@ -46,7 +58,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Iterable, Optional
 
 # How long after game start a request lingers before it's pruned. Covers a
@@ -69,7 +81,9 @@ def empty_state() -> dict:
     # same shared data. See new_request for the per-request origin guild/channel.
     # `standing` holds go-to subs (see the Go-to subs section below): arrangements,
     # not sign-ups, so they live apart from `availability` and never expire.
-    return {"boards": {}, "requests": [], "availability": [], "standing": []}
+    # `history`, `played` and `league_slots` are the sub records: see History below.
+    return {"boards": {}, "requests": [], "availability": [], "standing": [],
+            "history": [], "played": {}, "league_slots": {}}
 
 
 def load(path: str) -> dict:
@@ -89,6 +103,9 @@ def load(path: str) -> dict:
     state.setdefault("requests", [])
     state.setdefault("availability", [])
     state.setdefault("standing", [])
+    state.setdefault("history", [])       # stores written before records were kept
+    state.setdefault("played", {})
+    state.setdefault("league_slots", {})
     for r in state["requests"]:  # tolerate stores written before these fields existed
         r.setdefault("filled", [])
         r.setdefault("pending", [])
@@ -631,6 +648,9 @@ def expire(
     """
     Drop played-out requests and stale availability sign-ups. Mutates `state`
     and returns the removed items: {"requests": [...], "availability": [...]}.
+    A request dropped because its game has been PLAYED leaves a history row for
+    each sub who was on it (see record_played); nothing else that is dropped here
+    does, because nothing else was a game anyone played.
     A request with no game date ages out `undated_days` after it was posted; one
     whose timestamps can't be parsed at all is kept (never silently lost).
 
@@ -669,7 +689,14 @@ def expire(
         except (ValueError, KeyError):
             kept_reqs.append(r)
             continue
-        (dropped_reqs if game < cutoff else kept_reqs).append(r)
+        if game < cutoff:
+            # Played. This is the last moment the request exists, so who was on
+            # it is written down HERE, in the same pass that forgets it, not
+            # left to a caller to remember.
+            record_played(state, r)
+            dropped_reqs.append(r)
+        else:
+            kept_reqs.append(r)
     state["requests"] = kept_reqs
 
     # Availability: prune the entry's games ONE AT A TIME, then drop the entry once
@@ -715,3 +742,276 @@ def expire(
     # `games` lists games pruned from entries that SURVIVED — callers must treat a
     # non-empty value as a change worth saving, or the prune is lost on restart.
     return {"requests": dropped_reqs, "availability": dropped_av, "games": dropped_games}
+
+
+# ── History: who actually subbed ────────────────────────────────────────────
+# The board is today-forward and forgets a game the moment it is over, so none of
+# the above can say who has subbed the most. These three keys can.
+#
+# What removes them: nothing, on purpose. They are the record, the same way
+# practice attendance is. One short row per sub per game and one date per slot
+# per week is a few kilobytes a season. The one exception is `league_slots`,
+# which is a lookup rather than a record and is trimmed to the leagues something
+# still refers to (see note_leagues).
+#
+# A SLOT is the site's league category ("thurs", "friday-tgif"): the thing that
+# stays the same when Thursday Fall ends and Thursday Winter starts under a new
+# league id. Totals and streaks are kept per slot, never per league, so a new
+# season carries on from the last one instead of starting everyone at zero.
+#
+# Two separate measures come out of this, and neither is derived from the other:
+#   totals   — games subbed, a plain count (sub_totals / top_subs)
+#   streaks  — consecutive weeks subbed (streaks)
+
+# How many games in a slot before someone can be called its top sub. Below this
+# the first person to sub after the records start would hold the title at one.
+DEFAULT_TOP_MIN = 3
+
+
+def request_slot(state: dict, req: dict) -> str:
+    """The slot this request's league belongs to, or "" when we have never been
+    told (a league seen only while the site was unreadable)."""
+    meta = state.get("league_slots", {}).get(str(req.get("league_id") or "")) or {}
+    return meta.get("slot", "")
+
+
+def record_played(state: dict, req: dict) -> int:
+    """Write one history row per sub on a request whose game has been played.
+    Returns how many rows were added.
+
+    Only `filled` counts: a pending invite never said yes. An auto-assigned super
+    sub who never tapped confirm DOES count. They were the name on the spot at
+    game time, and people who simply turn up without tapping are far more common
+    than no-shows nobody took off the board.
+
+    Safe to call twice for the same request (rows are keyed on request + person),
+    though expire() only ever sees a request once."""
+    if req.get("kind", "sub") != "sub":
+        return 0
+    ts = (req.get("game_ts") or "").strip()
+    try:
+        datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return 0                     # no real date, so no week to count it in
+    lid = str(req.get("league_id") or "")
+    meta = state.get("league_slots", {}).get(lid) or {}
+    rows = state.setdefault("history", [])
+    seen = {(h.get("rid"), h.get("user_id")) for h in rows}
+    added = 0
+    for f in req.get("filled", []):
+        if (req.get("id"), f.get("user_id")) in seen:
+            continue
+        rows.append({
+            "rid": req.get("id"),
+            "user_id": f.get("user_id"),
+            "name": f.get("name", ""),
+            "game_ts": ts,
+            "league_id": lid,
+            "league": req.get("league", ""),
+            "team": req.get("team", ""),
+            "slot": meta.get("slot", ""),
+            "slot_name": meta.get("name", ""),
+        })
+        added += 1
+    return added
+
+
+def note_leagues(state: dict, slots: dict, played: Optional[dict] = None) -> bool:
+    """Take in what the league list currently says. Returns True if anything
+    changed (the caller saves).
+
+    `slots`   {league id: {"slot": str, "name": str}} for every league in the list
+    `played`  {slot: [ISO dates]} of draws that have already happened
+
+    Four small jobs, all idempotent:
+      * remember each league's slot, so a request for it can be filed correctly
+        when its game is played, even if the league has left the list by then;
+      * fill in the slot on any history row written before we knew it;
+      * add the played dates to each slot's calendar;
+      * forget league ids that are neither in the list nor referred to by
+        anything live.
+
+    An EMPTY `slots` is a list we could not read, not a club with no leagues, so
+    nothing is forgotten on the strength of it."""
+    changed = False
+    known = state.setdefault("league_slots", {})
+    for lid, meta in (slots or {}).items():
+        lid = str(lid)
+        slot = (meta.get("slot") or "").strip()
+        if not slot:
+            continue
+        entry = {"slot": slot, "name": (meta.get("name") or "").strip()}
+        if known.get(lid) != entry:
+            known[lid] = entry
+            changed = True
+
+    for h in state.setdefault("history", []):
+        if h.get("slot"):
+            continue
+        meta = known.get(str(h.get("league_id") or ""))
+        if meta:
+            h["slot"], h["slot_name"] = meta["slot"], meta["name"]
+            changed = True
+
+    calendar = state.setdefault("played", {})
+    for slot, dates in (played or {}).items():
+        if not slot:
+            continue
+        have = set(calendar.get(slot, []))
+        new = {d for d in dates if _as_date(d) is not None} - have
+        if new:
+            calendar[slot] = sorted(have | new)
+            changed = True
+
+    if slots:
+        live = {str(x.get("league_id") or "")
+                for key in ("requests", "availability", "standing")
+                for x in state.get(key, [])}
+        keep = {str(k) for k in slots} | live
+        for lid in [k for k in known if k not in keep]:
+            del known[lid]
+            changed = True
+    return changed
+
+
+def _as_date(text) -> Optional[date]:
+    try:
+        return datetime.fromisoformat(str(text)).date()
+    except (ValueError, TypeError):
+        return None
+
+
+def _week(d: date) -> date:
+    """The Monday of d's week. Weeks are Monday to Sunday, as practice streaks
+    count them, so a Sunday league sits at the END of its week."""
+    return d - timedelta(days=d.weekday())
+
+
+def _rows(state: dict, slot: Optional[str]) -> list[dict]:
+    """History rows for one slot, or every row when slot is None (all leagues)."""
+    rows = state.get("history", [])
+    return rows if slot is None else [h for h in rows if h.get("slot") == slot]
+
+
+def _latest_names(state: dict) -> dict:
+    """{user id: the name on their most recent row}. People rename themselves;
+    the board should call them what they are called now."""
+    names: dict = {}
+    for h in sorted(state.get("history", []), key=lambda h: h.get("game_ts", "")):
+        if h.get("name"):
+            names[h.get("user_id")] = h["name"]
+    return names
+
+
+def slots_with_history(state: dict) -> list[str]:
+    """Every slot someone has subbed in, in week order (Sunday first, then by
+    start time), so the records read the way the league pickers do."""
+    last: dict = {}
+    for h in state.get("history", []):
+        slot = h.get("slot")
+        if slot and h.get("game_ts", "") >= last.get(slot, ""):
+            last[slot] = h.get("game_ts", "")
+
+    def key(slot):
+        try:
+            dt = datetime.fromisoformat(last[slot])
+        except (ValueError, TypeError):
+            return (7, 0, slot)
+        return ((dt.weekday() + 1) % 7, dt.hour * 60 + dt.minute, slot)
+
+    return sorted(last, key=key)
+
+
+def slot_name(state: dict, slot: str) -> str:
+    """What to call a slot: the league name on its most recent game, which is how
+    the current season spells it. Falls back to the raw slot."""
+    best_ts, name = "", ""
+    for h in state.get("history", []):
+        if h.get("slot") == slot and h.get("slot_name") and h.get("game_ts", "") >= best_ts:
+            best_ts, name = h.get("game_ts", ""), h["slot_name"]
+    return name or slot
+
+
+def sub_totals(state: dict, slot: Optional[str] = None) -> list[dict]:
+    """Games subbed, most first: [{user_id, name, games}]. A plain count of
+    history rows. It owes nothing to streaks: ten games scattered over two years
+    and ten in a row are the same ten."""
+    counts: dict = {}
+    for h in _rows(state, slot):
+        counts[h.get("user_id")] = counts.get(h.get("user_id"), 0) + 1
+    names = _latest_names(state)
+    out = [{"user_id": uid, "name": names.get(uid, ""), "games": n}
+           for uid, n in counts.items()]
+    out.sort(key=lambda r: (-r["games"], (r["name"] or "").casefold()))
+    return out
+
+
+def top_subs(state: dict, min_games: int = DEFAULT_TOP_MIN) -> dict:
+    """{slot: frozenset of user ids} for whoever has subbed the most games in each
+    slot, all time. A tie shares it. A slot whose leader has fewer than `min_games`
+    has no top sub yet and is left out."""
+    out = {}
+    for slot in slots_with_history(state):
+        totals = sub_totals(state, slot)
+        if not totals or totals[0]["games"] < max(1, int(min_games)):
+            continue
+        best = totals[0]["games"]
+        out[slot] = frozenset(r["user_id"] for r in totals if r["games"] == best)
+    return out
+
+
+def played_weeks(state: dict, today: date, slot: Optional[str] = None) -> list[date]:
+    """The weeks (as Mondays) this slot played, oldest first; every slot's when
+    slot is None.
+
+    A draw only counts once its DAY is over. Requests for a game are pruned at
+    some point on the day it is played, so until midnight the calendar and the
+    history can disagree about tonight; from the next day they cannot. Any week
+    someone subbed in is a played week by definition, calendar or no calendar."""
+    calendar = state.get("played", {})
+    dates: list = []
+    for s, ds in calendar.items():
+        if slot is None or s == slot:
+            dates.extend(ds)
+    weeks = {_week(d) for d in map(_as_date, dates) if d is not None and d < today}
+    weeks |= {_week(d) for d in (_as_date(h.get("game_ts")) for h in _rows(state, slot))
+              if d is not None}
+    return sorted(weeks)
+
+
+def streaks(state: dict, now: datetime, slot: Optional[str] = None) -> list[dict]:
+    """Everyone's streak in a slot (or across all leagues when slot is None):
+    [{user_id, name, current, best}], unsorted.
+
+    A streak is a run of consecutive PLAYED weeks in which the person subbed at
+    least once. A week the slot had no draw is not in the list at all, so a break
+    between seasons or a dark week neither adds to a run nor ends it. A week it
+    did play and they did not sub ends it. Two games in one week are one week.
+
+      best     the longest run anywhere in their history. Records stand.
+      current  the run still going: the one that reaches the latest played week.
+               Zero once a played week has gone by without them."""
+    weeks = played_weeks(state, now.date(), slot)
+    mine: dict = {}
+    for h in _rows(state, slot):
+        d = _as_date(h.get("game_ts"))
+        if d is not None:
+            mine.setdefault(h.get("user_id"), set()).add(_week(d))
+    names = _latest_names(state)
+    out = []
+    for uid, subbed in mine.items():
+        best = run = 0
+        for w in weeks:
+            run = run + 1 if w in subbed else 0
+            best = max(best, run)
+        out.append({"user_id": uid, "name": names.get(uid, ""), "current": run, "best": best})
+    return out
+
+
+def streak_board(state: dict, now: datetime, key: str, slot: Optional[str] = None,
+                 *, at_least: int = 2) -> list[dict]:
+    """streaks() as a leaderboard on `key` ("current" or "best"), longest first.
+    One week is not a streak, so the default floor is two."""
+    rows = [r for r in streaks(state, now, slot) if r[key] >= at_least]
+    rows.sort(key=lambda r: (-r[key], (r["name"] or "").casefold()))
+    return rows

@@ -241,6 +241,46 @@ and the buttons survive bot restarts. The board is generic by design (each
 request has a `kind` field), so the same machinery can later back pickup games,
 team-building, etc.
 
+### Sub records (`/subs stats:True`)
+
+The board is today-forward and forgets a game the moment it is over, so the bot
+keeps a separate record: one row per person per game they subbed, written in the
+same pass that prunes the played request. `/subs stats:True` posts it to the
+channel (an embed of plain names, so nobody is pinged):
+
+```
+Thursday League
+👑  4 games · Ann Adams
+🥈  2 games · Bo Brooks
+🥉  1 game · Cara Cole
+🔥  2 wks running · Bo Brooks
+📈  longest run 3 wks · Ann Adams
+```
+
+...one block per league slot, then the same three boards across all leagues.
+
+- **Per slot, not per league.** A slot is the site's league category, which is
+  what this season's Thursday league shares with last season's. A new league in
+  the same category carries everyone's totals and streaks on.
+- **Games and streaks are separate measures.** Games is a plain count of games
+  subbed and never depends on a streak: ten scattered over two years and ten in a
+  row are the same ten. A streak is consecutive weeks subbed.
+- **A week the league is off doesn't break a streak.** The bot logs the dates
+  each slot actually had a draw (from the league pages), and a streak runs over
+  those weeks only. A week the slot played and you didn't sub ends it; a break
+  between seasons doesn't. Two games in one week are one week.
+- **What counts as a game:** being on a spot when a dated game is played. A
+  pending invite, a cancelled request and an undated request that ages out do
+  not. An auto-assigned super sub counts whether or not they tapped confirm.
+- **👑 on the board.** Whoever has subbed the most games in a slot, all time,
+  wears a crown next to their name whenever they are on a spot in that slot.
+  Ties share it, and nobody has it below `SUBS_TOP_MIN` games (default 3).
+
+Records start with the first game played after this is deployed; there is no
+history before that to read. They live in the subs store alongside the board
+state (`history`, `played`, `league_slots`) and, unlike the board, are never
+expired.
+
 ### Super subs (auto-assignment)
 
 **`/supersub`** shows who the club's super subs are and lets you set one up: pick the
@@ -364,6 +404,7 @@ All configuration is via environment variables (see `.env.example`):
 | `SUBS_STORE_PATH` | Subs board state file (default `subs_store.json`) |
 | `SUBS_GRACE_HOURS` | Hours after game start before a request expires (default 3) |
 | `SUBS_UNDATED_DAYS` | Days a legacy request with no game date lasts before ageing out (default 14) |
+| `SUBS_TOP_MIN` | Games subbed in a league slot before someone can wear its top-sub crown (default 3) |
 | `PEOPLE_PER_SHEET` | Max people on one sheet of ice (default 8) |
 | `INSTRUCTOR_CHANNEL_ID` | Channel the instructor board posts to. Unset = feature off |
 | `SHEET_ID` | Google Sheet id for the instructor sheet |
@@ -428,7 +469,8 @@ concurrent lookups.
   `gf_client` raises a sanitized error (status + path only) and commands log full
   detail server-side while showing a generic message. When adding new code, never
   interpolate a raw exception or request URL into a user-facing message.
-- **Member-facing commands are private:** `/sheets` and `/subs` reply ephemerally.
+- **Member-facing commands are private:** `/sheets` and `/subs` reply ephemerally
+  (their `stats:True` and `show:True` flags post to the channel on purpose).
   The shared practice board and the subs board intentionally show display names so
   members can coordinate. DM confirm/decline actions are validated against the
   invited user's ID, so only the invitee can respond.

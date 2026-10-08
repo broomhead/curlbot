@@ -142,6 +142,12 @@ BOARD_HORIZON_DAYS = int(os.environ.get("SUBS_BOARD_DAYS", "14"))
 # can't take-then-drop, and a Confirm/Decline can't clobber its own result.
 CLICK_DEBOUNCE_SECONDS = 3.0
 
+# Games subbed in one league slot before someone can be shown as its top sub.
+TOP_SUB_MIN = int(os.environ.get("SUBS_TOP_MIN", str(store.DEFAULT_TOP_MIN)))
+# Marks a slot's all-time top sub wherever their name appears on a spot. Not a
+# star: the star already means super sub, which is an arrangement, not a record.
+CROWN = "👑"
+
 CID_NEW     = "sub:new"
 CID_AVAIL   = "sub:avail"
 CID_FILLFOR = "sub:fillfor"
@@ -576,6 +582,45 @@ def dead_league_ids(leagues: list[dict], now: datetime) -> set[str]:
             if lg.get("ended") or league_is_over(lg, now)}
 
 
+def league_slot_map(leagues: list[dict]) -> dict[str, dict]:
+    """{league id: {"slot", "name"}} for the sub records.
+
+    The slot is the site's league category, which is what a new season of the
+    same league shares with the last one; its id and title both change. The name
+    is the league's own with the season and dates stripped ("Thursday League"),
+    kept alongside so the records can head a slot the way the club writes it.
+    A league with no category has no slot and is left out."""
+    out: dict[str, dict] = {}
+    for lg in leagues:
+        slot = (lg.get("category") or "").strip()
+        if not slot or lg.get("id") in (None, ""):
+            continue
+        out[str(lg["id"])] = {"slot": slot, "name": league_name(lg.get("title", ""))}
+    return out
+
+
+def played_dates(leagues: list[dict], now: datetime,
+                 grace_hours: float = store.DEFAULT_GRACE_HOURS) -> dict[str, list[str]]:
+    """{slot: [ISO dates]} of the draws that are over, by the same cutoff that
+    prunes a played request, so a draw and the subs who played it are logged in
+    the same pass. A league page lists its whole season, so the first read after
+    a gap catches up on every draw it missed."""
+    cutoff = store.board_cutoff(now, grace_hours)
+    out: dict[str, set] = {}
+    for lg in leagues:
+        slot = (lg.get("category") or "").strip()
+        if not slot:
+            continue
+        for draw in lg.get("draws", []) or []:
+            try:
+                when = draw_to_datetime(draw)
+            except (ValueError, TypeError):
+                continue
+            if when is not None and when < cutoff:
+                out.setdefault(slot, set()).add(when.date().isoformat())
+    return {slot: sorted(days) for slot, days in out.items()}
+
+
 def league_times(leagues: list[dict]) -> dict[str, clock_time]:
     """{league id: start time} for every league we can put a clock on."""
     return {str(lg.get("id")): t for lg in leagues
@@ -749,13 +794,16 @@ def _req_for(req: dict) -> str:
     return f"{who}'s spot" if who else "Sub"
 
 
-def _req_status_line(req: dict) -> str:
+def _req_status_line(req: dict, crowned=frozenset()) -> str:
+    """One spot on the board. `crowned` is the user ids of the top sub(s) for this
+    request's league slot; any of them filling the spot wears the crown."""
     needed = int(req["spots_needed"])
     covered = needed - store.open_spots(req)
     # An auto-assigned super sub who hasn't acknowledged yet is shown as such: the
     # spot IS covered, but nobody has heard from them, and a board that hides that
     # is how a team turns up three-handed.
-    names = [f["name"] + (" (unconfirmed)" if f.get("auto") and not f.get("confirmed") else "")
+    names = [f["name"] + (f" {CROWN}" if f["user_id"] in crowned else "")
+             + (" (unconfirmed)" if f.get("auto") and not f.get("confirmed") else "")
              for f in req.get("filled", [])]
     names += [f"{p['name']} (pending)" for p in req.get("pending", [])]
     who = ", ".join(names) if names else "nobody yet"
@@ -828,6 +876,7 @@ def build_embed(state: dict, *, horizon_days: int | None = BOARD_HORIZON_DAYS) -
     reqs = store.requests_sorted(state)
     horizon = board_horizon(horizon_days)
     e = discord.Embed(title=BOARD_TITLE, color=_embed_color(reqs))
+    tops = store.top_subs(state, TOP_SUB_MIN)
 
     # Date groups come from requests AND from game-specific availability, so a game
     # with willing subs shows up even before anyone opens a request for it.
@@ -873,7 +922,8 @@ def build_embed(state: dict, *, horizon_days: int | None = BOARD_HORIZON_DAYS) -
         grp = groups[k]
         lines = [f"**{grp['label']}**"]
         for r in grp["reqs"]:
-            lines.append(_req_status_line(r))
+            lines.append(_req_status_line(
+                r, tops.get(store.request_slot(state, r), frozenset())))
         free = _available_for_group(state, grp, k)
         if free:
             lines.append(f"{INDENT}available: {', '.join(free)}")
@@ -921,11 +971,112 @@ def build_embed(state: dict, *, horizon_days: int | None = BOARD_HORIZON_DAYS) -
         e.add_field(name="Available any time", value="\n".join(rows)[:1024], inline=False)
 
     foot = "🔴 none · 🟡 partial · 🟢 filled — tap a game button below to take a spot"
+    if CROWN in (e.description or ""):
+        # Only when one is actually showing: a legend for a mark that isn't on the
+        # board is a line of noise on every refresh.
+        foot += f" · {CROWN} most games subbed in that league"
     if horizon_days is None:
         foot += " · showing everything"
     elif later:
         foot += f" · showing the next {horizon_days} days"
     e.set_footer(text=foot)
+    return e
+
+
+# ── Sub records (/subs stats:True) ──────────────────────────────────────────
+# Two measures, shown side by side and never mixed: GAMES subbed, a plain count
+# that only ever goes up, and STREAKS, consecutive weeks subbed. Someone can lead
+# a league on games without ever having had a streak in it.
+
+STATS_TITLE = f"🏆  Sub Records — {CLUB_NAME}"
+STATS_TOP = 3            # places shown per league
+STATS_TOP_OVERALL = 5    # places shown on the all-league boards
+STATS_NAMES_PER_LINE = 6
+STATS_FIELD_LIMIT = 1024  # Discord's cap on one embed field
+
+
+def _plural(n: int, one: str, many: str) -> str:
+    return one if n == 1 else many
+
+
+def _who(names: list[str]) -> str:
+    listed = names[:STATS_NAMES_PER_LINE]
+    rest = len(names) - len(listed)
+    return ", ".join(listed) + (f" +{rest} more" if rest else "")
+
+
+def rank_groups(rows: list[dict], key: str) -> list[tuple[int, list[str]]]:
+    """A sorted leaderboard collapsed to [(value, [names]), ...], one entry per
+    distinct value. Everyone level on four games is one line and one place, the
+    same dense ranking the practice streak board uses."""
+    groups: list[tuple[int, list[str]]] = []
+    for r in rows:
+        if groups and groups[-1][0] == r[key]:
+            groups[-1][1].append(r["name"])
+        else:
+            groups.append((r[key], [r["name"]]))
+    return groups
+
+
+def _rank_lines(rows: list[dict], key: str, unit: tuple[str, str], n: int,
+                *, first: str = "🥇") -> list[str]:
+    medals = {1: first, 2: "🥈", 3: "🥉"}
+    out = []
+    for place, (value, names) in enumerate(rank_groups(rows, key)[:n], start=1):
+        out.append(f"{medals.get(place, f'`{place}.`')}  **{value} {_plural(value, *unit)}** "
+                   f"· {_who(names)}")
+    return out
+
+
+def _slot_field(state: dict, slot: str, now: datetime, tops: dict) -> str:
+    """One league slot: its top three on games, then its streak lines if anyone
+    has one. The leader's medal is the crown once they hold it, so this screen
+    and the board use the same mark for the same thing."""
+    totals = store.sub_totals(state, slot)
+    lines = _rank_lines(totals, "games", ("game", "games"), STATS_TOP,
+                        first=CROWN if slot in tops else "🥇")
+    current = store.streak_board(state, now, "current", slot)
+    best = store.streak_board(state, now, "best", slot)
+    if current:
+        value, names = rank_groups(current, "current")[0]
+        lines.append(f"🔥  {value} wks running · {_who(names)}")
+    if best:
+        value, names = rank_groups(best, "best")[0]
+        lines.append(f"📈  longest run {value} wks · {_who(names)}")
+    return "\n".join(lines)[:STATS_FIELD_LIMIT]
+
+
+def build_stats_embed(state: dict, now: datetime | None = None) -> discord.Embed:
+    """The /subs stats:True screen: who has subbed the most in each league slot,
+    across every season of it, and who is on a run."""
+    now = now or club_now()
+    e = discord.Embed(title=STATS_TITLE, color=0xE0632D)
+    if not state.get("history"):
+        e.description = ("No sub records yet. They start with the next game a sub plays, "
+                         "so take a spot on **/subs** and get your name up here.")
+        return e
+
+    tops = store.top_subs(state, TOP_SUB_MIN)
+    e.description = "Games subbed in each league, all seasons counted together."
+    for slot in store.slots_with_history(state):
+        e.add_field(name=_truncate(store.slot_name(state, slot), 60),
+                    value=_slot_field(state, slot, now, tops) or "—", inline=True)
+
+    overall = _rank_lines(store.sub_totals(state), "games", ("game", "games"),
+                          STATS_TOP_OVERALL)
+    e.add_field(name="All leagues · most games", inline=False,
+                value="\n".join(overall)[:STATS_FIELD_LIMIT] or "—")
+    current = _rank_lines(store.streak_board(state, now, "current"), "current",
+                          ("wk", "wks"), STATS_TOP_OVERALL)
+    best = _rank_lines(store.streak_board(state, now, "best"), "best",
+                       ("wk", "wks"), STATS_TOP_OVERALL)
+    e.add_field(name="🔥  Current streaks", inline=True,
+                value="\n".join(current)[:STATS_FIELD_LIMIT] or "Nobody on a run right now")
+    e.add_field(name="📈  Longest streaks", inline=True,
+                value="\n".join(best)[:STATS_FIELD_LIMIT] or "No streaks yet")
+    e.set_footer(text=(
+        f"{CROWN} most games in that league ({TOP_SUB_MIN} or more) · "
+        "streak = weeks in a row you subbed · a week the league is off doesn't break it"))
     return e
 
 
@@ -3013,6 +3164,7 @@ class Subs(commands.Cog):
         now = club_now()
         async with self._lock:
             retimed = retime_tbc(self.state, league_times(leagues))
+            self._note_leagues(leagues, now)
             store.expire(self.state, now, GRACE_HOURS, undated_days=UNDATED_DAYS,
                          dead_leagues=dead_league_ids(leagues, now))
             store.save(STORE_PATH, self.state)
@@ -3035,6 +3187,14 @@ class Subs(commands.Cog):
             self._queue_sub_notice(uid)
         if owed:
             log.info("Re-queued super sub notices for %d member(s)", len(owed))
+
+    def _note_leagues(self, leagues: list[dict], now: datetime) -> bool:
+        """Feed the league list to the sub records: which slot each league is in,
+        and which draws are over. Runs BEFORE expire() in both housekeeping passes,
+        so a game pruned in that pass is filed under the right slot and its week is
+        already on the calendar. Call with the lock held. True means save."""
+        return store.note_leagues(self.state, league_slot_map(leagues),
+                                  played_dates(leagues, now, GRACE_HOURS))
 
     # -- persistence + board refresh ----------------------------------------
     def _save(self):
@@ -3977,13 +4137,16 @@ class Subs(commands.Cog):
         now = club_now()
         async with self._lock:
             retimed = retime_tbc(self.state, league_times(leagues))
+            noted = self._note_leagues(leagues, now)
             dropped = store.expire(self.state, now, GRACE_HOURS,
                                    undated_days=UNDATED_DAYS,
                                    dead_leagues=dead_league_ids(leagues, now))
             changed = bool(retimed["requests"] or retimed["availability"]
                            or dropped["requests"] or dropped["availability"]
                            or dropped["games"])
-            if changed:
+            # `noted` is saved but is not a reason to redraw anything: a draw going
+            # onto the calendar changes no board.
+            if changed or noted:
                 self._save()
         # A retimed request's alert page still reads "time TBC" — redraw it. Skip
         # any that expiry has just dropped: their pages come down below instead.
@@ -4164,18 +4327,26 @@ class Subs(commands.Cog):
         await self.bot.wait_until_ready()
 
     # -- slash command ------------------------------------------------------
-    # One bare command with an optional flag: `/subs` shows a private copy; add
-    # `show:True` to instead post this server's shared board in the channel for all.
+    # One bare command with optional flags: `/subs` shows a private copy; add
+    # `show:True` to instead post this server's shared board in the channel for all,
+    # or `stats:True` to post the sub records. Same shape as /sheets.
     @app_commands.command(
         name="subs",
-        description="Show your subs board (private) — or post the shared board with show:True")
+        description="Your subs board (private) · stats:True sub records · show:True post the board")
     @app_commands.describe(
-        show="Post this server's shared board here for everyone (default: private, only you)")
-    async def subs_cmd(self, interaction: discord.Interaction, show: bool = False):
+        show="Post this server's shared board here for everyone (default: private, only you)",
+        stats="Post the sub records to the channel: most games per league, and streaks")
+    async def subs_cmd(self, interaction: discord.Interaction, show: bool = False,
+                       stats: bool = False):
         """Bare `/subs`: a private, ephemeral copy (only the caller sees it). `show:True`:
         (re)posts this server's shared board in the current channel, visible to all —
         that becomes the server's board. Data is shared across servers; each shows its
-        own board."""
+        own board. `stats:True`: the sub records, posted to the channel like the
+        practice streak records are. It is an embed of plain names, so it notifies
+        nobody."""
+        if stats:
+            await interaction.response.send_message(embed=build_stats_embed(self.state))
+            return
         if not show:
             await interaction.response.send_message(
                 content="Your subs board (only you can see this):",
