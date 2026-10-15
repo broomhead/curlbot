@@ -625,13 +625,15 @@ async def fill_for_someone_has_the_same_reach():
     check("fillfor/whole run ticked by default", len(v.rids), 4)
     check("fillfor/multi-date gets a date select",
           [type(c).__name__ for c in v.build().children],
-          ["FillForPick", "NightSelect", "FillForMemberSelect", "FillForSubmitButton"])
+          ["FillForPick", "NightSelect", "FillForMemberSelect", "FillForSubmitButton",
+           "FillForTypeNameButton"])
     # A single game skips straight to the member — no night select to wade through.
     v.key = pick.options[1].value
     v.on_unit_change()
     check("fillfor/single game has no date select",
           [type(c).__name__ for c in v.build().children],
-          ["FillForPick", "FillForMemberSelect", "FillForSubmitButton"])
+          ["FillForPick", "FillForMemberSelect", "FillForSubmitButton",
+           "FillForTypeNameButton"])
 
     # Put Ben on three of the four.
     three = [r["id"] for r in store.requests_sorted(cog.state) if r["team"] == "Smith"][:3]
@@ -659,7 +661,8 @@ async def fill_for_opens_pre_aimed_from_an_alert():
     check("prefill/all its dates ticked", len(v.rids), 4)
     check("prefill/straight to the member picker",
           [type(c).__name__ for c in v.build().children],
-          ["FillForPick", "NightSelect", "FillForMemberSelect", "FillForSubmitButton"])
+          ["FillForPick", "NightSelect", "FillForMemberSelect", "FillForSubmitButton",
+           "FillForTypeNameButton"])
     check("prefill/and it's the one selected in the dropdown",
           [o.default for o in v.build().children[0].options], [True, False])
 
@@ -667,7 +670,8 @@ async def fill_for_opens_pre_aimed_from_an_alert():
     v1 = subs.FillForView(cog.state, key=f"one:{single['id']}")
     check("prefill/single date needs no date picker",
           [type(c).__name__ for c in v1.build().children],
-          ["FillForPick", "FillForMemberSelect", "FillForSubmitButton"])
+          ["FillForPick", "FillForMemberSelect", "FillForSubmitButton",
+           "FillForTypeNameButton"])
     check("prefill/aimed at that one request", v1.rids, [single["id"]])
 
     # A stale alert (its spot filled while the message sat there) must not explode —
@@ -822,6 +826,133 @@ async def fill_for_keeps_the_precise_single_night_reasons():
     check("fillfor/gone", (filled, why), ([], "closed"))
 
 
+async def a_sub_who_is_not_on_discord_can_be_typed_in():
+    """The member select searches the server but can only return someone in it. A
+    sub with no Discord account is typed in by name instead, and the modal's Submit
+    marks them in on the ticked dates — no second confirm button after it."""
+    import ast
+    check("guest/name is tidied", store.clean_guest_name("  Robin   Vale "), "Robin Vale")
+    check("guest/markup and mentions are dropped",
+          store.clean_guest_name("**Robin** <@123> `Vale`"), "Robin 123 Vale")
+    check("guest/no letters is no name", store.clean_guest_name(" 12 @@ "), "")
+    check("guest/capped", len(store.clean_guest_name("x" * 90)), store.GUEST_NAME_MAX)
+    check("guest/same name, same person",
+          store.guest_id("robin  VALE"), store.guest_id("Robin Vale"))
+    check("guest/id never looks like a Discord id",
+          (store.is_guest(store.guest_id("Robin Vale")), store.is_guest(BEN.id)), (True, False))
+    check("guest/select values round-trip",
+          (store.parse_user_id(str(BEN.id)), store.parse_user_id(store.guest_id("Robin Vale"))),
+          (BEN.id, store.guest_id("Robin Vale")))
+
+    cog = make_cog()
+    await cog.add_series(requester=ANN, league_id="999", league="L", team="Smith",
+                         game_isos=TUE[:2], spots=1, channel=Ch())
+    v = subs.FillForView(cog.state)
+    v.key = v.children[0].options[0].value
+    v.on_unit_change()
+    btn = next((c for c in v.build().children
+                if isinstance(c, subs.FillForTypeNameButton)), None)
+    check("guest/the form offers a typed name", btn is not None, True)
+    check("guest/empty prompt points at it", "Type a name" in v.prompt(), True)
+
+    # Pressing it opens the modal; it must not touch the store.
+    if btn is not None:
+        it = FakeInteraction(BEN, cog)
+        sent = []
+
+        async def send_modal(m):
+            sent.append(m)
+        it.response.send_modal = send_modal
+        await btn.callback(it)
+        check("guest/button opens the name modal",
+              [type(m).__name__ for m in sent], ["FillForNameModal"])
+
+    # Junk is refused and nothing is written.
+    bad = subs.FillForNameModal(v)
+    bad.name._value = "@@ 42"
+    it = FakeInteraction(BEN, cog)
+    await bad.on_submit(it)
+    check("guest/junk fills nothing",
+          [len(r["filled"]) for r in store.requests_sorted(cog.state)], [0, 0])
+    check("guest/junk says so and keeps the form",
+          ("doesn't look like a name" in (it.response.calls[0][1].get("content", "")
+                                          if it.response.calls else ""),
+           v.submitted), (True, False))
+
+    # Untick one date first: Submit covers what the form has ticked, not the posting.
+    all_rids = list(v.rids)
+    v.rids = all_rids[:1]
+    modal = subs.FillForNameModal(v)
+    modal.name._value = "  **Robin**  Vale "
+    it = FakeInteraction(BEN, cog)
+    await modal.on_submit(it)
+    check("guest/submit marks them in on the ticked date only",
+          [[f["name"] for f in r["filled"]] for r in store.requests_sorted(cog.state)],
+          [["Robin Vale"], []])
+    check("guest/stored under the name-derived id",
+          [f["user_id"] for f in store.requests_sorted(cog.state)[0]["filled"]],
+          [store.guest_id("Robin Vale")])
+    msg = it.edits[-1] if it.edits else {}
+    check("guest/the form becomes the outcome",
+          ("Marked **Robin Vale** in" in msg.get("content", ""), msg.get("view", "?")),
+          (True, None))
+    check("guest/no claim they were notified",
+          "the requester was notified" in msg.get("content", ""), True)
+    dms = [c for c in cog.calls if c[0] == "dm"]
+    check("guest/only the requester is told", [c[1] for c in dms], [ANN.id])
+
+    # A second Submit on the same form is a no-op (one-shot guard).
+    again = subs.FillForNameModal(v)
+    again.name._value = "Alex Reed"
+    it2 = FakeInteraction(BEN, cog)
+    await again.on_submit(it2)
+    check("guest/a second submit does nothing",
+          [len(r["filled"]) for r in store.requests_sorted(cog.state)], [1, 0])
+    check("guest/…not even an attempt (one-shot guard)",
+          ([c[0] for c in it2.response.calls], it2.edits), (["defer"], []))
+
+    # Retyping the same name in other case is the same person.
+    again = await cog.fill_nights_for(BEN, all_rids[:1], subs.GuestSub("robin vale"), Ch())
+    check("guest/retyped name is already on it", again[2], "already")
+    req = store.requests_sorted(cog.state)[0]
+    check("guest/board shows the name", "Robin Vale" in subs._req_status_line(req), True)
+
+    # The sub records count them like anyone else.
+    store.record_played(cog.state, req)
+    check("guest/counted in the records",
+          [(t["name"], t["games"]) for t in store.sub_totals(cog.state)], [("Robin Vale", 1)])
+
+    # ➖ Remove: the select value carries a string id now, not just ints.
+    rm = subs.RemoveSubSelect(subs._all_committed_subs(cog.state))
+    rm._values = [rm.options[0].value]
+    it = FakeInteraction(ANN, cog)
+    try:
+        await rm.callback(it)
+    except (ValueError, TypeError) as e:     # FAIL, not crash: see check()
+        check("guest/remove select reads a typed-in sub's id", repr(e), "no error")
+        return
+    conf = it.response.calls[0][1].get("view") if it.response.calls else None
+    check("guest/remove asks first, about the right person",
+          (type(conf).__name__, getattr(conf, "target", None)),
+          ("ConfirmRemoveSubView", store.guest_id("Robin Vale")))
+    res, _ = await cog.remove_sub_by_anyone(ANN, req["id"], store.guest_id("Robin Vale"), Ch())
+    check("guest/and the remove lands", (res, len(req["filled"])), ("removed", 0))
+
+    # The modal commits only through the same helper as the green button, so the
+    # guards (one-shot, repeat-click, no dates ticked) can't drift between the two.
+    tree = ast.parse(open("subs.py", encoding="utf-8").read())
+    calls = {}
+    for name in ("FillForNameModal", "FillForSubmitButton"):
+        cls = next((n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == name), None)
+        calls[name] = sorted({n.func.id for n in ast.walk(cls) if isinstance(n, ast.Call)
+                              and isinstance(n.func, ast.Name) and n.func.id == "commit_fill"}
+                             | {n.func.attr for n in ast.walk(cls) if isinstance(n, ast.Call)
+                                and isinstance(n.func, ast.Attribute)
+                                and n.func.attr in ("fill_nights_for", "add_sub")}) if cls else None
+    check("guest/both commit paths go through commit_fill", calls,
+          {"FillForNameModal": ["commit_fill"], "FillForSubmitButton": ["commit_fill"]})
+
+
 for fn in (series_posts_one_request_per_night, single_night_is_not_a_series,
            a_run_lays_over_a_night_already_posted,
            a_run_over_an_entirely_posted_stretch_reports_nothing_made,
@@ -839,7 +970,8 @@ for fn in (series_posts_one_request_per_night, single_night_is_not_a_series,
            fill_for_opens_pre_aimed_from_an_alert,
            picking_a_name_does_not_fill_anything,
            clearing_your_availability_asks_first,
-           fill_for_keeps_the_precise_single_night_reasons):
+           fill_for_keeps_the_precise_single_night_reasons,
+           a_sub_who_is_not_on_discord_can_be_typed_in):
     asyncio.run(fn())
 
 print("\n".join(f"FAIL: {f}" for f in FAILS) or "All series + spot-edit checks passed.")

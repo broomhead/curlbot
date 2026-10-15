@@ -43,7 +43,9 @@ State shape:
         "notes": str,                          # free text (optional)
         "spots_needed": int,
         "series_id": "9f8e7d6c",              # "" = standalone; shared by a run
-        "filled": [{"user_id": int, "name": str, "ts": "..."}],
+        "filled": [{"user_id": int, "name": str, "ts": "..."}],   # user_id is a
+                                               # "guest:<name>" str for a sub typed in by
+                                               # name (see clean_guest_name)
         "created_ts": "..."
       }, ...
     ],
@@ -141,6 +143,46 @@ def find_request(state: dict, rid: str) -> Optional[dict]:
 def open_spots(req: dict) -> int:
     """Spots not yet filled. Pending (invited, unconfirmed) subs reserve a spot."""
     return max(0, int(req["spots_needed"]) - len(req.get("filled", [])) - len(req.get("pending", [])))
+
+
+# ── Subs who aren't on Discord ──────────────────────────────────────────────
+# Someone can be marked in by NAME when they have no Discord account: a spouse,
+# a member from another club, a regular who never joined the server. Their id is
+# a string built from the name, so every user_id comparison above and below works
+# unchanged (a str never equals a Discord int) and the same typed name lands on
+# the same id each time — which is what lets ➖ Remove find them and the sub
+# records count them as one person. They are never DMed or @-mentioned: nothing
+# that notifies reaches a filled sub, only requesters and super subs.
+GUEST_PREFIX = "guest:"
+GUEST_NAME_MAX = 40
+# Characters that would turn a name into markdown, a mention, or a channel link
+# on the board. Dropped rather than escaped, because select labels don't render
+# markdown and would show the backslashes.
+_GUEST_STRIP = set("`*_~|<>@#\\")
+
+
+def clean_guest_name(raw: str) -> str:
+    """A typed name, made safe to show: markup characters dropped, whitespace
+    collapsed, capped at GUEST_NAME_MAX. "" when nothing usable is left (no
+    letters at all), which the caller treats as a refusal."""
+    kept = "".join(ch for ch in (raw or "") if ch not in _GUEST_STRIP and ch.isprintable())
+    name = " ".join(kept.split())[:GUEST_NAME_MAX].strip()
+    return name if any(ch.isalpha() for ch in name) else ""
+
+
+def guest_id(name: str) -> str:
+    """Stable id for a typed-in sub: case and spacing don't make a new person."""
+    return GUEST_PREFIX + " ".join(name.split()).casefold()
+
+
+def is_guest(user_id) -> bool:
+    return isinstance(user_id, str) and user_id.startswith(GUEST_PREFIX)
+
+
+def parse_user_id(raw: str):
+    """Reverse of str(user_id) as packed into a select value: a Discord id comes
+    back as an int, a typed-in sub's id as the string it was."""
+    return int(raw) if raw.isdigit() else raw
 
 
 def is_filled_by(req: dict, user_id: int) -> bool:

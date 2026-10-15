@@ -1316,6 +1316,7 @@ class FillForView(discord.ui.View):
                                           placeholder="Dates they're covering…"))
             self.add_item(FillForMemberSelect(self.member, row=2))
             self.add_item(FillForSubmitButton(self.member, len(self.rids), row=3))
+            self.add_item(FillForTypeNameButton(row=3))
         return self
 
     def prompt(self) -> str:
@@ -1339,7 +1340,8 @@ class FillForView(discord.ui.View):
         # Nothing happens until the button: picking a name by mistake used to BE the
         # action, and there is no undo for it beyond ➖ Remove.
         if self.member is None:
-            return head + "\nNothing is recorded until you press the green button."
+            return head + ("\nNothing is recorded until you press the green button. "
+                           "Not on Discord? **Type a name** — submitting it marks them in.")
         n = len(self.rids)
         return head + (f"\nReady: {who} on **{n} date{'s' if n != 1 else ''}**. "
                        "Press the green button to record it.")
@@ -1402,6 +1404,98 @@ class FillForMemberSelect(discord.ui.UserSelect):
         await self.view.refresh(interaction)
 
 
+class GuestSub:
+    """A sub picked by typing their name — someone with no Discord account. Quacks
+    like the member the rest of the fill path reads (.id, .display_name); the id is
+    the name-derived string from sub_store.guest_id."""
+
+    def __init__(self, name: str):
+        self.display_name = name
+        self.id = store.guest_id(name)
+
+
+class FillForTypeNameButton(discord.ui.Button):
+    """The member select can SEARCH the server but can only return someone in it.
+    This is the way to name a sub who isn't on Discord at all.
+
+    Unlike the select, the modal's Submit DOES commit: typing a name and pressing
+    Submit is already a deliberate, labelled action, not a stray tap, so a second
+    confirm button after it would be a step for nothing. The dates it covers are
+    whatever the form above has ticked when the button is pressed."""
+
+    def __init__(self, row: int = 3):
+        super().__init__(label="Not on Discord? Type a name", emoji="✏️",
+                         style=discord.ButtonStyle.secondary, row=row)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(FillForNameModal(self.view))
+
+
+class FillForNameModal(discord.ui.Modal, title="Mark in a sub not on Discord"):
+    name = discord.ui.TextInput(
+        label="Their name", min_length=2, max_length=store.GUEST_NAME_MAX,
+        placeholder="First and last, as the team knows them")
+
+    def __init__(self, view: "FillForView"):
+        super().__init__()
+        self.fill_view = view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        view = self.fill_view
+        clean = store.clean_guest_name(str(self.name))
+        if not clean:
+            await interaction.response.edit_message(
+                content="That doesn't look like a name — try again.\n\n" + view.prompt(),
+                view=view.build())
+            return
+        await commit_fill(view, interaction, GuestSub(clean))
+
+
+async def commit_fill(view: "FillForView", interaction: discord.Interaction, member) -> None:
+    """Record `member` on the view's ticked dates and replace the form with the
+    outcome. Shared by the green button and the type-a-name modal's Submit."""
+    # One-shot guard, same as PostNeedButton: filling isn't idempotent and an
+    # impatient double-tap must not run twice. Set it before the first await.
+    if view.submitted:
+        try:
+            await interaction.response.defer()
+        except discord.HTTPException:
+            pass
+        return
+    view.submitted = True
+    await interaction.response.defer()
+
+    cog: "Subs" = interaction.client.get_cog("Subs")
+    rids = list(view.rids)
+    if member is None or not rids:
+        view.submitted = False
+        await interaction.edit_original_response(
+            content=("Pick a date and a person first.\n\n" + view.prompt()),
+            view=view.build())
+        return
+    if cog._is_repeat_click(cog._click_cooldown,
+                            ("fillfor", interaction.user.id, tuple(sorted(rids)), member.id)):
+        return
+    filled, skipped, why = await cog.fill_nights_for(
+        interaction.user, rids, member, interaction.channel)
+    if filled:
+        tail = (f" ({skipped} skipped — already covered, locked, or their own request.)"
+                if skipped else "")
+        told = ("the requester was notified" if store.is_guest(member.id)
+                else "they and the requester were notified")
+        msg = (f"✅  Marked **{member.display_name}** in for **{fmt_run(filled)}** — "
+               f"{told}.{tail}")
+    else:
+        msg = {
+            "already": f"**{member.display_name}** is already on all of that.",
+            "requester": "That's the requester — they can't sub their own request.",
+            "full": "No open spots left there.",
+            "locked": "That starts too soon — the roster's locked.",
+            "closed": "That's no longer on the board.",
+        }.get(why, "Nothing there to fill.")
+    await interaction.edit_original_response(content=msg, view=None)
+
+
 class FillForSubmitButton(discord.ui.Button):
     def __init__(self, member=None, count: int = 0, row: int = 3):
         if member is None:
@@ -1415,45 +1509,7 @@ class FillForSubmitButton(discord.ui.Button):
                          disabled=member is None)
 
     async def callback(self, interaction: discord.Interaction):
-        view: "FillForView" = self.view
-        # One-shot guard, same as PostNeedButton: filling isn't idempotent and an
-        # impatient double-tap must not run twice. Set it before the first await.
-        if view.submitted:
-            try:
-                await interaction.response.defer()
-            except discord.HTTPException:
-                pass
-            return
-        view.submitted = True
-        await interaction.response.defer()
-
-        cog: "Subs" = interaction.client.get_cog("Subs")
-        member, rids = view.member, list(view.rids)
-        if member is None or not rids:
-            view.submitted = False
-            await interaction.edit_original_response(
-                content=("Pick a date and a person first.\n\n" + view.prompt()),
-                view=view.build())
-            return
-        if cog._is_repeat_click(cog._click_cooldown,
-                                ("fillfor", interaction.user.id, tuple(sorted(rids)), member.id)):
-            return
-        filled, skipped, why = await cog.fill_nights_for(
-            interaction.user, rids, member, interaction.channel)
-        if filled:
-            tail = (f" ({skipped} skipped — already covered, locked, or their own request.)"
-                    if skipped else "")
-            msg = (f"✅  Marked **{member.display_name}** in for **{fmt_run(filled)}** — "
-                   f"they and the requester were notified.{tail}")
-        else:
-            msg = {
-                "already": f"**{member.display_name}** is already on all of that.",
-                "requester": "That's the requester — they can't sub their own request.",
-                "full": "No open spots left there.",
-                "locked": "That starts too soon — the roster's locked.",
-                "closed": "That's no longer on the board.",
-            }.get(why, "Nothing there to fill.")
-        await interaction.edit_original_response(content=msg, view=None)
+        await commit_fill(self.view, interaction, self.view.member)
 
 
 # ── Remove (click a name → confirm; cancel a request; clear availability) ─────
@@ -1530,7 +1586,7 @@ class RemoveSubSelect(discord.ui.Select):
         if not req:
             await interaction.response.edit_message(content="That request is no longer on the board.", view=None)
             return
-        target = int(uid_s)
+        target = store.parse_user_id(uid_s)
         name = next((m["name"] for m in (req.get("filled", []) + req.get("pending", []))
                      if m["user_id"] == target), "this sub")
         await interaction.response.edit_message(
@@ -1539,7 +1595,7 @@ class RemoveSubSelect(discord.ui.Select):
 
 
 class ConfirmRemoveSubView(discord.ui.View):
-    def __init__(self, rid: str, target: int, name: str):
+    def __init__(self, rid: str, target: int | str, name: str):
         super().__init__(timeout=120)
         self.rid = rid
         self.target = target
