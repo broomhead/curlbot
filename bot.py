@@ -492,6 +492,7 @@ async def setup_hook():
         subs.ConfirmAutoButton,
         subs.DropAutoButton,
         subs.SetTeamButton,
+        subs.DriftCancelButton,
         JoinPracticeButton,
         UnlistPracticeButton,
         BlockSheetsButton,

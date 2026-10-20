@@ -40,7 +40,8 @@ board:
                        "Ben's got Tuesdays" gets recorded, one tap from the ask.
   ➖ Remove          — take a sub off a game, cancel a request you opened, or clear
                        your own availability. All three CONFIRM first: in this cog a
-                       select never mutates shared state, only a button does.
+                       select never mutates shared state, only a button does. A
+                       server manager can cancel anyone's request here.
   🙋 <game>          — one one-tap button per open date, matching the text line for
                        line. NOT one per multi-date posting: posting several dates at
                        once is a bulk input convenience, not a standing arrangement —
@@ -582,6 +583,150 @@ def dead_league_ids(leagues: list[dict], now: datetime) -> set[str]:
             if lg.get("ended") or league_is_over(lg, now)}
 
 
+# ── Drift: a posted request the league page no longer agrees with ───────────
+# A request is written once, from what the league page said when it was posted.
+# The page can change underneath it: a team renamed or withdrawn, the schedule
+# redrawn so the team now has a bye that week, a date dropped. The request then
+# points at a spot that doesn't exist, and since nothing about it is malformed in
+# the store, nothing would ever remove it.
+#
+# Nothing here deletes anything. A renamed team still plays that date and may
+# already have its sub; a "missing" team may be a page that parsed badly for an
+# hour. The people involved know which, so they are told, once per change, and
+# handed the buttons to fix or cancel it. The one thing applied directly is a moved
+# start time — same date, same game, the club's own schedule (compare retime_tbc) —
+# and even then everyone on it is told, because a sub said yes to a time.
+#
+# Same rule as season expiry: a league that couldn't be read, or isn't in the list
+# at all, has told us nothing. Only what the page positively says counts.
+
+DRIFT_TEAM_GONE = "team_gone"
+DRIFT_BYE = "bye"
+DRIFT_NO_DRAW = "no_draw"
+DRIFT_TIME = "time"          # applied, never stored as a drift
+
+# The board's one-line flag on a drifted spot. Shown, never hidden: a spot that
+# quietly vanished would read as a bug, and everyone looking at the board should be
+# able to see that this one is in question.
+DRIFT_NOTE = {
+    DRIFT_TEAM_GONE: "team isn't on the league page",
+    DRIFT_BYE: "team is on bye that week",
+    DRIFT_NO_DRAW: "not on the league schedule",
+}
+
+
+def drift_kind(sig: str) -> str:
+    """The kind of a stored drift signature ("bye:2026-10-29:ashby" -> "bye")."""
+    return (sig or "").split(":", 1)[0]
+
+
+def _league_readable(league: dict | None) -> bool:
+    return bool(league) and not league.get("fetch_failed")
+
+
+def _roster_keys(league: dict) -> set[str]:
+    """The league's team names, normalised — or empty when the roster can't be
+    trusted as complete. Empty is "teams not posted", never "every team withdrawn";
+    fewer names than standings rows is a table that didn't fully parse, and judging
+    a team missing from half a table would flag teams that are still there."""
+    names = league.get("team_names") or []
+    rows = league.get("teams")
+    if not names or (isinstance(rows, int) and len(names) < rows):
+        return set()
+    return {_team_key(n) for n in names}
+
+
+def wholesale_team_loss(state: dict, league: dict) -> bool:
+    """Every team name stored against this league has vanished at once, and there
+    were at least two of them. Teams get renamed one at a time; all of them going
+    together is the page (or our parser) changing how names are written, and
+    flagging it would DM everyone with a request in the league about nothing."""
+    keys = _roster_keys(league)
+    lid = str(league.get("id"))
+    stored = {_team_key(x.get("team", ""))
+              for x in state.get("requests", []) + state.get("standing", [])
+              if str(x.get("league_id") or "") == lid and (x.get("team") or "").strip()}
+    return bool(keys) and len(stored) >= 2 and not (stored & keys)
+
+
+def request_drift(req: dict, league: dict | None, now: datetime) -> dict | None:
+    """What the league page now says is wrong with this request, or None.
+
+    {"kind", "sig"} is a mismatch a person has to resolve; `sig` names the change, so
+    the same mismatch is raised once and a different one is raised again.
+    {"kind": DRIFT_TIME, "iso"} is a moved start time that can simply be applied.
+
+    Checked in order, first hit wins: the team, then the date, then the bye, then the
+    time. Past or locked games are left alone — expiry owns those, and nobody can act
+    on a roster that has frozen."""
+    if not _league_readable(league):
+        return None
+    try:
+        when = datetime.fromisoformat(req.get("game_ts") or "")
+    except (ValueError, TypeError):
+        return None
+    if when.date() < now.date() or is_locked(req, now=now):
+        return None
+    team = (req.get("team") or "").strip()
+    roster = _roster_keys(league)
+    if team and roster and _team_key(team) not in roster:
+        return {"kind": DRIFT_TEAM_GONE, "sig": f"{DRIFT_TEAM_GONE}:{_team_key(team)}"}
+    dates = _draw_dates(league)
+    if not dates or not (dates[0] <= when.date() <= dates[-1]):
+        # No schedule yet, or the date lies outside it. Beyond the last posted draw
+        # could just be a schedule posted part way: absence again, not a change.
+        return None
+    day = [g for g in league_games(league, now) if g["dt"].date() == when.date()]
+    if not day:
+        return {"kind": DRIFT_NO_DRAW, "sig": f"{DRIFT_NO_DRAW}:{when.date().isoformat()}"}
+    if team and all(on_bye(g, team) for g in day):
+        return {"kind": DRIFT_BYE,
+                "sig": f"{DRIFT_BYE}:{when.date().isoformat()}:{_team_key(team)}"}
+    times = {g["iso"] for g in day}
+    if (when.time() != TIME_TBC and len(times) == 1
+            and when.replace(second=0, microsecond=0).isoformat() not in times):
+        # TBC entries are retime_tbc's. Two draw times on one date is a league whose
+        # teams play at different times, and which one is this team's isn't on the
+        # page, so that is left as it is.
+        return {"kind": DRIFT_TIME, "iso": next(iter(times))}
+    return None
+
+
+def standing_drift(g: dict, league: dict | None, now: datetime) -> dict | None:
+    """A super sub arrangement on a team the league page no longer lists. Silently
+    broken otherwise: auto-assignment matches on the team's name, so after a rename
+    it simply stops firing and nothing on the board says so. A finished season is
+    left out — those arrangements have stopped mattering, not broken."""
+    if not _league_readable(league) or league.get("ended") or league_is_over(league, now):
+        return None
+    team = (g.get("team") or "").strip()
+    roster = _roster_keys(league)
+    if team and roster and _team_key(team) not in roster:
+        return {"kind": DRIFT_TEAM_GONE, "sig": f"{DRIFT_TEAM_GONE}:{_team_key(team)}"}
+    return None
+
+
+def needs_team(req: dict) -> bool:
+    """A request whose team has to be (re)picked: none named yet, or one the league
+    page now disagrees with — renamed away, or on bye that date (the wrong team may
+    simply have been picked)."""
+    return (not (req.get("team") or "").strip()
+            or drift_kind(req.get("drift", "")) in (DRIFT_TEAM_GONE, DRIFT_BYE))
+
+
+def drift_reason(req: dict) -> str:
+    """Why a drifted request is in question, for a DM line."""
+    kind = drift_kind(req.get("drift", ""))
+    team = (req.get("team") or "").strip()
+    if kind == DRIFT_TEAM_GONE:
+        return f"**{team}** isn't on the league page any more"
+    if kind == DRIFT_BYE:
+        return f"**{team}** is on bye that week"
+    if kind == DRIFT_NO_DRAW:
+        return "that date isn't on the league schedule any more"
+    return ""
+
+
 def league_slot_map(leagues: list[dict]) -> dict[str, dict]:
     """{league id: {"slot", "name"}} for the sub records.
 
@@ -807,7 +952,9 @@ def _req_status_line(req: dict, crowned=frozenset()) -> str:
              for f in req.get("filled", [])]
     names += [f"{p['name']} (pending)" for p in req.get("pending", [])]
     who = ", ".join(names) if names else "nobody yet"
-    return f"{INDENT}{_req_icon(req)} {_req_for(req)} — {covered}/{needed} · {who}"
+    note = DRIFT_NOTE.get(drift_kind(req.get("drift", "")))
+    flag = f" · ⚠️ {note}" if note else ""
+    return f"{INDENT}{_req_icon(req)} {_req_for(req)} — {covered}/{needed} · {who}{flag}"
 
 
 def _available_for_group(state: dict, grp: dict, key: str) -> list[str]:
@@ -1540,27 +1687,42 @@ class RemoveButton(discord.ui.DynamicItem[discord.ui.Button], template=r"sub:rem
 
     async def callback(self, interaction: discord.Interaction):
         cog: "Subs" = interaction.client.get_cog("Subs")
-        view = RemoveHomeView(cog.state, interaction.user.id)
+        admin = can_cancel_any(interaction)
+        view = RemoveHomeView(cog.state, interaction.user.id, admin=admin)
         if not view.children:
             await interaction.response.send_message(
                 "Nothing to remove right now — no subs, requests, or availability listed.",
                 ephemeral=True)
             return
+        what = ("cancel any request (you manage this server)" if admin
+                else "cancel a request you opened")
         await interaction.response.send_message(
-            "**Remove** — cancel a sub (you'll confirm), cancel a request you opened, "
+            f"**Remove** — cancel a sub (you'll confirm), {what}, "
             "or clear your availability:", view=view, ephemeral=True)
 
 
+def can_cancel_any(interaction: discord.Interaction) -> bool:
+    """Server managers can cancel anyone's request. Otherwise only the person who
+    posted it can — and when that person can't (DMs closed, left the club, a
+    teammate asking on their behalf), nobody could, and a stale spot sat on the
+    board until its date. Empty permissions in a DM, so this is False there."""
+    perms = getattr(interaction, "permissions", None)
+    return bool(getattr(perms, "manage_guild", False))
+
+
 class RemoveHomeView(discord.ui.View):
-    def __init__(self, state: dict, uid: int):
+    def __init__(self, state: dict, uid: int, *, admin: bool = False):
         super().__init__(timeout=180)
         row = 0
         subs = _all_committed_subs(state)
         if subs:
             self.add_item(RemoveSubSelect(subs, row=row)); row += 1
-        my_reqs = _my_requests(state, uid)
+        # A manager sees every request, their own and the ones in question first.
+        my_reqs = (_cancel_order(store.requests_sorted(state), uid) if admin
+                   else _my_requests(state, uid))
         if my_reqs:
-            self.add_item(CancelRequestSelect(my_reqs, row=row)); row += 1
+            self.add_item(CancelRequestSelect(my_reqs, row=row, viewer_id=uid,
+                                              admin=admin)); row += 1
         my_avail = [a for a in state.get("availability", []) if a.get("user_id") == uid]
         if my_avail:
             self.add_item(RemoveAvailSelect(my_avail, row=row)); row += 1
@@ -1624,27 +1786,46 @@ class ConfirmRemoveSubView(discord.ui.View):
         await interaction.response.edit_message(content="Okay — left them on.", view=None)
 
 
+def _cancel_order(reqs: list[dict], uid: int) -> list[dict]:
+    """Requests in a cancel picker: ones the league page disagrees with first, then
+    the viewer's own, then the rest, soonest first within each. Discord caps a select
+    at 25, and the spots someone is most likely here to clear are the flagged ones."""
+    return sorted(reqs, key=lambda r: (not r.get("drift"), r.get("requester_id") != uid))
+
+
 class CancelRequestSelect(discord.ui.Select):
-    def __init__(self, reqs: list[dict], row: int = 1):
+    def __init__(self, reqs: list[dict], row: int = 1, *, viewer_id=None, admin: bool = False):
+        def label(r):
+            whose = ("" if r.get("requester_id") == viewer_id
+                     else f" · {first_name(r.get('requester_name', '')) or 'someone'}'s")
+            return f"{fmt_when_short(r['game_ts'])} · {_req_for(r)}{whose}"
+
+        def desc(r):
+            note = DRIFT_NOTE.get(drift_kind(r.get("drift", "")))
+            return f"⚠️ {note}" if note else f"{store.open_spots(r)} open · cancel this request"
+
         opts = _unique_options([
-            discord.SelectOption(
-                label=_truncate(f"{fmt_when_short(r['game_ts'])} · {_req_for(r)}", 100),
-                value=r["id"],
-                description=_truncate(f"{store.open_spots(r)} open · cancel this request", 100),
-            )
+            discord.SelectOption(label=_truncate(label(r), 100), value=r["id"],
+                                 description=_truncate(desc(r), 100))
             for r in reqs[:25]
         ])
-        super().__init__(placeholder="Cancel a request you opened…",
+        super().__init__(placeholder=("Cancel any request…" if admin
+                                      else "Cancel a request you opened…"),
                          min_values=1, max_values=1, options=opts, row=row)
 
     async def callback(self, interaction: discord.Interaction):
         cog: "Subs" = interaction.client.get_cog("Subs")
         req = store.find_request(cog.state, self.values[0])
-        if not req or req["requester_id"] != interaction.user.id:
+        if not req or not (req["requester_id"] == interaction.user.id
+                           or can_cancel_any(interaction)):
             await interaction.response.edit_message(content="That request is no longer yours to cancel.", view=None)
             return
+        whose = ("your request" if req["requester_id"] == interaction.user.id
+                 else f"{first_name(req.get('requester_name', '')) or 'their'}'s request "
+                      f"(they'll be told)")
         await interaction.response.edit_message(
-            content=f"Cancel your request for **{fmt_when(req['game_ts'])}**? Any subs on it will be told.",
+            content=f"Cancel {whose} for **{_req_for(req)}** on **{fmt_when(req['game_ts'])}**? "
+                    f"Any subs on it will be told.",
             view=ConfirmCancelView(req["id"]))
 
 
@@ -1658,17 +1839,48 @@ class ConfirmCancelView(discord.ui.View):
         await interaction.response.defer()
         cog: "Subs" = interaction.client.get_cog("Subs")
         req = store.find_request(cog.state, self.rid)
-        if not req or req["requester_id"] != interaction.user.id:
+        if not req or not (req["requester_id"] == interaction.user.id
+                           or can_cancel_any(interaction)):
             await interaction.edit_original_response(content="That request is no longer yours to cancel.", view=None)
             return
         if cog._is_repeat_click(cog._click_cooldown, ("cancelreq", interaction.user.id, self.rid)):
             return
-        await cog.close_request(self.rid, interaction.channel)
+        await cog.close_request(self.rid, interaction.channel, actor=interaction.user)
         await interaction.edit_original_response(content="✖️  Request cancelled and removed from the board.", view=None)
 
     @discord.ui.button(label="Keep", style=discord.ButtonStyle.secondary)
     async def keep(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(content="Okay — kept the request.", view=None)
+
+
+CID_FIX_CANCEL = "sub:fixcancel"
+
+
+class DriftCancelButton(discord.ui.DynamicItem[discord.ui.Button], template=r"sub:fixcancel"):
+    """From the "the league page has changed" DM: cancel one of your requests. Opens
+    the same picker + confirm as ➖ Remove, with the flagged requests first, so the
+    answer to "there's no game for us that week" is one tap from being told."""
+
+    def __init__(self):
+        super().__init__(discord.ui.Button(
+            label="Cancel a request", emoji="✖️", style=discord.ButtonStyle.secondary,
+            custom_id=CID_FIX_CANCEL))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls()
+
+    async def callback(self, interaction: discord.Interaction):
+        cog: "Subs" = interaction.client.get_cog("Subs")
+        mine = _cancel_order(_my_requests(cog.state, interaction.user.id), interaction.user.id)
+        if not mine:
+            await interaction.response.send_message(
+                "You have no requests on the board any more — nothing to cancel.", ephemeral=True)
+            return
+        view = discord.ui.View(timeout=180)
+        view.add_item(CancelRequestSelect(mine, row=0, viewer_id=interaction.user.id))
+        await interaction.response.send_message(
+            "Which request? You'll confirm before anything changes.", view=view, ephemeral=True)
 
 
 # ── Shared selects for the league/game flows ────────────────────────────────
@@ -2721,9 +2933,11 @@ class SetTeamButton(discord.ui.DynamicItem[discord.ui.Button],
 
 
 class SetTeamView(discord.ui.View):
-    """Attach a team to requests posted before the chair set the teams. All of the
-    caller's teamless dates in that league start ticked \u2014 they're nearly always the
-    same spot on the same team \u2014 and any that aren't can be unticked and done after."""
+    """Attach a team to requests posted before the chair set the teams, or re-pick it
+    on requests whose team the league page no longer agrees with (renamed, or on bye
+    that date — see request_drift). All of the caller's dates in that league that need
+    one start ticked \u2014 they're nearly always the same spot on the same team \u2014 and
+    any that aren't can be unticked and done after."""
 
     def __init__(self, state: dict, league: dict | None, user_id: int):
         super().__init__(timeout=300)
@@ -2740,7 +2954,7 @@ class SetTeamView(discord.ui.View):
             return []
         return [r for r in store.requests_sorted(self.state)
                 if r.get("requester_id") == self.user_id
-                and not (r.get("team") or "").strip()
+                and needs_team(r)
                 and str(r.get("league_id") or "") == lid
                 and not is_locked(r)]
 
@@ -2782,9 +2996,18 @@ class SetTeamView(discord.ui.View):
             return "Those requests are already sorted \u2014 nothing here needs a team."
         if not self.teams():
             return "That league still has no teams posted, so there's nothing to pick yet."
-        head = (f"**{league_label(self.league)}** \u2014 the teams are up now. You have "
-                f"**{len(ps)}** request{'s' if len(ps) != 1 else ''} with no team on "
-                f"{fmt_run([r['game_ts'] for r in ps])}.\n")
+        if any((r.get("team") or "").strip() for r in ps):
+            # Some of these HAD a team, and the league page has moved on from it.
+            lines = "\n".join(f"\u00b7 **{fmt_when(r['game_ts'])}** \u2014 "
+                              f"{drift_reason(r) or 'no team named yet'}" for r in ps)
+            head = (f"**{league_label(self.league)}** \u2014 the league page has changed under "
+                    f"{'your request' if len(ps) == 1 else f'**{len(ps)}** of your requests'}:\n"
+                    f"{lines}\nIf the team was renamed, pick its new name. If there's no game "
+                    f"for you that date, cancel it with **\u2796 Remove** instead.\n")
+        else:
+            head = (f"**{league_label(self.league)}** \u2014 the teams are up now. You have "
+                    f"**{len(ps)}** request{'s' if len(ps) != 1 else ''} with no team on "
+                    f"{fmt_run([r['game_ts'] for r in ps])}.\n")
         if not self.team:
             return head + "Pick the team the spot is on. All your dates are ticked \u2014 untick any that are a different team and do those after."
         note = bye_note(self.team, [r["game_ts"] for r in self.on_bye()], held_back=True)
@@ -3227,6 +3450,7 @@ class Subs(commands.Cog):
         n = len(retimed["requests"]) + len(retimed["availability"])
         if n:
             log.info("Re-timed %d entries posted before their start time was known", n)
+        await self.reconcile_drift(leagues, now)
         await self.render_all_boards()
         self._requeue_unnotified()
 
@@ -3894,13 +4118,33 @@ class Subs(commands.Cog):
                 f"🥌 {user.display_name} took a sub spot for your {when} game — {opn} still open.")
         return (result, req)
 
-    async def close_request(self, rid: str, channel=None):
+    async def close_request(self, rid: str, channel=None, *, actor=None):
+        """Take a request off the board, and tell the people it concerned: every sub
+        on it (the cancel prompt has always promised they'd be told), and the person
+        who posted it when someone else did the cancelling. One DM each."""
         async with self._lock:
             req = store.find_request(self.state, rid)
             alert = req.get("alert") if req is not None else None
             store.close_request(self.state, rid)
             self._save()
         await self.bump_board(self._guild_id(channel), fallback_channel=channel)
+        if req is not None:
+            actor_id = getattr(actor, "id", None)
+            when = fmt_when(req.get("game_ts", ""))
+            what = f"{stored_league(req.get('league', ''))} \u00b7 {_req_for(req)} \u00b7 **{when}**"
+            requester = req.get("requester_id")
+            if actor is not None and requester not in (None, actor_id) \
+                    and not store.is_guest(requester):
+                await self._dm(requester, f"\u2716\ufe0f  {actor.display_name} cancelled your "
+                                          f"sub request: {what}.")
+            told = {actor_id, requester}
+            for m in req.get("filled", []) + req.get("pending", []):
+                uid = m.get("user_id")
+                if uid in told or store.is_guest(uid):
+                    continue
+                told.add(uid)
+                await self._dm(uid, f"\u2716\ufe0f  The sub request you were on has been "
+                                    f"cancelled: {what}. You're no longer needed for it.")
         # Retire the alert page for the closed request.
         if alert and alert.get("message_id"):
             ch = await self._resolve_channel(alert["channel_id"])
@@ -4151,7 +4395,9 @@ class Subs(commands.Cog):
 
     async def set_team_for(self, user, rids, team: str,
                            channel=None) -> tuple[list[str], list[str], int]:
-        """Attach a team to the caller's own teamless requests. Returns
+        """Attach a team to the caller's own requests that need one: teamless, or
+        flagged because the league page no longer matches their team (needs_team).
+        Re-picking clears the flag; the next housekeeping pass re-checks it. Returns
         (dates set, dates that now collide with someone else's request for the same
         team, how many went to a super sub).
 
@@ -4167,11 +4413,12 @@ class Subs(commands.Cog):
                 req = store.find_request(self.state, rid)
                 if req is None or is_locked(req):
                     continue
-                if req.get("requester_id") != user.id or (req.get("team") or "").strip():
+                if req.get("requester_id") != user.id or not needs_team(req):
                     continue
                 clash = _find_open_duplicate(self.state, req.get("league_id", ""),
                                              req.get("game_ts", ""), team)
                 req["team"] = team
+                req["drift"] = ""
                 done.append(req["game_ts"])
                 changed.append(req)
                 if clash is not None and clash["id"] != req["id"]:
@@ -4230,6 +4477,147 @@ class Subs(commands.Cog):
                 await self.post_page(nxt, reason="bump")
         if changed:
             await self.render_all_boards()
+        # After expiry, so nothing just played is flagged, and off the same league
+        # list, so the two passes can't disagree about a league.
+        await self.reconcile_drift(leagues, now)
+
+    # -- the league page changed under what's posted ------------------------
+    async def reconcile_drift(self, leagues: list[dict], now: datetime) -> dict:
+        """Compare everything posted against the league page as it reads now, and
+        tell the people involved about anything that no longer matches. See the
+        Drift section for what counts and why nothing is deleted.
+
+        Each mismatch is raised ONCE: its signature is stored on the request (or
+        arrangement), and only a new signature notifies. A mismatch that goes away —
+        team re-picked, page changed back — clears silently; the board loses its flag.
+        Everyone hears at most one DM per pass, however many things changed.
+
+        Returns what it did, for tests and logs: {"flagged", "cleared", "moved",
+        "standing"}."""
+        done = {"flagged": [], "cleared": [], "moved": [], "standing": []}
+        if not leagues:
+            return done            # couldn't read the list: that's no news at all
+        by_id = {str(lg.get("id")): lg for lg in leagues}
+        async with self._lock:
+            for lid, lg in list(by_id.items()):
+                if _league_readable(lg) and wholesale_team_loss(self.state, lg):
+                    log.warning("League %s: every stored team name is gone from its page at "
+                                "once — not treating that as renames", lid)
+                    by_id[lid] = dict(lg, team_names=[])
+            for r in self.state["requests"]:
+                lg = by_id.get(str(r.get("league_id") or ""))
+                d = request_drift(r, lg, now)
+                if d and d["kind"] == DRIFT_TIME:
+                    done["moved"].append((r, r["game_ts"]))
+                    r["game_ts"] = d["iso"]
+                    d = None
+                sig = d["sig"] if d else ""
+                old = r.get("drift") or ""
+                if sig == old:
+                    continue
+                r["drift"] = sig
+                done["flagged" if sig else "cleared"].append(r)
+            for g in self.state.get("standing", []):
+                d = standing_drift(g, by_id.get(str(g.get("league_id") or "")), now)
+                sig = d["sig"] if d else ""
+                if sig == (g.get("drift") or ""):
+                    continue
+                g["drift"] = sig
+                if sig:
+                    done["standing"].append(g)
+                else:
+                    done["cleared"].append(g)
+            changed = any(done.values())
+            if changed:
+                self._save()
+        if not changed:
+            return done
+        if done["flagged"] or done["moved"] or done["standing"]:
+            log.info("League page drift: %d flagged, %d re-timed, %d super sub arrangements",
+                     len(done["flagged"]), len(done["moved"]), len(done["standing"]))
+        await self._tell_drift(done)
+        await self.render_all_boards()
+        for r, _ in done["moved"]:
+            await self.refresh_page(r)
+        return done
+
+    async def _tell_drift(self, done: dict):
+        """One DM per person covering everything that changed for them this pass:
+
+          the requester  — what's wrong, with the buttons to fix the team or cancel;
+          subs on it     — a heads-up that the spot is in question, no buttons (it's
+                           the requester's to sort, and they're still down for it);
+          a moved time   — everyone on the request, so a sub isn't caught out;
+          a super sub    — their arrangement's team has gone, and whoever set it up.
+        """
+        out: dict = {}
+
+        def to(uid):
+            if uid is None or store.is_guest(uid):
+                return None
+            return out.setdefault(uid, {"ask": [], "heads": [], "moved": [], "standing": []})
+
+        def on_it(r):
+            return [m.get("user_id") for m in r.get("filled", []) + r.get("pending", [])]
+
+        for r in done["flagged"]:
+            if (box := to(r.get("requester_id"))) is not None:
+                box["ask"].append(r)
+            for uid in on_it(r):
+                if uid != r.get("requester_id") and (box := to(uid)) is not None:
+                    box["heads"].append(r)
+        for r, old in done["moved"]:
+            for uid in dict.fromkeys([r.get("requester_id"), *on_it(r)]):
+                if (box := to(uid)) is not None:
+                    box["moved"].append((r, old))
+        for g in done["standing"]:
+            for uid in dict.fromkeys([g.get("user_id"), g.get("created_by")]):
+                if (box := to(uid)) is not None:
+                    box["standing"].append(g)
+
+        def line(r):
+            return (f"\u00b7 {stored_league(r.get('league', ''))} \u00b7 {_req_for(r)} \u00b7 "
+                    f"**{fmt_when(r['game_ts'])}**")
+
+        for uid, box in out.items():
+            parts, view = [], None
+            if box["ask"]:
+                parts.append(
+                    "\u26a0\ufe0f  **The league page has changed under your sub request"
+                    + ("s" if len(box["ask"]) > 1 else "") + ":**\n"
+                    + "\n".join(f"{line(r)} \u2014 {drift_reason(r)}" for r in box["ask"])
+                    + "\nIf the team was renamed, set its new name. If there's no game for you "
+                      "that date, cancel the request. Until then it stays on the board, "
+                      "flagged.")
+                view = discord.ui.View(timeout=None)
+                fixable = [r for r in box["ask"] if needs_team(r)]
+                for lid in dict.fromkeys(str(r.get("league_id") or "") for r in fixable):
+                    n = sum(1 for r in fixable if str(r.get("league_id") or "") == lid)
+                    if lid.isdigit() and len(view.children) < 4:
+                        view.add_item(SetTeamButton(lid, count=n))
+                view.add_item(DriftCancelButton())
+            if box["heads"]:
+                parts.append(
+                    "\u26a0\ufe0f  **Heads-up** \u2014 a game you're down to sub no longer matches "
+                    "the league page:\n"
+                    + "\n".join(f"{line(r)} \u2014 {drift_reason(r)}" for r in box["heads"])
+                    + "\nWhoever posted it has been asked to sort it out. You're still down for "
+                      "it until they do.")
+            if box["moved"]:
+                parts.append(
+                    "\U0001f552  **Start time changed** on the league page:\n"
+                    + "\n".join(f"{line(r)} (was {fmt_when(old)})" for r, old in box["moved"])
+                    + "\nThe request moved with it.")
+            if box["standing"]:
+                parts.append(
+                    "\u2b50  **Super sub** \u2014 this team isn't on the league page any more, "
+                    "so nothing will be assigned for it:\n"
+                    + "\n".join(f"\u00b7 {stored_league(g.get('league', ''))} \u00b7 "
+                                f"**{(g.get('team') or '').strip()}** \u00b7 {g.get('name', '')}"
+                                for g in box["standing"])
+                    + "\nIf it was renamed, remove this arrangement and set it up again under "
+                      "the new name with `/supersub`.")
+            await self._dm(uid, "\n\n".join(parts), view=view)
 
     @expiry_loop.before_loop
     async def _before_expiry(self):

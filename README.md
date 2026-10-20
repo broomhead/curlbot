@@ -202,6 +202,19 @@ board refreshes it in place. The buttons:
 - **➖ Remove** is the one place things come off the board: take a sub off a game,
   cancel a request you opened, or clear your own availability. All three ask before
   they act — nothing in this cog is destroyed by touching a dropdown.
+  Members with **Manage Server** can cancel *any* request there, so a spot whose
+  owner can't clear it doesn't sit on the board until its date. Cancelling tells
+  every sub on the request, and the owner too when someone else cancelled it.
+- **When the league page changes under a request** — its team renamed or gone,
+  its date dropped from the schedule, the team now on bye that week — the bot never
+  deletes it. Every housekeeping pass compares what's posted with the league page;
+  a mismatch flags the spot on the board (⚠️) and DMs the requester once, with
+  buttons to re-pick the team or cancel, plus a heads-up to any sub already on it.
+  A super sub whose team has vanished is told too, since auto-assignment silently
+  stops matching. A moved start time on the same date is simply applied, and
+  everyone on the request hears about it. A league page that couldn't be read, a
+  standings table that didn't fully parse, or every team name changing at once is
+  treated as no news.
 - **🛠 Manage** (requester only) lets you add/remove a member directly, **invite
   an available sub** (they get a DM to confirm), or close a request early.
 

@@ -119,6 +119,9 @@ def load(path: str) -> dict:
         r.setdefault("auto_declined", [])  # go-to subs who dropped THIS date
         r.setdefault("ack_nudged", False)  # unconfirmed-assignment chase has fired
         r.setdefault("team_prompted", False)  # asked to attach a team once teams existed
+        r.setdefault("drift", "")         # what the league page now disagrees with (subs.request_drift)
+    for g in state["standing"]:
+        g.setdefault("drift", "")         # its team has gone from the league page (subs.standing_drift)
     return state
 
 
@@ -253,6 +256,11 @@ def new_request(
         "auto_declined": [],
         "ack_nudged": False,
         "team_prompted": False,
+        # The signature of a change on the league page this request no longer
+        # matches ("" = none). It is a flag, not an expiry: what removes it is the
+        # mismatch going away — the team re-picked, the request cancelled, or the
+        # page changing back — re-checked every housekeeping pass.
+        "drift": "",
         "created_ts": _now_iso(now),
     }
     state["requests"].append(req)
@@ -649,6 +657,7 @@ def add_standing(state: dict, *, user_id: int, name: str, league_id, league: str
         "priority": rank,
         "created_by": int(created_by) if created_by is not None else None,
         "created_ts": _now_iso(now or datetime.now()),
+        "drift": "",
     })
     return "added"
 
