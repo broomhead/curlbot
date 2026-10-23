@@ -439,7 +439,8 @@ the form IDs, and the practice category slug. Adjust to match your site.
 - **Leagues:** league pages are fetched and parsed (standings → team count;
   schedule → upcoming draw day/time/sheets; Details prose → start time when no
   schedule is posted), then cached to `league_cache.json`.
-  `refresh_leagues.py` force-refreshes the cache and is suitable for a cron job.
+  `refresh_leagues.py` force-refreshes the cache and is suitable for a cron job;
+  `/curlbot refresh` does the same from Discord (see Caching).
 - **Reserved facility ice:** the rink's public iCal feeds (`POND_ICS_URLS`,
   comma-separated). A rink may split its curling blocks across SEVERAL of the
   calendars its schedule page overlays, so this is a list, not a URL — one feed
@@ -464,9 +465,25 @@ when it clears — silence means healthy. `--no-alert` prints without messaging.
 
 ## Caching
 
-League data is cached locally with a TTL (default 6h); calendar and Gravity
-Forms data are fetched live per command via a single ranged request with
-concurrent lookups.
+Every upstream source is cached, and refetched lazily on the first use after its
+TTL (default 6h each):
+
+| Source | Where it's kept | TTL setting |
+|---|---|---|
+| League pages | `league_cache.json` (survives restarts and deploys) | `LEAGUE_CACHE_TTL` |
+| Calendar + Gravity Forms behind `/sheets` | memory | `SHEETS_CACHE_TTL` |
+| Rink iCal feeds | memory | `POND_CACHE_TTL` |
+
+A failed refetch keeps serving the last good copy. `refresh_leagues.py` refreshes
+the league file nightly, but `/sheets` keeps its own copy of the league draws
+until that copy expires.
+
+**`/curlbot refresh`** (server managers only, hidden from everyone else by default)
+refetches all three now, recomputes `/sheets`, and redraws the subs and practice
+boards. It replies privately with one line per source, saying which ones
+couldn't be reached and are still on their last copy. Use it after a schedule
+change rather than restarting the bot. The instructor board isn't cached;
+`/instructors` re-reads the sheet.
 
 ## Security & privacy
 

@@ -32,7 +32,7 @@ from discord.ext import commands
 
 from gf_client import GFClient
 from ice import PEOPLE_PER_SHEET, TOTAL_SHEETS, sheets_for_people
-from league_client import get_cached_leagues, draw_to_datetime
+from league_client import get_cached_leagues, draw_to_datetime, refetch_leagues
 import block_store as bs
 import instructors
 import practice_ice as pi
@@ -621,6 +621,26 @@ async def fetch_sessions_cached(weeks: int) -> list[dict]:
                 entry = (time.monotonic(), sessions)
                 _sessions_cache[weeks] = entry
     return _fresh_sessions(entry[1])
+
+
+async def refresh_sessions_cache() -> tuple[list[int], list[int]]:
+    """Refetch every cached /sheets window now, ignoring its age. Always includes
+    the default 1-week window, so a refresh right after launch still warms it.
+
+    A window whose refetch fails keeps its old entry: an admin pressing refresh
+    while the calendar is down must not leave members with nothing to look at.
+    Returns (windows refreshed, windows that failed), each sorted by weeks."""
+    async with _sessions_cache_lock:
+        ok, failed = [], []
+        for w in sorted(set(_sessions_cache) | {1}):
+            try:
+                sessions = await fetch_sessions(w)
+            except SheetsError:
+                failed.append(w)
+                continue
+            _sessions_cache[w] = (time.monotonic(), sessions)
+            ok.append(w)
+    return ok, failed
 
 
 async def current_opportunities(weeks: int) -> list[dict]:
@@ -1836,6 +1856,99 @@ async def sheets_cmd(interaction: discord.Interaction, weeks: int = 1,
         await interaction.followup.send(str(e), ephemeral=True)
         return
     await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+
+# ── /curlbot refresh: pull every upstream source now ─────────────────────────────────
+# League pages, the event calendar + registrations behind /sheets, and the rink's
+# reserved-ice feeds are all cached for hours (see the *_CACHE_TTL settings).
+# This drops those caches and refetches in place, so a schedule change shows up
+# without a restart. The instructor board isn't cached; /instructors re-reads it.
+
+_refresh_lock = asyncio.Lock()
+
+
+def can_refresh(interaction: discord.Interaction) -> bool:
+    """Server managers only. Empty permissions in a DM, so this is False there."""
+    perms = getattr(interaction, "permissions", None)
+    return bool(getattr(perms, "manage_guild", False))
+
+
+async def refresh_all_data() -> list[str]:
+    """Refetch every cached source, then redraw what reads from them. Returns one
+    status line per source for the admin who asked.
+
+    Order matters: leagues and rink feeds first, because the /sheets sessions are
+    built from both. Each step reports its own failure and the rest still run."""
+    lines: list[str] = []
+
+    try:
+        leagues = await refetch_leagues()
+        active = sum(1 for lg in leagues if not lg.get("ended"))
+        lines.append(f"✅  Leagues: {len(leagues)} refetched ({active} active)")
+    except Exception as ex:  # noqa: BLE001 — report it, keep going
+        log.warning("League refresh failed: %s", ex)
+        lines.append("⚠️  Leagues: couldn't load the league pages — still using the last copy")
+
+    if POND_ICS_URLS:
+        feeds = await pond_ice.fetch_feeds(POND_ICS_URLS, POND_CACHE_TTL, force=True)
+        good = sum(1 for f in feeds if f["ok"])
+        if good == len(feeds):
+            lines.append(f"✅  Rink calendars: {good} refetched")
+        else:
+            lines.append(f"⚠️  Rink calendars: {good} of {len(feeds)} loaded — "
+                         "the rest are using their last copy")
+
+    ok, failed = await refresh_sessions_cache()
+    if failed:
+        lines.append("⚠️  /sheets: couldn't reach the event calendar — still showing the last copy")
+    else:
+        lines.append("✅  /sheets: free ice recomputed")
+
+    # Redraw the boards from the new data: the subs board's league dates, the
+    # practice board's free-sheet counts. The subs pass is the same one a
+    # reconnect runs (re-time TBC posts, expiry, drift check, board redraw).
+    try:
+        cog = bot.get_cog("Subs")
+        if cog is not None:
+            await cog.startup()
+        if ok:
+            await _resync_practice_sheets(max(ok))
+        await render_practice_board(await _board_channel())
+        lines.append("✅  Boards redrawn")
+    except Exception as ex:  # noqa: BLE001 — the data is refreshed; say the redraw wasn't
+        log.exception("Board redraw after refresh failed: %s", ex)
+        lines.append("⚠️  Boards: data refreshed, but redrawing a board failed (see the logs)")
+
+    return lines
+
+
+# Admin commands live under one /curlbot group rather than at the top level, so
+# they don't crowd the member-facing commands. Discord applies permissions to the
+# group as a whole: everything in it is hidden from non-managers by default.
+curlbot_group = app_commands.Group(
+    name="curlbot", description="Bot admin (server managers)",
+    default_permissions=discord.Permissions(manage_guild=True), guild_only=True)
+
+
+@curlbot_group.command(name="refresh", description="Refetch league, calendar and rink data now")
+async def refresh_cmd(interaction: discord.Interaction):
+    # default_permissions only hides the command; a server can re-grant it, so
+    # check again here.
+    if not can_refresh(interaction):
+        await interaction.response.send_message(
+            "Only server managers can run /curlbot refresh.", ephemeral=True)
+        return
+    if _refresh_lock.locked():
+        await interaction.response.send_message(
+            "A refresh is already running — give it a moment.", ephemeral=True)
+        return
+    async with _refresh_lock:
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        lines = await refresh_all_data()
+    await interaction.followup.send("**Refresh done**\n" + "\n".join(lines), ephemeral=True)
+
+
+bot.tree.add_command(curlbot_group)
 
 
 bot.run(DISCORD_TOKEN)

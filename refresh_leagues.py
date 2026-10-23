@@ -34,7 +34,7 @@ load_dotenv()
 
 import alerts                                          # noqa: E402
 import pond_check                                      # noqa: E402
-from league_client import get_cached_leagues, CACHE_PATH  # noqa: E402
+from league_client import refetch_leagues, CACHE_PATH  # noqa: E402
 
 POND_ICS_URLS = [u.strip() for u in os.environ.get("POND_ICS_URLS", "").split(",") if u.strip()]
 POND_MATCH = os.environ.get("POND_MATCH", "curl")
@@ -43,7 +43,9 @@ POND_MATCH = os.environ.get("POND_MATCH", "curl")
 async def refresh_leagues() -> list[dict]:
     """Refresh the league cache and print what's in it. Findings on failure."""
     try:
-        leagues = await get_cached_leagues(force=True)
+        # refetch_leagues, not get_cached_leagues(force=True): the latter falls
+        # back to the stale file on failure, so this branch could never fire.
+        leagues = await refetch_leagues()
     except Exception:  # noqa: BLE001 — the message must not carry the request URL
         print(f"Could not refresh {CACHE_PATH}", file=sys.stderr)
         return [{"key": "league_refresh",

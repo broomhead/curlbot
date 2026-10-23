@@ -237,7 +237,7 @@ def run_job(*, leagues, collect_result, send_ok=True, no_alert=False):
         rec.sent.append(text)
         return send_ok
 
-    job.get_cached_leagues = fake_leagues
+    job.refetch_leagues = fake_leagues
     job.pond_check.collect = fake_collect
     job.alerts.send = fake_send
     job.alerts.load = lambda *a, **k: alerts.empty_state()

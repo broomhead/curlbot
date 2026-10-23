@@ -386,8 +386,9 @@ class LeagueClient:
 # puts LEAGUE_CACHE_PATH on the /data volume so a restart doesn't refetch every
 # league page. So a DEPLOY DOES NOT REFRESH LEAGUE DATA — new parsing code reaches
 # the board only when the cache next goes stale (CACHE_TTL, 6h) or the nightly
-# refresh_leagues.py cron runs. Force it now with refresh_leagues.py; the bot
-# re-reads the file on each call, so no restart is needed after one.
+# refresh_leagues.py cron runs. Force it now with /curlbot refresh in Discord (which
+# also drops the bot's in-memory /sheets and rink-feed caches) or with
+# refresh_leagues.py (league file only; /sheets keeps its own copy until its TTL).
 
 CACHE_PATH = os.environ.get("LEAGUE_CACHE_PATH", "league_cache.json")
 CACHE_TTL = int(os.environ.get("LEAGUE_CACHE_TTL", "21600"))  # seconds (6h)
@@ -421,6 +422,26 @@ def _write_cache(path: str, leagues: list[dict]) -> None:
     os.replace(tmp, path)
 
 
+async def refetch_leagues(*, cache_path: str = CACHE_PATH) -> list[dict]:
+    """Fetch every league page now and rewrite the cache. Raises on failure and
+    leaves the old cache untouched.
+
+    get_cached_leagues swallows a failed refetch and serves the stale file, which
+    is right for a member's request but wrong for anything that has to report
+    whether the refresh actually happened (the nightly job, the admin command).
+    """
+    async with LeagueClient() as lc:
+        leagues = await lc.all_active_league_info()
+    if leagues and all(lg.get("fetch_failed") for lg in leagues):
+        # Every page failed: the list call worked but the site is unwell.
+        # Caching this would overwrite good data with a set of leagues that
+        # have no teams and no draws.
+        raise LeagueFetchError(
+            f"all {len(leagues)} league pages failed to load; keeping the old cache")
+    _write_cache(cache_path, leagues)
+    return leagues
+
+
 async def get_cached_leagues(
     *, force: bool = False, cache_path: str = CACHE_PATH, ttl: int = CACHE_TTL
 ) -> list[dict]:
@@ -437,16 +458,7 @@ async def get_cached_leagues(
             return cached
 
     try:
-        async with LeagueClient() as lc:
-            leagues = await lc.all_active_league_info()
-        if leagues and all(lg.get("fetch_failed") for lg in leagues):
-            # Every page failed: the list call worked but the site is unwell.
-            # Caching this would overwrite good data with a set of leagues that
-            # have no teams and no draws.
-            raise LeagueFetchError(
-                f"all {len(leagues)} league pages failed to load; keeping the old cache")
-        _write_cache(cache_path, leagues)
-        return leagues
+        return await refetch_leagues(cache_path=cache_path)
     except Exception as e:  # noqa: BLE001 — fall back to stale cache on network errors
         log.warning("League refetch failed (%s); trying stale cache", e)
         try:
